@@ -34,4 +34,57 @@
       command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
 
     - name: 3. Get Node Public IPv4
-      command:
+      command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
+      register: ip_result
+
+    - name: 4. Parse IP Address
+      set_fact:
+        node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
+
+    - name: 5. Get and Patch Kubeconfig
+      # 【修正重點】這裡改用 shell 模組，以支援管道符號 (|)
+      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g'"
+      register: kubeconfig_patched
+
+    # =========================================================
+    # 第二階段：KubeSphere 自動納管 (API 操作)
+    # =========================================================
+    
+    - name: 6. Login to KubeSphere API (Get Token)
+      uri:
+        url: "{{ ks_url }}/kapis/iam.kubesphere.io/v1alpha2/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ ks_user }}"
+          password: "{{ ks_password }}"
+        validate_certs: no
+      register: ks_login_response
+      delegate_to: localhost 
+
+    - name: 7. Register Cluster to KubeSphere
+      uri:
+        url: "{{ ks_url }}/kapis/cluster.kubesphere.io/v1alpha1/clusters"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ ks_login_response.json.access_token }}"
+        body:
+          apiVersion: "cluster.kubesphere.io/v1alpha1"
+          kind: "Cluster"
+          metadata:
+            name: "{{ k8s_model }}"
+            labels:
+              cluster-role.kubesphere.io/member: ""
+          spec:
+            connection:
+              type: "direct"
+              kubeconfig: "{{ kubeconfig_patched.stdout | b64encode }}"
+            provider: "microk8s"
+        status_code: [200, 201, 409] # 409 代表已存在 (不算失敗)
+        validate_certs: no
+      delegate_to: localhost
+
+    - name: Final Status
+      debug:
+        msg: "🎉 成功！集群 {{ k8s_model }} (IP: {{ node_ip }}) 已部署並自動註冊至 KubeSphere。"
