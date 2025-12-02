@@ -60,11 +60,12 @@
           password: "{{ ks_password }}"
         
         # ----------------------------------------------------
-        # 【修正重點】強制 Ansible 使用 Basic Auth 傳輸，解決 403 錯誤
-        http_auth: basic
+        # 【修正重點 1】刪除不支援的 http_auth: basic
+        # ----------------------------------------------------
+        
+        # 【修正重點 2】使用 url_username/url_password 確保憑證被傳遞
         url_username: "{{ ks_user }}"
         url_password: "{{ ks_password }}"
-        # ----------------------------------------------------
         
         validate_certs: no
       register: ks_login_response
