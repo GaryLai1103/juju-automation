@@ -58,9 +58,17 @@
         body:
           username: "{{ ks_user }}"
           password: "{{ ks_password }}"
+        
+        # ----------------------------------------------------
+        # 【修正重點】強制 Ansible 使用 Basic Auth 傳輸，解決 403 錯誤
+        http_auth: basic
+        url_username: "{{ ks_user }}"
+        url_password: "{{ ks_password }}"
+        # ----------------------------------------------------
+        
         validate_certs: no
       register: ks_login_response
-      delegate_to: localhost 
+      delegate_to: localhost
 
     - name: 7. Register Cluster to KubeSphere
       uri:
