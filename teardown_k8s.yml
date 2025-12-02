@@ -1,0 +1,19 @@
+---
+- name: Teardown K8s Cluster (Release Resources)
+  hosts: all
+  gather_facts: no
+  vars:
+    k8s_model: "k8s-cluster-test" # 預設值，會被 AWX 問卷覆蓋
+
+  tasks:
+    - name: Destroy Juju Model
+      # 這行指令會強制刪除模型，並釋放 MAAS 機器回到 Ready 狀態
+      command: "juju destroy-model {{ k8s_model }} --no-prompt --force --destroy-storage"
+      register: destroy_result
+      failed_when: 
+        - destroy_result.rc != 0 
+        - '"not found" not in destroy_result.stderr' # 如果模型本來就不在，不算失敗
+
+    - name: Display Status
+      debug:
+        msg: "Model {{ k8s_model }} has been destroyed. Machine is being released to MAAS."
