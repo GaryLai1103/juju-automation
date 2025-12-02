@@ -1,0 +1,24 @@
+---
+- name: Automate K8s Deployment with Juju
+  hosts: all
+  gather_facts: no
+  vars:
+    k8s_model: "k8s-cluster-01"  # 預設名稱，會被 Survey 覆蓋
+
+  tasks:
+    - name: Create a new Juju Model
+      command: "juju add-model {{ k8s_model }}"
+      ignore_errors: yes # 如果模型已存在，忽略錯誤繼續往下
+
+    - name: Deploy MicroK8s (Kubernetes)
+      command: "juju deploy microk8s --channel=1.28/stable"
+      # 注意：這裡會自動去 MAAS 找機器。如果您想要指定機器，可以加 --constraints "tags=k8s"
+
+    - name: Wait for MicroK8s to be active (Optional check)
+      command: "juju status --format=json"
+      register: juju_status
+      changed_when: false
+
+    - name: Display Status
+      debug:
+        msg: "Deployment triggered for model {{ k8s_model }}. Check Juju Dashboard for progress."
