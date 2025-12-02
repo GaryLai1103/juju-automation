@@ -1,0 +1,78 @@
+---
+- name: Deploy K8s and Auto-Register to KubeSphere
+  hosts: all
+  gather_facts: no
+  vars:
+    # --- 變數設定 (可以被 AWX Survey 覆蓋) ---
+    k8s_model: "k8s-cluster-auto"
+    # KubeSphere 的連線資訊 (建議之後改用 Ansible Vault 加密)
+    ks_url: "http://192.168.1.112:30880"
+    ks_user: "admin"
+    ks_password: "P@88w0rd"  # <--- 請務必修改成您 KubeSphere 的真實密碼！！
+
+  tasks:
+    # ---------------------------------------------------------
+    # 第一階段：Juju 部署與設定檔獲取
+    # ---------------------------------------------------------
+    - name: 1. Create and Deploy MicroK8s (Ubuntu 22.04)
+      command: "juju deploy microk8s --channel=1.28/stable --series jammy -m {{ k8s_model }}"
+      ignore_errors: yes # 如果模型已存在則忽略
+
+    - name: 2. Wait for MicroK8s to be Ready
+      command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
+      # 這一步會等比較久，請耐心
+
+    - name: 3. Get Node Public IPv4
+      command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
+      register: ip_result
+
+    - name: 4. Parse IP Address
+      set_fact:
+        node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
+
+    - name: 5. Get and Patch Kubeconfig
+      # 抓下來並直接把 127.0.0.1 換成真正的 IP
+      command: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g'"
+      register: kubeconfig_patched
+
+    # ---------------------------------------------------------
+    # 第二階段：KubeSphere 自動納管 (API 操作)
+    # ---------------------------------------------------------
+    - name: 6. Login to KubeSphere API (Get Token)
+      uri:
+        url: "{{ ks_url }}/kapis/iam.kubesphere.io/v1alpha2/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ ks_user }}"
+          password: "{{ ks_password }}"
+        validate_certs: no
+      register: ks_login_response
+      delegate_to: localhost  # 這一步由 AWX 本機執行，不是 Juju VM
+
+    - name: 7. Register Cluster to KubeSphere
+      uri:
+        url: "{{ ks_url }}/kapis/cluster.kubesphere.io/v1alpha1/clusters"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ ks_login_response.json.access_token }}"
+        body:
+          apiVersion: "cluster.kubesphere.io/v1alpha1"
+          kind: "Cluster"
+          metadata:
+            name: "{{ k8s_model }}" # 集群名稱與 Juju Model 同名
+            labels:
+              cluster-role.kubesphere.io/member: ""
+          spec:
+            connection:
+              type: "direct" # 直接連線模式
+              kubeconfig: "{{ kubeconfig_patched.stdout | b64encode }}" # 需轉成 Base64
+            provider: "microk8s"
+        status_code: [200, 201, 409] # 409代表已存在，不算失敗
+        validate_certs: no
+      delegate_to: localhost
+
+    - name: Final Status
+      debug:
+        msg: "成功！集群 {{ k8s_model }} 已部署並自動註冊至 KubeSphere。"
