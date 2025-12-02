@@ -9,7 +9,7 @@
     # --- KubeSphere 連線資訊 (請確認密碼是否正確) ---
     ks_url: "http://192.168.1.112:30880"
     ks_user: "admin"
-    ks_password: "P@88w0rd"  # <--- ⚠️ 請務必確認這裡是您 KubeSphere 的真實密碼
+    ks_password: "1qaz@WSX"  # <--- ⚠️ 請務必確認這裡是您 KubeSphere 的真實密碼
 
   tasks:
     # =========================================================
