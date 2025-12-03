@@ -1,15 +1,16 @@
 ---
-- name: Deploy K8s and Generate Import YAML
+# ==========================================
+# 第一場戲：在 Juju Controller 上生成配置
+# ==========================================
+- name: 1. Deploy and Generate Config (on Juju)
   hosts: all
   gather_facts: no
   vars:
     k8s_model: "k8s-cluster-auto" # AWX Survey 會覆蓋此變數
 
   tasks:
-    # =========================================================
-    # 第一階段：Juju 部署 (完全自動化)
-    # =========================================================
-    
+    # ... (省略前面 Juju 部署 Task 1.1 ~ 4，請保留原樣) ...
+    # 為了版面簡潔，請保留您原本 Task 1.1 到 Task 4 的內容
     - name: 1.1 Create Juju Model
       command: "juju add-model {{ k8s_model }}"
       ignore_errors: yes
@@ -33,34 +34,47 @@
       set_fact:
         node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
 
-    # =========================================================
-    # 第二階段：產生 KubeSphere 納管所需的 YAML
-    # =========================================================
+    # --- 關鍵修改開始 ---
 
     - name: 5. Generate Base64 Kubeconfig
-      # 直接在 Juju 端處理好 IP 替換和 Base64 編碼
       shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
       register: kubeconfig_b64
 
-    - name: 6. Show Final Command
-      # 這裡不執行，而是直接印出完整的指令供您複製
+    - name: 6. Add KubeSphere Host to Inventory
+      # 這個動作是「動態」把 Host 加入執行清單，並把變數傳過去
+      add_host:
+        name: "ks_host"
+        ansible_host: "192.168.1.112" # KubeSphere Host IP
+        ansible_user: "garylai"       # 登入帳號
+        # 把查到的資料傳給下一場戲
+        cluster_name: "{{ k8s_model }}"
+        cluster_config: "{{ kubeconfig_b64.stdout }}"
+
+# ==========================================
+# 第二場戲：在 KubeSphere Host 上執行註冊
+# ==========================================
+- name: 2. Register Cluster (on KubeSphere Host)
+  hosts: ks_host
+  gather_facts: no
+  
+  tasks:
+    - name: 7. Apply Cluster CRD
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ cluster_name }}
+          labels:
+            cluster-role.kubesphere.io/member: ""
+        spec:
+          connection:
+            type: direct
+            kubeconfig: {{ cluster_config }}
+          provider: microk8s
+        EOF
+      register: apply_result
+
+    - name: Final Success Message
       debug:
-        msg: 
-          - "================================================================================="
-          - "🎉 自動化部署完成！由於 AWX 無法直接操作 Host，請手動執行最後一步。"
-          - "請複製下方【綠色文字區塊】，直接貼上到 Host (192.168.1.112) 的終端機執行："
-          - "================================================================================="
-          - "cat <<EOF | kubectl apply -f -"
-          - "apiVersion: cluster.kubesphere.io/v1alpha1"
-          - "kind: Cluster"
-          - "metadata:"
-          - "  name: {{ k8s_model }}"
-          - "  labels:"
-          - "    cluster-role.kubesphere.io/member: \"\""
-          - "spec:"
-          - "  connection:"
-          - "    type: direct"
-          - "    kubeconfig: {{ kubeconfig_b64.stdout }}"
-          - "  provider: microk8s"
-          - "EOF"
-          - "================================================================================="
+        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已直接註冊至 KubeSphere。"
