@@ -37,10 +37,17 @@
       set_fact:
         node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
 
-    - name: 5. Generate Base64 Kubeconfig
-      # 【修正重點】加入 -o StrictHostKeyChecking=no 和 -o UserKnownHostsFile=/dev/null
-      # 這樣 Juju SSH 連線時就不會因為指紋變更而卡住
-      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
+    - name: 5. Generate Base64 Kubeconfig (Safe Mode)
+      shell: |
+        # 步驟 A: 先把原始 Config 乾淨地存入檔案 (過濾掉任何 SSH 歡迎訊息)
+        # 使用 -q (quiet) 減少雜訊
+        juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config > /tmp/{{ k8s_model }}.kubeconfig
+        
+        # 步驟 B: 替換成對外 IP
+        sed -i 's/127.0.0.1/{{ node_ip }}/g' /tmp/{{ k8s_model }}.kubeconfig
+        
+        # 步驟 C: 輸出 Base64 (只輸出檔案內容，不包含其他東西)
+        cat /tmp/{{ k8s_model }}.kubeconfig | base64 -w 0
       register: kubeconfig_b64
 
     # ----------------------------------------------------
