@@ -68,19 +68,16 @@
         cat <<EOF | kubectl apply -f -
         apiVersion: cluster.kubesphere.io/v1alpha1
         kind: Cluster
-        metadata:
-          name: {{ cluster_name }}
-          labels:
-            cluster-role.kubesphere.io/member: ""
         spec:
-          # 【新增】啟用聯邦功能 (這可能是觸發 UI 更新的關鍵)
-          joinFederation: true
-          # 【新增】啟用直連
-          enable: true
+          provider: microk8s
           connection:
             type: direct
             kubeconfig: {{ cluster_config }}
-          provider: microk8s
+          joinFederation: true
+          config: 
+            global:
+        metadata:
+          name: {{ cluster_name }}
         EOF
       register: apply_result
 
