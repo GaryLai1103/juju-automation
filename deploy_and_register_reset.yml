@@ -44,11 +44,12 @@
       register: kubeconfig_b64
 
     # ----------------------------------------------------
-    # 3. 透過 SSH 遠端執行註冊 (保證成功)
+    # 3. 透過 SSH 遠端執行註冊 (修正版：加入指定金鑰)
     # ----------------------------------------------------
     - name: 6. Remote Register on KubeSphere Host
       shell: |
-        ssh -o StrictHostKeyChecking=no {{ ks_host_user }}@{{ ks_host_ip }} "cat <<EOF | kubectl apply -f -
+        # 【修正】加入 -i ~/.ssh/awx_key 明確指定私鑰
+        ssh -i ~/.ssh/awx_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ks_host_user }}@{{ ks_host_ip }} "cat <<EOF | kubectl apply -f -
         apiVersion: cluster.kubesphere.io/v1alpha1
         kind: Cluster
         metadata:
@@ -64,11 +65,12 @@
       register: ssh_result
 
     # ----------------------------------------------------
-    # 4. 強力刷新 UI (重啟後端與前端)
+    # 4. 強力刷新 UI (修正版：加入指定金鑰)
     # ----------------------------------------------------
     - name: 7. Force Refresh UI (Restart KS Services)
       shell: |
-        ssh -o StrictHostKeyChecking=no {{ ks_host_user }}@{{ ks_host_ip }} "kubectl rollout restart deployment ks-apiserver -n kubesphere-system && kubectl rollout restart deployment ks-console -n kubesphere-system"
+        # 【修正】同樣加入 -i ~/.ssh/awx_key
+        ssh -i ~/.ssh/awx_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ks_host_user }}@{{ ks_host_ip }} "kubectl rollout restart deployment ks-apiserver -n kubesphere-system && kubectl rollout restart deployment ks-console -n kubesphere-system"
       ignore_errors: yes
 
     - name: Final Status
