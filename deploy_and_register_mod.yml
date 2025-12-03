@@ -1,7 +1,7 @@
 ---
-# ==========================================
-# 第一場戲：在 Juju Controller 上生成配置
-# ==========================================
+# =================================================================
+# 第一場戲：在 Juju Controller 上生成配置 (Play 1)
+# =================================================================
 - name: 1. Deploy and Generate Config (on Juju)
   hosts: all
   gather_facts: no
@@ -55,10 +55,10 @@
         cluster_name: "{{ k8s_model }}"
         cluster_config: "{{ kubeconfig_b64.stdout }}"
 
-# ==========================================
-# 第二場戲：在 KubeSphere Host 上執行註冊
-# ==========================================
-- name: 2. Register Cluster (on KubeSphere Host)
+# =================================================================
+# 第二場戲：在 KubeSphere Host 上執行註冊與刷新 (Play 2)
+# =================================================================
+- name: 2. Register Cluster and Refresh UI (on KubeSphere Host)
   hosts: ks_host
   gather_facts: no
   
@@ -80,6 +80,11 @@
         EOF
       register: apply_result
 
+    # 【新增】強制重啟 KubeSphere API Server 以刷新 UI 計數
+    - name: 8. Force Refresh KubeSphere UI (Restart API)
+      command: "kubectl rollout restart deployment ks-apiserver -n kubesphere-system"
+      ignore_errors: yes # 就算重啟失敗也不要讓整個 Job 變紅燈
+
     - name: Final Success Message
       debug:
-        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已直接註冊至 KubeSphere。"
+        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已註冊，API Server 已重啟以刷新 UI 數字。"
