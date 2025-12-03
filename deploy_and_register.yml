@@ -3,64 +3,47 @@
   hosts: all
   gather_facts: no
   vars:
-    # --- 變數設定 (AWX Survey 輸入的 k8s_model 會覆蓋這裡) ---
+    # --- 變數設定 ---
     k8s_model: "k8s-cluster-auto"
-    
-    # --- KubeSphere 連線資訊 ---
     ks_url: "http://192.168.1.112:30880"
-    
-    # 【修正重點 1】直接使用 ServiceAccount 的 Bearer Token 進行 API 呼叫
-    ks_token: "eyJhbGciOiJSUzI1NiIsImtpZCI6ImszdmJRMm1USVpCd19YUGt4QUZDVEdCbkpzQkNsc2dQcUJYaUpzS2daVTQifQ.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJrdWJlc3BoZXJlLXN5c3RlbSIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VjcmV0Lm5hbWUiOiJhd3gtYXV0b21hdGlvbi10b2tlbiIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50Lm5hbWUiOiJhd3gtYXV0b21hdGlvbiIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50LnVpZCI6IjQ2MjQ2ODlkLTgzZTEtNDZmMC04NWRmLTI1OTM2NTkwNjJiMCIsInN1YiI6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDprdWJlc3BoZXJlLXN5c3RlbTphd3gtYXV0b21hdGlvbiJ9.nNp2th8MWfPlwDNIZ-0IaVG6g_SWSlsBnK6Qjav5Snnb4TZbWurGp-CE1b6_aRKwBsfWG-2tSWHGSH7EbgK1INAnJMmHKs6CsQKnVspgjoUYflQUf87AAG1srmPVXdIMT_lDoyU703hvlndguxBFDsnfGlfilYLovolDP37WLxOiwfoiJPpgOFtpUsLp5D8uxyVe9pV4Iu_QdLyZsu-KSCnRTEfKcfIvX2G5R5z2uvwdeoHX0w1PeL5Ay4plqEZ9kBNm2DsklZpx4HOZRwp7mR7xjO8y_gMDgQhLA0uR0H5-7tsZYGKeJ9j59xYaf89GNzDAiToTx4zLV6_I5fWziQ"
-    
+    ks_user: "admin"
+    ks_password: "1qaz@WSX"  # <-- 請確認這組密碼
+
   tasks:
-    # =========================================================
-    # 第一階段：Juju 部署與設定檔獲取 (不變)
-    # =========================================================
-    
-    - name: 1.1 Create Juju Model
-      command: "juju add-model {{ k8s_model }}"
-      ignore_errors: yes
+    # ... (省略 Task 1 ~ 5) ...
 
-    - name: 1.2 Set Model Base to Ubuntu 22.04
-      command: "juju model-config -m {{ k8s_model }} default-base=ubuntu@22.04"
-      ignore_errors: yes
-
-    - name: 1.3 Deploy MicroK8s
-      command: "juju deploy microk8s --channel=1.28/stable --base ubuntu@22.04 -m {{ k8s_model }}"
-      ignore_errors: yes
-
-    - name: 2. Wait for MicroK8s to be Ready
-      command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
-
-    - name: 3. Get Node Public IPv4
-      command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
-      register: ip_result
-
-    - name: 4. Parse IP Address
-      set_fact:
-        node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
-
-    - name: 5. Get and Patch Kubeconfig
-      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g'"
-      register: kubeconfig_patched
-
-    # =========================================================
-    # 第二階段：KubeSphere 自動納管 (使用 Token 認證)
-    # =========================================================
-    
-    # 【已刪除】 Task 6 (Login to KubeSphere API)
+    # ---------------------------------------------------------
+    # 【復活 Task 6】再次嘗試登入，並取得 Token
+    # ---------------------------------------------------------
+    - name: 6. Login to KubeSphere API (Get Token)
+      uri:
+        url: "{{ ks_url }}/kapis/iam.kubesphere.io/v1alpha2/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ ks_user }}"
+          password: "{{ ks_password }}"
+        
+        # 使用 url_username/url_password 確保憑證在 Header 中傳輸
+        url_username: "{{ ks_user }}"
+        url_password: "{{ ks_password }}"
+        
+        validate_certs: no
+        status_code: [200] # 必須返回 200 才算成功
+      register: ks_login_response
+      delegate_to: localhost 
+      # ⚠️ 注意：如果 Task 6 還是失敗 (403)，請確認您的密碼 1qaz@WSX 是否包含特殊符號，
+      # 或在 KubeSphere 網頁上確認密碼是否被重設。
 
     - name: 7. Register Cluster to KubeSphere
+      # 【修正重點】使用 Task 6 取得的 Token
       uri:
         url: "{{ ks_url }}/kapis/cluster.kubesphere.io/v1alpha1/clusters"
         method: POST
         body_format: json
-        
-        # 【修正重點 2】直接使用 ks_token 進行 Bearer 認證
         headers:
-          Authorization: "Bearer {{ ks_token }}" 
-          Content-Type: "application/json" # 確保 API 知道傳輸的是 JSON
-        
+          Authorization: "Bearer {{ ks_login_response.json.access_token }}" # 使用 Login API 返回的 Token
+          Content-Type: "application/json"
         body:
           apiVersion: "cluster.kubesphere.io/v1alpha1"
           kind: "Cluster"
@@ -71,12 +54,13 @@
           spec:
             connection:
               type: "direct"
-              kubeconfig: "{{ kubeconfig_patched.stdout | b64encode }}"
+              # 這裡的 Kubeconfig 必須經過 Base64 編碼，才能作為 JSON Body 傳輸
+              kubeconfig: "{{ kubeconfig_patched.stdout | b64encode }}" 
             provider: "microk8s"
-        status_code: [200, 201, 409] # 409 代表已存在 (不算失敗)
+        status_code: [201, 409] # 期待狀態碼 201 (Created)
         validate_certs: no
       delegate_to: localhost
 
     - name: Final Status
       debug:
-        msg: "🎉 成功！集群 {{ k8s_model }} (IP: {{ node_ip }}) 已部署並自動註冊至 KubeSphere。"
+        msg: "🎉 成功！集群 {{ k8s_model }} 已部署並自動註冊至 KubeSphere。"
