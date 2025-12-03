@@ -73,6 +73,10 @@
           labels:
             cluster-role.kubesphere.io/member: ""
         spec:
+          # 【新增】啟用聯邦功能 (這可能是觸發 UI 更新的關鍵)
+          joinFederation: true
+          # 【新增】啟用直連
+          enable: true
           connection:
             type: direct
             kubeconfig: {{ cluster_config }}
