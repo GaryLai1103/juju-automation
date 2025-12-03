@@ -1,17 +1,16 @@
 ---
-# =================================================================
-# 第一場戲：在 Juju Controller 上生成配置 (Play 1)
-# =================================================================
-- name: 1. Deploy and Generate Config (on Juju)
+- name: Deploy K8s and Register via SSH (Stable Version)
   hosts: all
   gather_facts: no
   vars:
-    k8s_model: "k8s-cluster-auto" # AWX Survey 會覆蓋此變數
+    k8s_model: "k8s-cluster-auto" # AWX Survey 覆蓋此變數
+    ks_host_ip: "192.168.1.112"   # KubeSphere Host IP
+    ks_host_user: "garylai"       # Host 登入帳號
 
   tasks:
-    # ----------------------------------------------------------------
-    # Juju 部署部分 (保留原樣)
-    # ----------------------------------------------------------------
+    # ----------------------------------------------------
+    # 1. 基礎設施部署 (Juju)
+    # ----------------------------------------------------
     - name: 1.1 Create Juju Model
       command: "juju add-model {{ k8s_model }}"
       ignore_errors: yes
@@ -27,9 +26,9 @@
     - name: 2. Wait for MicroK8s to be Ready
       command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
 
-    # ----------------------------------------------------------------
-    # 取得連線資訊與設定檔
-    # ----------------------------------------------------------------
+    # ----------------------------------------------------
+    # 2. 準備 Kubeconfig
+    # ----------------------------------------------------
     - name: 3. Get Node Public IPv4
       command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
       register: ip_result
@@ -42,75 +41,36 @@
       shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
       register: kubeconfig_b64
 
-    # ----------------------------------------------------------------
-    # 傳遞變數給 Host (請確認您的 KubeSphere 密碼)
-    # ----------------------------------------------------------------
-    - name: 6. Add KubeSphere Host to Inventory
-      add_host:
-        name: "ks_host"
-        ansible_host: "192.168.1.112"
-        ansible_user: "garylai"
-        cluster_name: "{{ k8s_model }}"
-        cluster_config: "{{ kubeconfig_b64.stdout }}"
-        ks_password: "1qaz@WSX"  # <--- 您的 KubeSphere 登入密碼
-
-# =================================================================
-# 第二場戲：在 KubeSphere Host 上用 Curl 呼叫 API (Play 2)
-# =================================================================
-- name: 2. Register Cluster via Local API (on KubeSphere Host)
-  hosts: ks_host
-  gather_facts: no
-  
-  tasks:
-    # 1. 登入 API 取得 Token (使用 localhost 繞過外部限制)
-    - name: 7. Login and Get Token (Curl)
+    # ----------------------------------------------------
+    # 3. 透過 SSH 遠端執行註冊 (保證成功)
+    # ----------------------------------------------------
+    - name: 6. Remote Register on KubeSphere Host
       shell: |
-        curl -s -X POST "http://localhost:30880/kapis/iam.kubesphere.io/v1alpha2/login" \
-        -H "Content-Type: application/json" \
-        -d '{"username":"admin","password":"{{ ks_password }}"}'
-      register: login_response
-      ignore_errors: yes # 避免登入失敗直接紅燈，讓我們能看到錯誤訊息
+        ssh -o StrictHostKeyChecking=no {{ ks_host_user }}@{{ ks_host_ip }} "cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ k8s_model }}
+          labels:
+            cluster-role.kubesphere.io/member: \"\"
+        spec:
+          connection:
+            type: direct
+            kubeconfig: {{ kubeconfig_b64.stdout }}
+          provider: microk8s
+        EOF"
+      register: ssh_result
 
-    # 用 Debug 印出回應，萬一失敗才知道原因
-    - name: 7.1 Debug Login Response
-      debug:
-        var: login_response.stdout
-
-    - name: 8. Parse Token
-      set_fact:
-        api_token: "{{ (login_response.stdout | from_json).oauthToken.access_token }}"
-      when: login_response.rc == 0 and 'oauthToken' in login_response.stdout
-
-    # 2. 使用 Token 呼叫 API 建立集群
-    - name: 9. Create Cluster via API (Curl)
+    # ----------------------------------------------------
+    # 4. 強力刷新 UI (重啟後端與前端)
+    # ----------------------------------------------------
+    - name: 7. Force Refresh UI (Restart KS Services)
       shell: |
-        curl -s -X POST "http://localhost:30880/kapis/cluster.kubesphere.io/v1alpha1/clusters" \
-        -H "Authorization: Bearer {{ api_token }}" \
-        -H "Content-Type: application/json" \
-        -d '{
-          "apiVersion": "cluster.kubesphere.io/v1alpha1",
-          "kind": "Cluster",
-          "metadata": {
-            "name": "{{ cluster_name }}",
-            "labels": {
-              "cluster-role.kubesphere.io/member": ""
-            }
-          },
-          "spec": {
-            "connection": {
-              "type": "direct",
-              "kubeconfig": "{{ cluster_config }}"
-            },
-            "provider": "microk8s"
-          }
-        }'
-      register: create_response
-      # 判斷成功條件：回傳成功或已存在
-      failed_when: 
-        - create_response.rc != 0
-        - '"reason" in create_response.stdout and "AlreadyExists" not in create_response.stdout'
-      when: api_token is defined
+        ssh -o StrictHostKeyChecking=no {{ ks_host_user }}@{{ ks_host_ip }} "kubectl rollout restart deployment ks-apiserver -n kubesphere-system && kubectl rollout restart deployment ks-console -n kubesphere-system"
+      ignore_errors: yes
 
-    - name: Final Success Message
+    - name: Final Status
       debug:
-        msg: "🎉 API 註冊完成！請檢查 KubeSphere UI 數字是否更新。"
+        msg: 
+          - "🎉 成功！集群 {{ k8s_model }} 已註冊。"
+          - "KubeSphere 服務正在重啟以刷新數據，請稍等 1 分鐘後刷新網頁。"
