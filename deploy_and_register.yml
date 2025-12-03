@@ -1,21 +1,15 @@
 ---
-- name: Deploy K8s and Auto-Register to KubeSphere
+- name: Deploy K8s and Register to KubeSphere (CLI Method)
   hosts: all
   gather_facts: no
   vars:
-    # --- 變數設定 (AWX Survey 輸入的 k8s_model 會覆蓋這裡) ---
-    k8s_model: "k8s-cluster-auto"
-    
-    # --- KubeSphere 連線資訊 ---
-    ks_url: "http://192.168.1.112:30880"
-    
-    # 【關鍵修正】使用 ServiceAccount Bearer Token 繞過登入 API
-    # ⚠️ 請將此處的佔位符替換成您之前取得的 Cluster-Admin Token！
-    ks_token: "eyJhbGciOiJSUzI1NiIsImtpZCI6ImszdmJRMm1USVpCd19YUGt4QUZDVEdCbkpzQkNsc2dQcUJYaUpzS2daVTQifQ.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJrdWJlc3BoZXJlLXN5c3RlbSIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VjcmV0Lm5hbWUiOiJhd3gtYXV0b21hdGlvbi10b2tlbiIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50Lm5hbWUiOiJhd3gtYXV0b21hdGlvbiIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50LnVpZCI6IjQ2MjQ2ODlkLTgzZTEtNDZmMC04NWRmLTI1OTM2NTkwNjJiMCIsInN1YiI6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDprdWJlc3BoZXJlLXN5c3RlbTphd3gtYXV0b21hdGlvbiJ9.nNp2th8MWfPlwDNIZ-0IaVG6g_SWSlsBnK6Qjav5Snnb4TZbWurGp-CE1b6_aRKwBsfWG-2tSWHGSH7EbgK1INAnJMmHKs6CsQKnVspgjoUYflQUf87AAG1srmPVXdIMT_lDoyU703hvlndguxBFDsnfGlfilYLovolDP37WLxOiwfoiJPpgOFtpUsLp5D8uxyVe9pV4Iu_QdLyZsu-KSCnRTEfKcfIvX2G5R5z2uvwdeoHX0w1PeL5Ay4plqEZ9kBNm2DsklZpx4HOZRwp7mR7xjO8y_gMDgQhLA0uR0H5-7tsZYGKeJ9j59xYaf89GNzDAiToTx4zLV6_I5fWziQ"
+    # --- 變數設定 ---
+    k8s_model: "k8s-cluster-auto" # AWX Survey 會覆蓋此變數
+    # 注意：這次不需要 KubeSphere 帳密了，因為我們直接用 kubectl
 
   tasks:
     # =========================================================
-    # 第一階段：Juju 部署與設定檔獲取 (不變)
+    # 第一階段：Juju 部署 (與之前相同)
     # =========================================================
     
     - name: 1.1 Create Juju Model
@@ -28,7 +22,7 @@
 
     - name: 1.3 Deploy MicroK8s
       command: "juju deploy microk8s --channel=1.28/stable --base ubuntu@22.04 -m {{ k8s_model }}"
-      ignore_errors: yes
+      ignore_errors: yes 
 
     - name: 2. Wait for MicroK8s to be Ready
       command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
@@ -41,43 +35,42 @@
       set_fact:
         node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
 
-    - name: 5. Get and Patch Kubeconfig
-      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g'"
-      register: kubeconfig_patched
-
     # =========================================================
-    # 第二階段：KubeSphere 自動納管 (使用 Token 認證)
+    # 第二階段：準備設定檔並註冊 (CLI 方法)
     # =========================================================
-    
-    # 【已刪除】 Task 6 (Login to KubeSphere API)
 
-    - name: 7. Register Cluster to KubeSphere
-      uri:
-        url: "{{ ks_url }}/kapis/cluster.kubesphere.io/v1alpha1/clusters"
-        method: POST
-        body_format: json
-        
-        # 【修正】直接使用 Bearer Token 進行認證，繞過 Login 閘道
-        headers:
-          Authorization: "Bearer {{ ks_token }}" 
-          Content-Type: "application/json"
-        
-        body:
-          apiVersion: "cluster.kubesphere.io/v1alpha1"
-          kind: "Cluster"
-          metadata:
-            name: "{{ k8s_model }}"
-            labels:
-              cluster-role.kubesphere.io/member: ""
-          spec:
-            connection:
-              type: "direct"
-              kubeconfig: "{{ kubeconfig_patched.stdout | b64encode }}"
-            provider: "microk8s"
-        status_code: [201, 409] # 409 代表已存在 (不算失敗)
-        validate_certs: no
-      delegate_to: localhost
+    - name: 5. Generate Base64 Kubeconfig
+      # 直接在 Juju 端處理好 IP 替換和 Base64 編碼，抓回來就是一行亂碼
+      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
+      register: kubeconfig_b64
 
+    - name: 6. Create Cluster CRD Manifest on Host
+      # 在 KubeSphere Host 上產生 YAML 檔案
+      # delegate_to: localhost 代表這一步是在 AWX 執行環境(或 Host)上跑，視您的 Inventory 設定
+      # 為了保險，我們假設您的 Inventory 'all' 指向的是 Juju Controller
+      # 但我們需要操作 KubeSphere Host (192.168.1.112)
+      # 這裡最簡單的方法是：利用 Juju Controller 當跳板，或者直接用 Ansible 的 kubernetes.core.k8s 模組
+      # 考慮到您的環境，我們用最單純的 'kubectl' 指令 (假設 Juju VM 上有 kubectl 且能連到 Host，或者我們直接 SSH 到 Host)
+      
+      # *** 關鍵策略 ***
+      # AWX 是跑在 KubeSphere 上面的，所以 AWX 的 Pod 其實可以直接對 KubeSphere 下指令！
+      # 我們直接在 AWX 容器內執行 kubectl apply
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ k8s_model }}
+          labels:
+            cluster-role.kubesphere.io/member: ""
+        spec:
+          connection:
+            type: direct
+            kubeconfig: {{ kubeconfig_b64.stdout }}
+          provider: microk8s
+        EOF
+      delegate_to: localhost # 在 AWX 容器本機執行
+      
     - name: Final Status
       debug:
-        msg: "🎉 成功！集群 {{ k8s_model }} (IP: {{ node_ip }}) 已部署並自動註冊至 KubeSphere。"
+        msg: "🎉 成功！集群 {{ k8s_model }} 已部署並透過 kubectl 完成註冊。"
