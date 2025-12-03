@@ -9,9 +9,9 @@
     k8s_model: "k8s-cluster-auto" # AWX Survey 會覆蓋此變數
 
   tasks:
-    # ----------------------------------------------------
-    # 1. 基礎設施部署 (MAAS + MicroK8s)
-    # ----------------------------------------------------
+    # ----------------------------------------------------------------
+    # Juju 部署部分
+    # ----------------------------------------------------------------
     - name: 1.1 Create Juju Model
       command: "juju add-model {{ k8s_model }}"
       ignore_errors: yes
@@ -27,9 +27,9 @@
     - name: 2. Wait for MicroK8s to be Ready
       command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
 
-    # ----------------------------------------------------
-    # 2. 取得連線資訊與設定檔
-    # ----------------------------------------------------
+    # ----------------------------------------------------------------
+    # 取得連線資訊與設定檔
+    # ----------------------------------------------------------------
     - name: 3. Get Node Public IPv4
       command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
       register: ip_result
@@ -38,74 +38,48 @@
       set_fact:
         node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
 
+    # ----------------------------------------------------------------
+    # 關鍵修改：產生 Base64 Config 並傳遞給 Host
+    # ----------------------------------------------------------------
     - name: 5. Generate Base64 Kubeconfig
-      # 直接在 Juju 端處理好 IP 替換和 Base64 編碼
       shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
       register: kubeconfig_b64
 
-    # ----------------------------------------------------
-    # 3. 動態新增 KubeSphere Host 到執行清單
-    # ----------------------------------------------------
     - name: 6. Add KubeSphere Host to Inventory
+      # 這個動作是「動態」把 Host 加入執行清單，並把變數傳過去
       add_host:
         name: "ks_host"
         ansible_host: "192.168.1.112" # KubeSphere Host IP
-        ansible_user: "garylai"       # SSH 登入帳號 (需已打通 SSH Key)
-        # 傳遞變數給下一場戲
+        ansible_user: "garylai"       # 登入帳號
+        # 把查到的資料傳給下一場戲
         cluster_name: "{{ k8s_model }}"
         cluster_config: "{{ kubeconfig_b64.stdout }}"
-        ks_password: "1qaz@WSX"       # KubeSphere 網頁登入密碼
 
 # ==========================================
-# 第二場戲：在 KubeSphere Host 上用 Curl 模擬網頁操作
+# 第二場戲：在 KubeSphere Host 上執行註冊
 # ==========================================
-- name: 2. Register Cluster via API (on KubeSphere Host)
+- name: 2. Register Cluster (on KubeSphere Host)
   hosts: ks_host
   gather_facts: no
   
   tasks:
-    - name: 7. Login and Get Token (Curl)
-      # 直接在 Host 本機呼叫 localhost API，最穩定
+    - name: 7. Apply Cluster CRD
       shell: |
-        curl -s -X POST "http://localhost:30880/kapis/iam.kubesphere.io/v1alpha2/login" \
-        -H "Content-Type: application/json" \
-        -d '{"username":"admin","password":"{{ ks_password }}"}'
-      register: login_response
-
-    - name: 8. Parse Token
-      set_fact:
-        # 解析回傳的 JSON 取得 Token
-        api_token: "{{ (login_response.stdout | from_json).oauthToken.access_token }}"
-
-    - name: 9. Create Cluster via API (Curl)
-      # 模擬網頁點擊「導入」的動作
-      shell: |
-        curl -s -X POST "http://localhost:30880/kapis/cluster.kubesphere.io/v1alpha1/clusters" \
-        -H "Authorization: Bearer {{ api_token }}" \
-        -H "Content-Type: application/json" \
-        -d '{
-          "apiVersion": "cluster.kubesphere.io/v1alpha1",
-          "kind": "Cluster",
-          "metadata": {
-            "name": "{{ cluster_name }}",
-            "labels": {
-              "cluster-role.kubesphere.io/member": ""
-            }
-          },
-          "spec": {
-            "connection": {
-              "type": "direct",
-              "kubeconfig": "{{ cluster_config }}"
-            },
-            "provider": "microk8s"
-          }
-        }'
-      register: create_response
-      # 允許 200/201 (成功) 或 409 (已存在)
-      failed_when: 
-        - create_response.rc != 0
-        - '"reason" in create_response.stdout and "AlreadyExists" not in create_response.stdout'
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ cluster_name }}
+          labels:
+            cluster-role.kubesphere.io/member: ""
+        spec:
+          connection:
+            type: direct
+            kubeconfig: {{ cluster_config }}
+          provider: microk8s
+        EOF
+      register: apply_result
 
     - name: Final Success Message
       debug:
-        msg: "🎉 API 註冊成功！Cluster count 應該已經更新。"
+        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已直接註冊至 KubeSphere。"
