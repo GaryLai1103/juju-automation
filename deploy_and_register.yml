@@ -1,7 +1,62 @@
-# ... (第一場戲：Juju 部分完全不變，省略以節省版面) ...
+---
+# ==========================================
+# 第一場戲：在 Juju Controller 上生成配置
+# ==========================================
+- name: 1. Deploy and Generate Config (on Juju)
+  hosts: all
+  gather_facts: no
+  vars:
+    k8s_model: "k8s-cluster-auto" # AWX Survey 會覆蓋此變數
+
+  tasks:
+    # ----------------------------------------------------------------
+    # Juju 部署部分
+    # ----------------------------------------------------------------
+    - name: 1.1 Create Juju Model
+      command: "juju add-model {{ k8s_model }}"
+      ignore_errors: yes
+
+    - name: 1.2 Set Model Base to Ubuntu 22.04
+      command: "juju model-config -m {{ k8s_model }} default-base=ubuntu@22.04"
+      ignore_errors: yes
+
+    - name: 1.3 Deploy MicroK8s
+      command: "juju deploy microk8s --channel=1.28/stable --base ubuntu@22.04 -m {{ k8s_model }}"
+      ignore_errors: yes 
+
+    - name: 2. Wait for MicroK8s to be Ready
+      command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
+
+    # ----------------------------------------------------------------
+    # 取得連線資訊與設定檔
+    # ----------------------------------------------------------------
+    - name: 3. Get Node Public IPv4
+      command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
+      register: ip_result
+
+    - name: 4. Parse IP Address
+      set_fact:
+        node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
+
+    # ----------------------------------------------------------------
+    # 關鍵修改：產生 Base64 Config 並傳遞給 Host
+    # ----------------------------------------------------------------
+    - name: 5. Generate Base64 Kubeconfig
+      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
+      register: kubeconfig_b64
+
+    - name: 6. Add KubeSphere Host to Inventory
+      # 這個動作是「動態」把 Host 加入執行清單，並把變數傳過去
+      add_host:
+        name: "ks_host"
+        ansible_host: "192.168.1.112" # KubeSphere Host IP
+        ansible_user: "garylai"       # 登入帳號
+        # 把查到的資料傳給下一場戲
+        cluster_name: "{{ k8s_model }}"
+        cluster_config: "{{ kubeconfig_b64.stdout }}"
 
 # ==========================================
-# 第二場戲：在 KubeSphere Host 上執行註冊與刷新
+# 第二場戲：在 KubeSphere Host 上執行註冊
 # ==========================================
 - name: 2. Register Cluster (on KubeSphere Host)
   hosts: ks_host
@@ -25,11 +80,6 @@
         EOF
       register: apply_result
 
-    # 【新增】強制重啟 KubeSphere API Server 以刷新 UI 計數
-    - name: 8. Force Refresh KubeSphere UI (Restart API)
-      command: "kubectl rollout restart deployment ks-apiserver -n kubesphere-system"
-      ignore_errors: yes # 就算重啟失敗也不要讓整個 Job 變紅燈
-
     - name: Final Success Message
       debug:
-        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已註冊，API Server 已重啟以刷新 UI。"
+        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已直接註冊至 KubeSphere。"
