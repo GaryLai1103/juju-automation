@@ -64,15 +64,6 @@
         EOF"
       register: ssh_result
 
-    # ----------------------------------------------------
-    # 4. 強力刷新 UI (修正版：加入指定金鑰)
-    # ----------------------------------------------------
-    - name: 7. Force Refresh UI (Restart KS Services)
-      shell: |
-        # 【修正】同樣加入 -i ~/.ssh/awx_key
-        ssh -i ~/.ssh/awx_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ks_host_user }}@{{ ks_host_ip }} "kubectl rollout restart deployment ks-apiserver -n kubesphere-system && kubectl rollout restart deployment ks-console -n kubesphere-system"
-      ignore_errors: yes
-
     - name: Final Status
       debug:
         msg: 
