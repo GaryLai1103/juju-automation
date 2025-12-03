@@ -38,7 +38,9 @@
         node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
 
     - name: 5. Generate Base64 Kubeconfig
-      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
+      # 【修正重點】加入 -o StrictHostKeyChecking=no 和 -o UserKnownHostsFile=/dev/null
+      # 這樣 Juju SSH 連線時就不會因為指紋變更而卡住
+      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
       register: kubeconfig_b64
 
     # ----------------------------------------------------
