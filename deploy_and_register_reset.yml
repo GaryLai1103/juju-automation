@@ -44,25 +44,50 @@
       register: kubeconfig_b64
 
     # ----------------------------------------------------
-    # 3. 透過 SSH 遠端執行註冊 (修正版：加入指定金鑰)
+    # 3. 透過 SSH 遠端執行註冊 (穩定版：先產檔 -> 再傳送 -> 再執行)
     # ----------------------------------------------------
-    - name: 6. Remote Register on KubeSphere Host
+    
+    # 步驟 6.1: 先在 Juju VM 本地產生正確的 YAML 檔案
+    # 這樣可以確保 Ansible 變數 ({{ ... }}) 完美填入，不會受 SSH 影響
+    - name: 6.1 Create Import YAML locally on Juju VM
+      copy:
+        dest: "/tmp/{{ k8s_model }}_import.yaml"
+        content: |
+          apiVersion: cluster.kubesphere.io/v1alpha1
+          kind: Cluster
+          metadata:
+            name: {{ k8s_model }}
+            labels:
+              cluster-role.kubesphere.io/member: ""
+          spec:
+            connection:
+              type: direct
+              kubeconfig: {{ kubeconfig_b64.stdout }}
+            provider: microk8s
+
+    # 步驟 6.2: 把檔案傳送到 KubeSphere Host
+    - name: 6.2 SCP YAML to Host
+      shell: >
+        scp -i ~/.ssh/awx_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        /tmp/{{ k8s_model }}_import.yaml
+        {{ ks_host_user }}@{{ ks_host_ip }}:/tmp/{{ k8s_model }}_import.yaml
+
+    # 步驟 6.3: 在 Host 上執行 Apply (使用 kubectl 的絕對路徑)
+    # 我們先用 'which kubectl' 找路徑，找不到就預設 /usr/local/bin/kubectl
+    - name: 6.3 Apply YAML on Host
       shell: |
-        # 【修正】加入 -i ~/.ssh/awx_key 明確指定私鑰
-        ssh -i ~/.ssh/awx_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ks_host_user }}@{{ ks_host_ip }} "cat <<EOF | kubectl apply -f -
-        apiVersion: cluster.kubesphere.io/v1alpha1
-        kind: Cluster
-        metadata:
-          name: {{ k8s_model }}
-          labels:
-            cluster-role.kubesphere.io/member: \"\"
-        spec:
-          connection:
-            type: direct
-            kubeconfig: {{ kubeconfig_b64.stdout }}
-          provider: microk8s
-        EOF"
-      register: ssh_result
+        ssh -i ~/.ssh/awx_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {{ ks_host_user }}@{{ ks_host_ip }} "
+        # 嘗試尋找 kubectl，若找不到則嘗試常見路徑
+        KUBECTL=\$(which kubectl || echo /usr/local/bin/kubectl || echo /usr/bin/kubectl)
+        \$KUBECTL apply -f /tmp/{{ k8s_model }}_import.yaml
+        "
+      register: apply_result
+
+    - name: Final Status
+      debug:
+        msg: 
+          - "🎉 成功！已透過 SSH 檔案傳輸方式註冊集群。"
+          - "Host 回應: {{ apply_result.stdout }}"
 
     - name: Final Status
       debug:
