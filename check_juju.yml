@@ -1,4 +1,3 @@
----
 - name: Check Juju Status
   hosts: all
   gather_facts: no  # 加快速度，不蒐集硬體資訊
