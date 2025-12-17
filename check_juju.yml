@@ -1,0 +1,13 @@
+---
+- name: Check Juju Status
+  hosts: all
+  gather_facts: no  # 加快速度，不蒐集硬體資訊
+  tasks:
+    - name: Run juju status command
+      shell: /snap/bin/juju status --color
+      # 注意：請確認 juju 的安裝路徑，通常是 /snap/bin/juju
+      register: juju_output
+
+    - name: Show Juju output
+      debug:
+        msg: "{{ juju_output.stdout_lines }}"
