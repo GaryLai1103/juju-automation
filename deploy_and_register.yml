@@ -93,13 +93,18 @@
   gather_facts: no
   
   tasks:
-    - name: 9. Apply Cluster CRD
+    - name: 9. Apply Cluster CRD with Success Labels
       shell: |
         cat <<EOF | kubectl apply -f -
         apiVersion: cluster.kubesphere.io/v1alpha1
         kind: Cluster
         metadata:
           name: {{ cluster_name }}
+          labels:
+            # 讓 Dashboard 顯示數字跳動的關鍵標籤組合
+            kubesphere.io/managed: "true"
+            cluster-role.kubesphere.io/member: ""
+            cluster-role.kubesphere.io/public: ""
         spec:
           provider: microk8s
           joinFederation: true
