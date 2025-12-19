@@ -1,12 +1,14 @@
----
 # ==========================================
 # 第一場戲：在 Juju Controller 上生成配置
 # ==========================================
 - name: 1. Deploy and Generate Config (on Juju)
-  hosts: all
+  hosts: all  # 確保 AWX Inventory 指向您的 Juju Controller (maasjuju)
   gather_facts: no
   vars:
-    k8s_model: "k8s-cluster-auto" # AWX Survey 會覆蓋此變數
+    k8s_model: "k8s-cluster-auto"
+    # [修改] 將 KubeSphere 的資訊變數化，不要寫死 IP
+    ks_host_ip: "192.168.100.4"   # 請在 AWX Survey 設定此變數
+    ks_host_user: "ubuntu"        # 請在 AWX Survey 設定此變數
 
   tasks:
     # ----------------------------------------------------------------
@@ -24,34 +26,48 @@
       command: "juju deploy microk8s --channel=1.28/stable --base ubuntu@22.04 -m {{ k8s_model }}"
       ignore_errors: yes 
 
+    # [優化] 使用 retries 取代單純 wait-for，避免 Juju 版本差異導致指令失敗
     - name: 2. Wait for MicroK8s to be Ready
-      command: "juju wait-for application microk8s -m {{ k8s_model }} --query='name==\"microk8s\" && status==\"active\"'"
+      shell: "juju status -m {{ k8s_model }} --format json | jq -r '.applications.microk8s.status.active'"
+      register: app_status
+      until: app_status.stdout == "true"
+      retries: 30
+      delay: 10
 
     # ----------------------------------------------------------------
-    # 取得連線資訊與設定檔
+    # [關鍵修正] 設定 SANs (Subject Alternative Names)
     # ----------------------------------------------------------------
     - name: 3. Get Node Public IPv4
-      command: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global"
+      # 排除 127.0.0.1，確保抓到對外 IP
+      shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- ip -4 -o addr show scope global | grep -v '127.0.0.1' | awk '{print $4}' | cut -d/ -f1 | head -n1"
       register: ip_result
 
-    - name: 4. Parse IP Address
+    - name: 4. Set Facts
       set_fact:
-        node_ip: "{{ ip_result.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
+        node_ip: "{{ ip_result.stdout | trim }}"
+
+    - name: 5. Add IP to MicroK8s Cert SANs
+      # 這是最重要的修正！如果不加這行，KubeSphere 連線時會報 x509 錯誤
+      command: "juju config -m {{ k8s_model }} microk8s extra_sans={{ node_ip }}"
+
+    # 等待證書更新重啟
+    - name: 6. Wait for Config Update
+      wait_for:
+        timeout: 10
 
     # ----------------------------------------------------------------
-    # 關鍵修改：產生 Base64 Config 並傳遞給 Host
+    # 產生 Base64 Config 並傳遞給 Host
     # ----------------------------------------------------------------
-    - name: 5. Generate Base64 Kubeconfig
+    - name: 7. Generate Base64 Kubeconfig
+      # 使用 sed 替換 IP，並轉為 Base64 (不換行)
       shell: "juju ssh -m {{ k8s_model }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
       register: kubeconfig_b64
 
-    - name: 6. Add KubeSphere Host to Inventory
-      # 這個動作是「動態」把 Host 加入執行清單，並把變數傳過去
+    - name: 8. Add KubeSphere Host to Inventory
       add_host:
         name: "ks_host"
-        ansible_host: "192.168.1.112" # KubeSphere Host IP
-        ansible_user: "garylai"       # 登入帳號
-        # 把查到的資料傳給下一場戲
+        ansible_host: "{{ ks_host_ip }}"
+        ansible_user: "{{ ks_host_user }}"
         cluster_name: "{{ k8s_model }}"
         cluster_config: "{{ kubeconfig_b64.stdout }}"
 
@@ -63,24 +79,25 @@
   gather_facts: no
   
   tasks:
-    - name: 7. Apply Cluster CRD
+    - name: 9. Apply Cluster CRD
+      # [修正] 這裡修正了 YAML 縮排錯誤，這在 Ansible 中非常嚴格
       shell: |
         cat <<EOF | kubectl apply -f -
         apiVersion: cluster.kubesphere.io/v1alpha1
         kind: Cluster
+        metadata:
+          name: {{ cluster_name }}
         spec:
           provider: microk8s
+          joinFederation: true
           connection:
             type: direct
             kubeconfig: {{ cluster_config }}
-          joinFederation: true
           config: 
-            global:
-        metadata:
-          name: {{ cluster_name }}
+            global: {}
         EOF
       register: apply_result
 
     - name: Final Success Message
       debug:
-        msg: "🎉 全自動成功！集群 {{ cluster_name }} 已直接註冊至 KubeSphere。"
+        msg: "🎉 全自動成功！集群 {{ cluster_name }} (IP: {{ hostvars['ks_host']['cluster_name'] }}) 已直接註冊至 KubeSphere。"
