@@ -87,7 +87,6 @@
   
   tasks:
     - name: 9. Apply Cluster CRD
-      # 這裡的 cluster_name 是由上一場戲的 [修改 9] 傳過來的，所以這裡不用動
       shell: |
         cat <<EOF | kubectl apply -f -
         apiVersion: cluster.kubesphere.io/v1alpha1
@@ -100,8 +99,6 @@
           connection:
             type: direct
             kubeconfig: {{ cluster_config }}
-          config: 
-            global: {}
         EOF
       register: apply_result
 
