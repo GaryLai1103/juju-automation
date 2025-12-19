@@ -26,13 +26,13 @@
       command: "juju deploy microk8s --channel=1.28/stable --base ubuntu@22.04 -m {{ k8s_model }}"
       ignore_errors: yes 
 
-    # [優化] 使用 retries 取代單純 wait-for，避免 Juju 版本差異導致指令失敗
     - name: 2. Wait for MicroK8s to be Ready
-      shell: "juju status -m {{ k8s_model }} --format json | jq -r '.applications.microk8s.status.active'"
-      register: app_status
-      until: app_status.stdout == "true"
-      retries: 30
-      delay: 10
+      # 使用 Juju 原生等待指令，但加上 20 分鐘超時設定 (避免網路慢時中斷)
+      command: >
+        juju wait-for application microk8s 
+        -m {{ k8s_model }} 
+        --query='status=="active"' 
+        --timeout 20m0s
 
     # ----------------------------------------------------------------
     # [關鍵修正] 設定 SANs (Subject Alternative Names)
