@@ -40,7 +40,14 @@
         -m {{ k8s_cluster }} 
         --query='status=="active"' 
         --timeout 20m0s
+    # ----------------------------------------------------------------
+    # 啟用 MicroK8s 必要插件 (解決 PVC 掛不上的問題)
+    # ----------------------------------------------------------------
+    - name: 2.1 Enable MicroK8s Storage Addon
+      command: "juju ssh -m {{ k8s_cluster }} microk8s/0 -- sudo microk8s enable hostpath-storage"
 
+    - name: 2.2 Enable MicroK8s DNS Addon (推薦加入，否則服務發現會出錯)
+      command: "juju ssh -m {{ k8s_cluster }} microk8s/0 -- sudo microk8s enable dns"
     # ----------------------------------------------------------------
     # 設定 SANs
     # ----------------------------------------------------------------
