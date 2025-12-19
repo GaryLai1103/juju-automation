@@ -41,14 +41,6 @@
         --query='status=="active"' 
         --timeout 20m0s
     # ----------------------------------------------------------------
-    # 啟用 MicroK8s 必要插件 (解決 PVC 掛不上的問題)
-    # ----------------------------------------------------------------
-    - name: 2.1 Enable MicroK8s Storage Addon
-      command: "juju ssh -m {{ k8s_cluster }} microk8s/0 -- sudo microk8s enable hostpath-storage"
-
-    - name: 2.2 Enable MicroK8s DNS Addon (推薦加入，否則服務發現會出錯)
-      command: "juju ssh -m {{ k8s_cluster }} microk8s/0 -- sudo microk8s enable dns"
-    # ----------------------------------------------------------------
     # 設定 SANs
     # ----------------------------------------------------------------
     - name: 3. Get Node Public IPv4
@@ -75,7 +67,23 @@
       # [修改 8] 變數名稱改為 k8s_cluster
       shell: "juju ssh -m {{ k8s_cluster }} microk8s/0 -- sudo microk8s config | sed 's/127.0.0.1/{{ node_ip }}/g' | base64 -w 0"
       register: kubeconfig_b64
-
+      
+    # === [把它放在這裡！] ===
+    - name: 7.1 Enable MicroK8s Addons (Storage & DNS)
+      # 加上 retry 是為了防止 MicroK8s 剛好在重啟 API Server
+      command: "juju ssh -m {{ k8s_cluster }} microk8s/0 -- sudo microk8s enable hostpath-storage dns"
+      register: addon_result
+      until: addon_result.rc == 0
+      retries: 5
+      delay: 5
+      ignore_errors: yes
+    
+    # 稍微等一下讓 StorageClass 建立好，這樣 KubeSphere 一進來就有硬碟用
+    - name: 7.2 Wait for Storage to reflect
+      pause:
+        seconds: 10
+    # =======================
+    
     - name: 8. Add KubeSphere Host to Inventory
       add_host:
         name: "ks_host"
