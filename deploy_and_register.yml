@@ -27,6 +27,7 @@
       # [修改 3] 變數名稱改為 k8s_cluster
       command: "juju model-config -m {{ k8s_cluster }} default-base=ubuntu@22.04"
       ignore_errors: yes
+      tags: [deploy]
 
     - name: 1.3 Deploy MicroK8s
       # [修改 4] 變數名稱改為 k8s_cluster
