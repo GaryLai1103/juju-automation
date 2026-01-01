@@ -1,7 +1,7 @@
 # ==========================================
-# SKU: HPC-Full-Stack-Reconstruction-v2-Optimized
+# SKU: HPC-Full-Stack-Reconstruction-v3-Parallel
 # ==========================================
-- name: 1. 基礎環境與硬體準備 (OS + Driver)
+- name: 1. 控制端佈署與運算端硬體準備
   hosts: all
   gather_facts: no
   vars:
@@ -13,63 +13,52 @@
       command: "juju add-model {{ slurm_model }}"
       ignore_errors: yes
 
-    - name: 1.2 向 MAAS 請求 GPU 節點
-      command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node"
-      register: add_machine_result
-
-    - name: 1.3 獲取剛建立的 Machine ID
-      # 從 add-machine 的輸出中抓取 created machine ID
-      shell: "juju machines -m {{ slurm_model }} --format json | jq -r '.machines | keys | last'"
-      register: target_machine_id
-
-    - name: 1.4 等待 Machine 就緒 (修正語法)
-      # 使用 agent-status==\"idle\" 是最穩妥的判斷方式，代表 OS 灌完且 Juju 已接管
-      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
-
-    - name: 1.5 在佈署 Slurm 前先行安裝 580 驅動
-      shell: |
-        juju ssh -m {{ slurm_model }} {{ target_machine_id.stdout }} "
-        sudo apt-get update && \
-        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 && \
-        sudo nvidia-smi -pm 1
-        "
-    - name: 1.6 安裝 DCGM Exporter (用於 Prometheus 監控，選配)
-      shell: |
-        juju ssh -m {{ slurm_model }} {{ target_machine_id.stdout }} "
-        if [ ! -f /usr/bin/dcgm-exporter ]; then
-          wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.1/dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
-          sudo dpkg -i dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
-          sudo systemctl enable --now dcgm-exporter
-        fi
-        "
-      ignore_errors: yes
-      
-# ==========================================
-# 第二階段：精準佈署 Slurm 組件到指定機器
-# ==========================================
-- name: 2. 定點佈署 Slurm 角色
-  hosts: all
-  vars:
-    slurm_model: "hpc-lab"
-    target_os: "ubuntu@24.04"
-  tasks:
-    - name: 2.1 佈署控制端 (可佈署於虛擬容器或新機器)
+    # [優化]：先讓大腦上線
+    - name: 1.2 佈署控制端 (slurmctld)
       command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
       ignore_errors: yes
 
-    - name: 2.2 佈署運算端到「已裝好驅動」的 Machine 0
-      # [核心修正]：使用 --to 0 強制佈署到剛才裝好驅動的那台機器
-      command: "juju deploy slurmd -m {{ slurm_model }} --to 0 --channel=23.11/stable"
+    - name: 1.3 向 MAAS 請求 GPU 節點 (僅安裝系統)
+      command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node"
+      register: add_machine_result
+
+    - name: 1.4 獲取運算節點 Machine ID
+      shell: "juju machines -m {{ slurm_model }} --format json | jq -r '.machines | keys | last'"
+      register: target_machine_id
+
+    - name: 1.5 等待運算節點 OS 就緒
+      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
+
+    - name: 1.6 安裝 NVIDIA 驅動與 DCGM (在佈署 slurmd 前)
+      shell: |
+        juju ssh -m {{ slurm_model }} {{ target_machine_id.stdout }} "
+        sudo apt-get update && \
+        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager && \
+        sudo systemctl enable --now nvidia-dcgm && \
+        sudo nvidia-smi -pm 1
+        "
+
+# ==========================================
+# 第二階段：佈署運算端並建立連動
+# ==========================================
+- name: 2. 佈署 Slurm 運算端
+  hosts: all
+  vars:
+    slurm_model: "hpc-lab"
+  tasks:
+    - name: 2.1 佈署運算端至指定已就緒機器
+      # 使用 1.4 抓到的動態 ID
+      command: "juju deploy slurmd -m {{ slurm_model }} --to {{ target_machine_id.stdout }} --channel=23.11/stable"
       ignore_errors: yes
 
-    - name: 2.3 建立連動
+    - name: 2.2 建立整合關係 (大腦與手腳連線)
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
 # ==========================================
-# 第三階段：深度修正（插件與網路對齊）
+# 第三階段：深度修正 (插件、網路、DCGM Exporter)
 # ==========================================
-- name: 3. 執行節點自動化修正
+- name: 3. 執行自動化環境修正
   hosts: all
   tasks:
     - name: 3.1 修正控制端 (slurmctld)
@@ -85,26 +74,29 @@
         sudo systemctl restart munge && sudo systemctl restart slurmctld
         "
 
-    - name: 3.2 修正運算端 (slurmd)
+    - name: 3.2 修正運算端與安裝 DCGM Exporter
       shell: |
         juju ssh -m hpc-lab slurmd/0 "
-        # 自動抓取 master 資訊
+        # 1. 網路與 Slurm 修正
         CTLD_IP=\$(juju ssh -m hpc-lab slurmctld/0 'hostname -I' | awk '{print \$1}')
         sudo sed -i '/slurm-master/d' /etc/hosts
         echo \"\$CTLD_IP slurm-master\" | sudo tee -a /etc/hosts
-        
-        # 設定檔修正
         sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
         sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
         echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
-        
-        # 強制對齊硬體描述
         sudo sed -i '/NodeName=gpu-node01/c\NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN' /etc/slurm/slurm.conf
         
+        # 2. DCGM Exporter 安裝
+        if [ ! -f /usr/bin/dcgm-exporter ]; then
+          wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.1/dcgm-exporter_3.3.5-3.4.1_amd64.deb
+          sudo dpkg -i dcgm-exporter_3.3.5-3.4.1_amd64.deb
+          sudo systemctl enable --now dcgm-exporter
+        fi
+
         sudo mkdir -p /run/slurm && sudo chown slurm:slurm /run/slurm
         sudo systemctl restart munge && sudo systemctl restart slurmd
         "
 
-    - name: 3.3 最終啟動
+    - name: 3.3 最終節點喚醒
       shell: |
         juju ssh -m hpc-lab slurmctld/0 "sudo scontrol update nodename=gpu-node01 state=resume"
