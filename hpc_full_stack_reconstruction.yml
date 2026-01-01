@@ -33,7 +33,17 @@
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 && \
         sudo nvidia-smi -pm 1
         "
-
+    - name: 1.6 安裝 DCGM Exporter (用於 Prometheus 監控，選配)
+      shell: |
+        juju ssh -m {{ slurm_model }} {{ target_machine_id.stdout }} "
+        if [ ! -f /usr/bin/dcgm-exporter ]; then
+          wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.1/dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
+          sudo dpkg -i dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
+          sudo systemctl enable --now dcgm-exporter
+        fi
+        "
+      ignore_errors: yes
+      
 # ==========================================
 # 第二階段：精準佈署 Slurm 組件到指定機器
 # ==========================================
