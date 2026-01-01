@@ -29,8 +29,9 @@
       shell: "juju machines -m {{ slurm_model }} --format json | jq -r '.machines | keys | last'"
       register: target_machine_id
 
-    - name: 1.5 等待運算節點 OS 就緒
-      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
+    - name: 1.5 等待運算節點實體啟動 (對齊表格 State)
+      # 查詢表格中顯示的 "started" 狀態
+      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='instance-status==\"running\"' --timeout 15m"
 
     - name: 1.6 安裝 NVIDIA 驅動與 DCGM (在佈署 slurmd 前)
       shell: |
