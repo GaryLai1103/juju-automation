@@ -2,8 +2,17 @@
 # SKU: HPC-Full-Stack-Reconstruction
 # ==========================================
 - name: 1. 兩台機器 OS 佈署與 Slurm 角色配置 (使用 Tags)
-  hosts: juju_controller
+  hosts: all  # 確保 AWX Inventory 指向您的 Juju Controller (maasjuju)
+  gather_facts: no
   vars:
+    # [修改 1] 移除原本的 k8s_model 定義
+    # 因為 AWX Survey 會直接傳入 'k8s_cluster' 這個變數，這裡不需要再定義
+    # 如果您想保留預設值以防萬一，可以解開下面這行註解，但通常不需要：
+    # k8s_cluster: "{{ k8s_cluster | default('k8s-cluster-auto') }}"
+
+    # [保留] 這些建議也加入 Survey，目前先保留在此當作預設值
+    ks_host_ip: "192.168.100.4"
+    ks_host_user: "ubuntu"
     slurm_model: "hpc-lab"
     # [修改] 更新為 Ubuntu 24.04
     target_os: "ubuntu@24.04"
