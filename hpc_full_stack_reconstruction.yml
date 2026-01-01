@@ -1,7 +1,7 @@
 # ==========================================
-# SKU: HPC-Full-Stack-Reconstruction
+# SKU: HPC-Full-Stack-Reconstruction-v2
 # ==========================================
-- name: 1. 兩台機器 OS 佈署與 Slurm 角色配置
+- name: 1. 環境準備與 GPU 驅動先行安裝
   hosts: all
   gather_facts: no
   vars:
@@ -11,63 +11,86 @@
   tasks:
     - name: 1.1 建立全新 Model
       command: "juju add-model {{ slurm_model }}"
-      # [保留] 如果 model 已存在，不報錯繼續往下
       ignore_errors: yes
 
-    - name: 1.2 佈署控制端 (slurmctld)
-      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
-      # [新增] 如果應用程式已存在，則視為成功
-      register: deploy_ctld
-      failed_when: 
-        - deploy_ctld.rc != 0 
-        - "'already exists' not in deploy_ctld.stderr"
-
-    - name: 1.3 佈署運算端 (slurmd)
-      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }} --channel=23.11/stable"
-      # [新增] 同樣處理「已存在」的情況
-      register: deploy_d
-      failed_when: 
-        - deploy_d.rc != 0 
-        - "'already exists' not in deploy_d.stderr"
-
-    - name: 1.4 建立連動關係
-      command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
-      # [新增] 避免重複建立連動報錯
+    # [關鍵修正]：在佈署 slurmd 之前，必須先確保機器有驅動，否則 Juju 偵測會出錯
+    - name: 1.2 預先安裝 580 驅動 (對應 MAAS 標籤節點)
+      shell: |
+        # 這裡建議透過 MAAS 或直接對目標機進行操作，若透過 Juju 則需先 add-machine
+        # 假設 slurmd/0 已經在 machine 1 上
+        juju ssh -m {{ slurm_model }} 1 "
+        sudo apt-get update && \
+        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580
+        "
       ignore_errors: yes
 
-    - name: 1.5 等待服務啟動
-      # 既然 status 已經是 active，這步會秒過
-      command: "juju wait-for application slurmd -m {{ slurm_model }} --query='status==\"active\"' --timeout 5m0s"
-
 # ==========================================
-# 第二場戲：針對 gpu-node01 進行環境注入
+# 第二階段：佈署 Slurm 組件
 # ==========================================
-- name: 2. 針對運算節點安裝 580 驅動與監控
+- name: 2. 佈署 Slurm 角色與建立連動
   hosts: all
-  gather_facts: no
   vars:
     slurm_model: "hpc-lab"
-
   tasks:
-    - name: 2.1 基礎環境清理與倉庫設定
-      shell: |
-        juju ssh -m {{ slurm_model }} slurmd/0 "
-        # 徹底移除所有舊版驅動殘留，避免與官方庫衝突
-        sudo apt-get purge -y nvidia* libnvidia* && \
-        sudo apt-get autoremove -y && \
-        
-        # 重新導入倉庫
-        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
-        sudo dpkg -i cuda-keyring_1.1-1_all.deb && \
-        sudo apt-get update"
+    - name: 2.1 佈署控制端
+      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
+      register: deploy_ctld
+      failed_when: "(deploy_ctld.rc != 0) and ('already exists' not in deploy_ctld.stderr)"
 
-    - name: 2.2 安裝官方版 580 驅動與監控
+    - name: 2.2 佈署運算端
+      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }} --channel=23.11/stable"
+      register: deploy_d
+      failed_when: "(deploy_d.rc != 0) and ('already exists' not in deploy_d.stderr)"
+
+    - name: 2.3 建立整合關係
+      command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
+      ignore_errors: yes
+
+# ==========================================
+# 第三階段：深度修正（解決閃退與 GPU 識別問題）
+# ==========================================
+- name: 3. 執行節點自動化修正
+  hosts: all
+  tasks:
+    - name: 3.1 修正控制端 (slurmctld) 網路認同與插件
       shell: |
-        juju ssh -m {{ slurm_model }} slurmd/0 "
-        # 指定安裝官方倉庫的版本
-        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager && \
+        juju ssh -m hpc-lab slurmctld/0 "
+        # 修正自我名稱解析 (slurmhn)
+        REAL_HOSTNAME=\$(hostname)
+        sudo sed -i \"/127.0.0.1/s/$/ \$REAL_HOSTNAME slurm-master/\" /etc/hosts
         
-        # 下載並安裝監控
-        wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.1/dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
-        sudo dpkg -i dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
-        sudo systemctl enable --now dcgm-exporter"
+        # 修正 slurm.conf: 升級插件並移除過時參數
+        sudo sed -i 's/SlurmctldHost=.*/SlurmctldHost='\$REAL_HOSTNAME'/g' /etc/slurm/slurm.conf
+        sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
+        sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
+        sudo sed -i '1i SlurmdParameters=config_overrides' /etc/slurm/slurm.conf
+        
+        # 建立 spool 目錄
+        sudo mkdir -p /var/spool/slurmctld && sudo chown slurm:slurm /var/spool/slurmctld
+        sudo systemctl restart munge && sudo systemctl restart slurmctld
+        "
+
+    - name: 3.2 修正運算端 (slurmd) GPU 宣告與網路
+      shell: |
+        juju ssh -m hpc-lab slurmd/0 "
+        # 抓取控制端真實 IP 並對齊 hosts
+        CTLD_IP=\$(juju ssh -m hpc-lab slurmctld/0 'hostname -I' | awk '{print \$1}')
+        sudo sed -i '/slurm-master/d' /etc/hosts
+        echo \"\$CTLD_IP slurm-master\" | sudo tee -a /etc/hosts
+        
+        # 修正設定檔與建立 gres.conf
+        sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
+        sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
+        echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
+        
+        # 強制寫入正確規格 (18核, 128G)
+        sudo sed -i '/NodeName=gpu-node01/c\NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN' /etc/slurm/slurm.conf
+        
+        # 修正 PID 目錄與重啟
+        sudo mkdir -p /run/slurm && sudo chown slurm:slurm /run/slurm
+        sudo systemctl restart munge && sudo systemctl restart slurmd
+        "
+
+    - name: 3.3 最終喚醒節點
+      shell: |
+        juju ssh -m hpc-lab slurmctld/0 "sudo scontrol update nodename=gpu-node01 state=resume"
