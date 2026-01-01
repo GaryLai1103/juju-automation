@@ -2,20 +2,14 @@
 # SKU: HPC-Full-Stack-Reconstruction
 # ==========================================
 - name: 1. 兩台機器 OS 佈署與 Slurm 角色配置 (使用 Tags)
-  hosts: all  # 確保 AWX Inventory 指向您的 Juju Controller (maasjuju)
+  hosts: all
   gather_facts: no
   vars:
-    # [修改 1] 移除原本的 k8s_model 定義
-    # 因為 AWX Survey 會直接傳入 'k8s_cluster' 這個變數，這裡不需要再定義
-    # 如果您想保留預設值以防萬一，可以解開下面這行註解，但通常不需要：
-    # k8s_cluster: "{{ k8s_cluster | default('k8s-cluster-auto') }}"
-
-    # [保留] 這些建議也加入 Survey，目前先保留在此當作預設值
     ks_host_ip: "192.168.100.4"
     ks_host_user: "ubuntu"
     slurm_model: "hpc-lab"
-    # [修改] 更新為 Ubuntu 24.04
-    target_os: ubuntu@24.04
+    # [修正 4] 加上引號
+    target_os: "ubuntu@24.04"
 
   tasks:
     - name: 1.1 建立全新 Model
@@ -23,43 +17,43 @@
       ignore_errors: yes
 
     # ----------------------------------------------------------------
-    # 機器 A：控制端 - 部署 slurmctld (大腦)
+    # 機器 A：控制端 - 觸發 MAAS 灌 OS 並安裝 slurmctld
     # ----------------------------------------------------------------
     - name: 1.2 佈署控制端 OS 於 VM (使用 Tag)
-      # [修正] 改用 slurmctld，這是 24.04 商店能識別的名稱
-      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }}"
+      # [修正 1] 加入 --channel，這會觸發 MAAS 灌 OS
+      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
 
     # ----------------------------------------------------------------
-    # 機器 B：運算端 - 部署 slurmd (肌肉)
+    # 機器 B：運算端 - 觸發 MAAS 灌 OS 並安裝 slurmd
     # ----------------------------------------------------------------
     - name: 1.3 佈署運算端 OS 於 4090 裸機 (使用 Tag)
-      # [修正] 改用 slurmd，並指定 channel (如果需要的話)
-      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
+      # [修正 1] 加入 --channel，這會觸發 MAAS 灌 OS
+      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }} --channel=23.11/stable"
 
-    # ----------------------------------------------------------------
-    # 1.4 連結組件 (自動建立 Munge 認證)
-    # ----------------------------------------------------------------
     - name: 1.4 建立連動關係
-      # [修正] 名稱跟著改為 slurmctld 與 slurmd
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
+
+    # [修正 2] 必須等 OS 灌完，否則下一步 SSH 會失敗
+    - name: 1.5 等待兩台機器 OS 灌完且應用程式 Active
+      command: "juju wait-for application slurmd -m {{ slurm_model }} --query='status==\"active\"' --timeout 25m0s"
 
 # ==========================================
 # 第二場戲：針對 gpu-node01 進行今日成功環境的注入
 # ==========================================
 - name: 2. 針對運算節點安裝 580 驅動與監控
-  hosts: juju_controller
+  hosts: all # 這裡建議維持 all 或 juju_controller
   tasks:
     - name: 2.1 注入今日成功驅動 (v580)
-      # Ubuntu 24.04 下安裝 580 驅動邏輯不變
+      # [修正 3] 名稱改為 slurmd/0
       shell: |
-        juju ssh -m {{ slurm_model }} slurm-worker/0 "
+        juju ssh -m {{ slurm_model }} slurmd/0 "
         sudo apt-get update && \
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 nvidia-cuda-toolkit"
 
     - name: 2.2 注入今日成功監控 (v3.3.5)
-      # 確保 DCGM 與 Exporter 與您手動成功的配置完全一致
+      # [修正 3] 名稱改為 slurmd/0
       shell: |
-        juju ssh -m {{ slurm_model }} slurm-worker/0 "
+        juju ssh -m {{ slurm_model }} slurmd/0 "
         sudo apt-get install -y datacenter-gpu-manager && \
         wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.0/dcgm-exporter_3.3.5-3.4.0_amd64.deb && \
         sudo dpkg -i dcgm-exporter_3.3.5-3.4.0_amd64.deb && \
