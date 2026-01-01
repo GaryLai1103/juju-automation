@@ -27,14 +27,14 @@
     # ----------------------------------------------------------------
     - name: 1.2 佈署控制端 OS 於 VM (使用 Tag)
       # [修正] 改用 slurmctld，這是 24.04 商店能識別的名稱
-      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }}"
+      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual default-base {{ target_os }}"
 
     # ----------------------------------------------------------------
     # 機器 B：運算端 - 部署 slurmd (肌肉)
     # ----------------------------------------------------------------
     - name: 1.3 佈署運算端 OS 於 4090 裸機 (使用 Tag)
       # [修正] 改用 slurmd，並指定 channel (如果需要的話)
-      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
+      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node default-base {{ target_os }}"
 
     # ----------------------------------------------------------------
     # 1.4 連結組件 (自動建立 Munge 認證)
