@@ -49,24 +49,25 @@
     slurm_model: "hpc-lab"
 
   tasks:
-    - name: 2.1 注入今日成功驅動 (v580)
+    - name: 2.1 基礎環境清理與倉庫設定
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
-        sudo apt-get update && \
-        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 nvidia-cuda-toolkit"
+        # 徹底移除所有舊版驅動殘留，避免與官方庫衝突
+        sudo apt-get purge -y nvidia* libnvidia* && \
+        sudo apt-get autoremove -y && \
+        
+        # 重新導入倉庫
+        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb && \
+        sudo apt-get update"
 
-    - name: 2.2 注入今日成功監控 (v3.3.5)
+    - name: 2.2 安裝官方版 580 驅動與監控
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
-        # 1. 確保 NVIDIA 倉庫已更新 (預防萬一)
-        sudo apt-get update && \
+        # 指定安裝官方倉庫的版本
+        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager && \
         
-        # 2. 安裝 DCGM 引擎
-        sudo apt-get install -y datacenter-gpu-manager && \
-        
-        # 3. [修正] 使用正確的 v3.3.5 下載連結 (注意版本號細節)
+        # 下載並安裝監控
         wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.1/dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
-        
-        # 4. 安裝並啟動
         sudo dpkg -i dcgm-exporter_3.3.5-3.4.1_amd64.deb && \
         sudo systemctl enable --now dcgm-exporter"
