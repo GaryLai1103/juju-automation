@@ -40,7 +40,7 @@
       command: "juju wait-for application slurmd -m {{ slurm_model }} --query='status==\"active\"' --timeout 5m0s"
 
 # ==========================================
-# 第二場戲：這才是您現在要執行的核心重點！
+# 第二場戲：針對 gpu-node01 進行環境注入
 # ==========================================
 - name: 2. 針對運算節點安裝 580 驅動與監控
   hosts: all
@@ -56,9 +56,20 @@
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 nvidia-cuda-toolkit"
 
     - name: 2.2 注入今日成功監控 (v3.3.5)
+      # [修改重點] 加入了 cuda-keyring 確保能找到 datacenter-gpu-manager
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
+        # 1. 導入 NVIDIA 官方軟體源金鑰
+        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb && \
+        sudo apt-get update && \
+        
+        # 2. 安裝 DCGM 引擎 (現在 apt 就能找到了)
         sudo apt-get install -y datacenter-gpu-manager && \
+        
+        # 3. 安裝您驗證成功的 Exporter 版本
         wget https://github.com/NVIDIA/dcgm-exporter/releases/download/v3.3.5-3.4.0/dcgm-exporter_3.3.5-3.4.0_amd64.deb && \
         sudo dpkg -i dcgm-exporter_3.3.5-3.4.0_amd64.deb && \
+        
+        # 4. 啟動監控
         sudo systemctl enable --now dcgm-exporter"
