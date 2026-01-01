@@ -1,7 +1,7 @@
 # ==========================================
-# SKU: HPC-Full-Stack-Reconstruction-v2
+# SKU: HPC-Full-Stack-Reconstruction-v2-Optimized
 # ==========================================
-- name: 1. 環境準備與 GPU 驅動先行安裝
+- name: 1. 基礎環境與硬體準備 (OS + Driver)
   hosts: all
   gather_facts: no
   vars:
@@ -13,84 +13,85 @@
       command: "juju add-model {{ slurm_model }}"
       ignore_errors: yes
 
-    # [關鍵修正]：在佈署 slurmd 之前，必須先確保機器有驅動，否則 Juju 偵測會出錯
-    - name: 1.2 預先安裝 580 驅動 (對應 MAAS 標籤節點)
-      shell: |
-        # 這裡建議透過 MAAS 或直接對目標機進行操作，若透過 Juju 則需先 add-machine
-        # 假設 slurmd/0 已經在 machine 1 上
-        juju ssh -m {{ slurm_model }} 1 "
-        sudo apt-get update && \
-        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580
-        "
+    - name: 1.2 向 MAAS 請求 GPU 節點 (不佈署服務，僅灌系統)
+      # 使用 add-machine 會讓 MAAS 開始部署 Ubuntu 24.04
+      command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node"
+      register: machine_out
       ignore_errors: yes
 
+    - name: 1.3 等待 Machine 0 SSH 就緒
+      # 假設這是 model 裡的第一台機器，編號通常為 0 (可用 juju machines 確認)
+      command: "juju wait-for machine 0 -m {{ slurm_model }} --query='lifecycle==\"ready\"' --timeout 10m"
+
+    - name: 1.4 在佈署 Slurm 前先行安裝 580 驅動
+      shell: |
+        juju ssh -m {{ slurm_model }} 0 "
+        sudo apt-get update && \
+        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 && \
+        sudo nvidia-smi -pm 1
+        "
+
 # ==========================================
-# 第二階段：佈署 Slurm 組件
+# 第二階段：精準佈署 Slurm 組件到指定機器
 # ==========================================
-- name: 2. 佈署 Slurm 角色與建立連動
+- name: 2. 定點佈署 Slurm 角色
   hosts: all
   vars:
     slurm_model: "hpc-lab"
+    target_os: "ubuntu@24.04"
   tasks:
-    - name: 2.1 佈署控制端
+    - name: 2.1 佈署控制端 (可佈署於虛擬容器或新機器)
       command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
-      register: deploy_ctld
-      failed_when: "(deploy_ctld.rc != 0) and ('already exists' not in deploy_ctld.stderr)"
+      ignore_errors: yes
 
-    - name: 2.2 佈署運算端
-      command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }} --channel=23.11/stable"
-      register: deploy_d
-      failed_when: "(deploy_d.rc != 0) and ('already exists' not in deploy_d.stderr)"
+    - name: 2.2 佈署運算端到「已裝好驅動」的 Machine 0
+      # [核心修正]：使用 --to 0 強制佈署到剛才裝好驅動的那台機器
+      command: "juju deploy slurmd -m {{ slurm_model }} --to 0 --channel=23.11/stable"
+      ignore_errors: yes
 
-    - name: 2.3 建立整合關係
+    - name: 2.3 建立連動
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
 # ==========================================
-# 第三階段：深度修正（解決閃退與 GPU 識別問題）
+# 第三階段：深度修正（插件與網路對齊）
 # ==========================================
 - name: 3. 執行節點自動化修正
   hosts: all
   tasks:
-    - name: 3.1 修正控制端 (slurmctld) 網路認同與插件
+    - name: 3.1 修正控制端 (slurmctld)
       shell: |
         juju ssh -m hpc-lab slurmctld/0 "
-        # 修正自我名稱解析 (slurmhn)
         REAL_HOSTNAME=\$(hostname)
         sudo sed -i \"/127.0.0.1/s/$/ \$REAL_HOSTNAME slurm-master/\" /etc/hosts
-        
-        # 修正 slurm.conf: 升級插件並移除過時參數
         sudo sed -i 's/SlurmctldHost=.*/SlurmctldHost='\$REAL_HOSTNAME'/g' /etc/slurm/slurm.conf
         sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
         sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
         sudo sed -i '1i SlurmdParameters=config_overrides' /etc/slurm/slurm.conf
-        
-        # 建立 spool 目錄
         sudo mkdir -p /var/spool/slurmctld && sudo chown slurm:slurm /var/spool/slurmctld
         sudo systemctl restart munge && sudo systemctl restart slurmctld
         "
 
-    - name: 3.2 修正運算端 (slurmd) GPU 宣告與網路
+    - name: 3.2 修正運算端 (slurmd)
       shell: |
         juju ssh -m hpc-lab slurmd/0 "
-        # 抓取控制端真實 IP 並對齊 hosts
+        # 自動抓取 master 資訊
         CTLD_IP=\$(juju ssh -m hpc-lab slurmctld/0 'hostname -I' | awk '{print \$1}')
         sudo sed -i '/slurm-master/d' /etc/hosts
         echo \"\$CTLD_IP slurm-master\" | sudo tee -a /etc/hosts
         
-        # 修正設定檔與建立 gres.conf
+        # 設定檔修正
         sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
         sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
         echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
         
-        # 強制寫入正確規格 (18核, 128G)
+        # 強制對齊硬體描述
         sudo sed -i '/NodeName=gpu-node01/c\NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN' /etc/slurm/slurm.conf
         
-        # 修正 PID 目錄與重啟
         sudo mkdir -p /run/slurm && sudo chown slurm:slurm /run/slurm
         sudo systemctl restart munge && sudo systemctl restart slurmd
         "
 
-    - name: 3.3 最終喚醒節點
+    - name: 3.3 最終啟動
       shell: |
         juju ssh -m hpc-lab slurmctld/0 "sudo scontrol update nodename=gpu-node01 state=resume"
