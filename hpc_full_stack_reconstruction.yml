@@ -1,14 +1,12 @@
 # ==========================================
 # SKU: HPC-Full-Stack-Reconstruction
 # ==========================================
-- name: 1. 兩台機器 OS 佈署與 Slurm 角色配置 (使用 Tags)
+- name: 1. 兩台機器 OS 佈署與 Slurm 角色配置
   hosts: all
   gather_facts: no
   vars:
-    ks_host_ip: "192.168.100.4"
-    ks_host_user: "ubuntu"
+    # 這裡定義的變數僅在這個 Play 內有效
     slurm_model: "hpc-lab"
-    # [修正 4] 加上引號
     target_os: "ubuntu@24.04"
 
   tasks:
@@ -16,42 +14,37 @@
       command: "juju add-model {{ slurm_model }}"
       ignore_errors: yes
 
-    # ----------------------------------------------------------------
-    # 機器 A：控制端 - 觸發 MAAS 灌 OS 並安裝 slurmctld
-    # ----------------------------------------------------------------
-    - name: 1.2 佈署控制端 OS 於 VM (使用 Tag)
-      # [修正 1] 加入 --channel，這會觸發 MAAS 灌 OS
+    - name: 1.2 佈署控制端 (slurmctld)
       command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
 
-    # ----------------------------------------------------------------
-    # 機器 B：運算端 - 觸發 MAAS 灌 OS 並安裝 slurmd
-    # ----------------------------------------------------------------
-    - name: 1.3 佈署運算端 OS 於 4090 裸機 (使用 Tag)
-      # [修正 1] 加入 --channel，這會觸發 MAAS 灌 OS
+    - name: 1.3 佈署運算端 (slurmd)
       command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }} --channel=23.11/stable"
 
     - name: 1.4 建立連動關係
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
 
-    # [修正 2] 必須等 OS 灌完，否則下一步 SSH 會失敗
-    - name: 1.5 等待兩台機器 OS 灌完且應用程式 Active
-      command: "juju wait-for application slurmd -m {{ slurm_model }} --query='status==\"active\"' --timeout 25m0s"
+    - name: 1.5 等待服務啟動 (目前您的狀態已達成)
+      command: "juju wait-for application slurmd -m {{ slurm_model }} --query='status==\"active\"' --timeout 5m0s"
 
 # ==========================================
-# 第二場戲：針對 gpu-node01 進行今日成功環境的注入
+# 第二場戲：針對 gpu-node01 進行環境注入
 # ==========================================
 - name: 2. 針對運算節點安裝 580 驅動與監控
-  hosts: all # 這裡建議維持 all 或 juju_controller
+  hosts: all
+  gather_facts: no
+  vars:
+    # [修正] 在這裡必須重新定義變數，或者在第一個 Play 使用 set_fact
+    slurm_model: "hpc-lab"
+
   tasks:
     - name: 2.1 注入今日成功驅動 (v580)
-      # [修正 3] 名稱改為 slurmd/0
+      # [修正] 確保使用 slurmd/0 而非 slurm-worker/0
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
         sudo apt-get update && \
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 nvidia-cuda-toolkit"
 
     - name: 2.2 注入今日成功監控 (v3.3.5)
-      # [修正 3] 名稱改為 slurmd/0
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
         sudo apt-get install -y datacenter-gpu-manager && \
