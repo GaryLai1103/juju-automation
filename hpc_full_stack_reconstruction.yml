@@ -55,7 +55,7 @@
         sudo apt-get update && \
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 nvidia-cuda-toolkit"
 
-- name: 2.2 注入今日成功監控 (v3.3.5)
+    - name: 2.2 注入今日成功監控 (v3.3.5)
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
         # 1. 確保 NVIDIA 倉庫已更新 (預防萬一)
