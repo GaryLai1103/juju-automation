@@ -15,7 +15,7 @@
     ks_host_user: "ubuntu"
     slurm_model: "hpc-lab"
     # [修改] 更新為 Ubuntu 24.04
-    target_os: "ubuntu@22.04"
+    target_os: ubuntu@24.04
 
   tasks:
     - name: 1.1 建立全新 Model
