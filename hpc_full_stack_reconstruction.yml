@@ -5,40 +5,51 @@
   hosts: all
   gather_facts: no
   vars:
-    # 這裡定義的變數僅在這個 Play 內有效
     slurm_model: "hpc-lab"
     target_os: "ubuntu@24.04"
 
   tasks:
     - name: 1.1 建立全新 Model
       command: "juju add-model {{ slurm_model }}"
+      # [保留] 如果 model 已存在，不報錯繼續往下
       ignore_errors: yes
 
     - name: 1.2 佈署控制端 (slurmctld)
       command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
+      # [新增] 如果應用程式已存在，則視為成功
+      register: deploy_ctld
+      failed_when: 
+        - deploy_ctld.rc != 0 
+        - "'already exists' not in deploy_ctld.stderr"
 
     - name: 1.3 佈署運算端 (slurmd)
       command: "juju deploy slurmd -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }} --channel=23.11/stable"
+      # [新增] 同樣處理「已存在」的情況
+      register: deploy_d
+      failed_when: 
+        - deploy_d.rc != 0 
+        - "'already exists' not in deploy_d.stderr"
 
     - name: 1.4 建立連動關係
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
+      # [新增] 避免重複建立連動報錯
+      ignore_errors: yes
 
-    - name: 1.5 等待服務啟動 (目前您的狀態已達成)
+    - name: 1.5 等待服務啟動
+      # 既然 status 已經是 active，這步會秒過
       command: "juju wait-for application slurmd -m {{ slurm_model }} --query='status==\"active\"' --timeout 5m0s"
 
 # ==========================================
-# 第二場戲：針對 gpu-node01 進行環境注入
+# 第二場戲：這才是您現在要執行的核心重點！
 # ==========================================
 - name: 2. 針對運算節點安裝 580 驅動與監控
   hosts: all
   gather_facts: no
   vars:
-    # [修正] 在這裡必須重新定義變數，或者在第一個 Play 使用 set_fact
     slurm_model: "hpc-lab"
 
   tasks:
     - name: 2.1 注入今日成功驅動 (v580)
-      # [修正] 確保使用 slurmd/0 而非 slurm-worker/0
       shell: |
         juju ssh -m {{ slurm_model }} slurmd/0 "
         sudo apt-get update && \
