@@ -13,19 +13,22 @@
       command: "juju add-model {{ slurm_model }}"
       ignore_errors: yes
 
-    - name: 1.2 向 MAAS 請求 GPU 節點 (不佈署服務，僅灌系統)
-      # 使用 add-machine 會讓 MAAS 開始部署 Ubuntu 24.04
+    - name: 1.2 向 MAAS 請求 GPU 節點
       command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node"
-      register: machine_out
-      ignore_errors: yes
+      register: add_machine_result
 
-    - name: 1.3 等待 Machine 0 SSH 就緒
-      # 假設這是 model 裡的第一台機器，編號通常為 0 (可用 juju machines 確認)
-      command: "juju wait-for machine 0 -m {{ slurm_model }} --query='lifecycle==\"ready\"' --timeout 10m"
+    - name: 1.3 獲取剛建立的 Machine ID
+      # 從 add-machine 的輸出中抓取 created machine ID
+      shell: "juju machines -m {{ slurm_model }} --format json | jq -r '.machines | keys | last'"
+      register: target_machine_id
 
-    - name: 1.4 在佈署 Slurm 前先行安裝 580 驅動
+    - name: 1.4 等待 Machine 就緒 (修正語法)
+      # 使用 agent-status==\"idle\" 是最穩妥的判斷方式，代表 OS 灌完且 Juju 已接管
+      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
+
+    - name: 1.5 在佈署 Slurm 前先行安裝 580 驅動
       shell: |
-        juju ssh -m {{ slurm_model }} 0 "
+        juju ssh -m {{ slurm_model }} {{ target_machine_id.stdout }} "
         sudo apt-get update && \
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 && \
         sudo nvidia-smi -pm 1
