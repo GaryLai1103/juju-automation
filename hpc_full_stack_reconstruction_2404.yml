@@ -228,7 +228,7 @@
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
-    - name: 2.3 Gate：等待 slurmd 就緒 (強固版)
+    - name: 2.3 Gate：等待 slurmd 就緒 (Python 雙重檢查版)
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
@@ -237,36 +237,57 @@
         
         # 迴圈檢查 20 次
         for i in {1..20}; do
-            # [修正] 使用更寬容的 jq 查詢，避免路徑錯誤回傳 null
-            # 我們直接抓所有 units 的狀態，然後過濾出 slurmd/0
-            STATUS=$(juju status -m "$MODEL" --format=json | jq -r '.applications.slurmd.units | to_entries[] | select(.key | startswith("slurmd/0")) | .value."agent-status".current')
+            # 使用 Python 解析 JSON，同時抓取 juju-status 和 workload-status
+            RESULT=$(juju status -m "$MODEL" --format=json | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    # 抓取第一台 slurmd unit
+    units = data.get('applications', {}).get('slurmd', {}).get('units', {})
+    if not units:
+        print('initializing|initializing')
+        sys.exit(0)
+        
+    # 優先抓 slurmd/0，抓不到就抓第一台
+    unit_key = 'slurmd/0' if 'slurmd/0' in units else list(units.keys())[0]
+    unit = units[unit_key]
+    
+    # Juju 3.x 使用 'juju-status'，舊版使用 'agent-status'
+    agent = unit.get('juju-status', {}).get('current') or unit.get('agent-status', {}).get('current', 'unknown')
+    workload = unit.get('workload-status', {}).get('current', 'unknown')
+    
+    print(f'{agent}|{workload}')
+except Exception:
+    print('error|error')
+")
             
-            echo "Current Status: $STATUS ($i/20)"
+            # 分割變數
+            AGENT_STATUS=$(echo "$RESULT" | cut -d'|' -f1)
+            WORKLOAD_STATUS=$(echo "$RESULT" | cut -d'|' -f2)
             
-            # 1. 成功狀態
-            if [ "$STATUS" == "idle" ]; then
-                echo "Slurmd is Ready (Idle)!"
-                exit 0
-            fi
+            echo "Status: Agent=$AGENT_STATUS, Workload=$WORKLOAD_STATUS ($i/20)"
             
-            # 2. 失敗狀態 (需要解鎖)
-            if [ "$STATUS" == "blocked" ] || [ "$STATUS" == "error" ]; then
+            # 1. 觸發自動修復 (如果因為驅動被鎖而 blocked)
+            if [ "$WORKLOAD_STATUS" == "blocked" ]; then
                 echo "⚠️ Detected BLOCKED state. Forcing resolve..."
                 juju resolve -m "$MODEL" slurmd/0 --no-retry
                 sleep 10
+                continue
             fi
             
-            # 3. 處理 null (還沒準備好)
-            if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
-                echo "Status is initializing..."
+            # 2. 成功判定：只要 Agent 閒置 (idle)，無論 Workload 是 waiting 還是 blocked，都放行
+            # 因為後面的 Task 3 會負責修復設定檔讓它變綠燈
+            if [ "$AGENT_STATUS" == "idle" ]; then
+                echo "Slurmd Agent is ready (Idle). Proceeding to configuration."
+                exit 0
             fi
             
             sleep 10
         done
         
-        # [最後通牒] 如果還是不行，但 SSH 通了，我們就當作它好了 (因為我們要去手動修設定檔了)
+        # [最後通牒] SSH 通了就放行
         if juju ssh -m "$MODEL" slurmd/0 -- "echo up"; then
-             echo "⚠️ Slurmd status is $STATUS, but SSH is UP. Proceeding forcefully."
+             echo "⚠️ Status check timeout, but SSH is UP. Proceeding forcefully."
              exit 0
         fi
         
