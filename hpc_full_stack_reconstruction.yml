@@ -21,20 +21,34 @@
       command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
       register: add_machine_result
       
-       # k3s 安裝段 ----
-    - name: 1.2a Gate：等待 slurmctld/0 可 SSH（machine 0 ready）
+       # k3s 安裝段======================================================================================
+    - name: 1.2a Gate：等待 slurmctld/0 SSH 通暢且 APT 閒置
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
-        echo "[1.2a] wait slurmctld/0 sshable in model=${MODEL}"
-        while true; do
-          if juju ssh -m "$MODEL" slurmctld/0 -- 'echo up' >/dev/null 2>&1; then
-            echo "[1.2a] slurmctld/0 SSH is ready"
-            break
-          fi
-          echo "[1.2a] waiting..."
+        echo "[1.2a] wait slurmctld/0..."
+        
+        # 1. 循環等待 SSH 連線成功
+        while ! juju ssh -m "$MODEL" slurmctld/0 -- 'echo up' >/dev/null 2>&1; do
+          echo "[1.2a] waiting for SSH..."
           sleep 5
         done
+        echo "[1.2a] SSH is ready"
+
+        # 2. [關鍵新增] 等待 cloud-init 完成 (確保 OS 初始化完畢)
+        echo "[1.2a] waiting for cloud-init..."
+        juju ssh -m "$MODEL" slurmctld/0 -- 'cloud-init status --wait' >/dev/null 2>&1 || true
+
+        # 3. [核心防護] 等待 DPKG/APT 鎖釋放
+        echo "[1.2a] waiting for apt/dpkg lock release..."
+        juju ssh -m "$MODEL" slurmctld/0 -- '
+          # 檢查 lock 檔案是否被佔用，如果有人在用，fuser 會回傳 PID
+          while sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            echo "Waiting for apt lock..."
+            sleep 5
+          done
+        '
+        echo "[1.2a] System is ready for K3s installation"
       args:
         executable: /bin/bash
       environment:
