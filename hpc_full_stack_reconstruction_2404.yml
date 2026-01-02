@@ -124,46 +124,82 @@
         executable: /bin/bash
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA Driver + DCGM Snap (Ubuntu 24.04 版)
+    - name: 1.6 安裝 NVIDIA Driver (Auto) + DCGM Exporter (含 Retry)
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
-        MID="{{ target_machine_id }}"
-        
-        if ! juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
-          echo "Installing NVIDIA driver..."
-          juju ssh -m "$MODEL" "$MID" -- '
-            sudo apt-get update
-            # [修正] 針對 24.04 (noble) 的 CUDA Keyring
-            wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-            sudo dpkg -i cuda-keyring_1.1-1_all.deb
-            sudo apt-get update
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager
-            sudo reboot
-          ' || true
+        MID="{{ target_machine_id | default('', true) | string | trim }}"
+    
+        echo "[1.6] install driver on MID=$MID MODEL=$MODEL"
+    
+        # --- 1) 裝 driver（autoinstall 策略：最穩健）---
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
+          # 避免 apt lock
+          while sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1; do sleep 5; done
           
-          echo "Waiting for reboot..."
-          sleep 10
-          while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do sleep 5; done
-          
-          for i in {1..20}; do
-            if juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then break; fi
-            sleep 5
+          sudo apt-get update
+          sudo apt-get install -y ubuntu-drivers-common
+          echo "== ubuntu-drivers devices =="
+          ubuntu-drivers devices || true
+          sudo ubuntu-drivers autoinstall
+        '
+    
+        # --- 2) 驗證 nvidia-smi；若不存在/失敗就 reboot 再檢一次 ---
+        if ! juju ssh -m "$MODEL" "$MID" -- 'command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1'; then
+          echo "[1.6] nvidia-smi not ready, rebooting..."
+          juju ssh -m "$MODEL" "$MID" -- 'sudo reboot' || true
+    
+          # 等機器回來（簡易 wait：每 10 秒試一次 juju ssh）
+          echo "[1.6] waiting machine back..."
+          for i in $(seq 1 60); do
+            if juju ssh -m "$MODEL" "$MID" -- 'true' >/dev/null 2>&1; then
+              echo "[1.6] machine is back"
+              break
+            fi
+            sleep 10
           done
+          
+          # 重開機後給一點緩衝讓驅動載入
+          sleep 10
         fi
-
+    
+        # --- 3) 最終確認 nvidia-smi ---
+        echo "[1.6] checking nvidia-smi..."
+        juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi'
+    
+        # --- 4) 安裝/啟動 dcgm snap exporter (加上 Retry 機制) ---
+        echo "[1.6] installing dcgm snap + starting exporter..."
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
           sudo snap install dcgm || true
+          sudo snap start --enable dcgm.nv-hostengine
+          sudo snap start --enable dcgm.dcgm-exporter
+          
           sleep 5
-          sudo snap start --enable dcgm.nv-hostengine || true
-          sleep 3
-          sudo snap start --enable dcgm.dcgm-exporter || true
-          sleep 3
-          sudo nvidia-smi -pm 1
+          sudo snap restart dcgm.nv-hostengine
+          sleep 2
+          sudo snap restart dcgm.dcgm-exporter
+          
+          # [修正] 增加 Retry 迴圈，避免服務還沒起來就 curl 失敗
+          echo "Waiting for Metrics..."
+          for i in {1..12}; do
+             if curl -s http://127.0.0.1:9400/metrics | grep -q "# HELP"; then
+                 echo "Metrics OK!"
+                 curl -s http://127.0.0.1:9400/metrics | head -n 10
+                 exit 0
+             fi
+             echo "Retry metrics check ($i/12)..."
+             sleep 5
+          done
+          
+          echo "ERROR: Metrics failed to start"
+          exit 1
         '
       args:
         executable: /bin/bash
+      environment:
+        JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
 
 # ==========================================
