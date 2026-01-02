@@ -150,20 +150,37 @@
         sudo systemctl restart slurmctld
         "
 
-    - name: 3.2 寫入 Worker 設定 (含 Gres)
+    - name: 3.2 同步 Worker 設定與配置 GPU
       shell: |
-        # 複製 Master 的 conf 到 Worker
+        # 1. 從 Machine 0 複製乾淨的設定檔到跳板機暫存
         juju ssh -m {{ slurm_model }} 0 'cat /etc/slurm/slurm.conf' > /tmp/slurm.conf
+        
+        # 2. 推送到 Machine 1
         juju scp /tmp/slurm.conf {{ slurm_model }}:1:/tmp/slurm.conf
+        
+        # 3. 在 Worker 執行原生配置
         juju ssh -m {{ slurm_model }} 1 "
+          # 確保目錄存在且權限正確
+          sudo mkdir -p /etc/slurm /run/slurm /var/spool/slurmd /var/log/slurm
+          sudo chown -R slurm:slurm /etc/slurm /run/slurm /var/spool/slurmd /var/log/slurm
+          
+          # 移動檔案並設定 GPU
           sudo mv /tmp/slurm.conf /etc/slurm/slurm.conf
+          sudo chown slurm:slurm /etc/slurm/slurm.conf
           echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
-          sudo mkdir -p /run/slurm /var/spool/slurmd
-          sudo chown slurm:slurm /run/slurm /var/spool/slurmd
+          
+          # 重啟服務
+          sudo systemctl restart munge
           sudo systemctl restart slurmd
         "
+        # 4. 清理暫存檔
         rm /tmp/slurm.conf
+      args:
+        executable: /bin/bash
 
-    - name: 3.3 喚醒節點
+    - name: 3.3 喚醒節點 (Resume)
       shell: |
+        # 給 slurmd 5秒鐘註冊時間
+        sleep 5
         juju ssh -m {{ slurm_model }} 0 'sudo scontrol update nodename=gpu-node01 state=resume'
+      changed_when: false
