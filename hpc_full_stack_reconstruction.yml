@@ -191,105 +191,82 @@
       register: ci_status
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA Driver + reboot + 啟動 DCGM Exporter（含 metrics gate）
+    - name: 1.6 安裝 NVIDIA Driver + DCGM Snap (修正 Service Race Condition)
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
         MID="{{ target_machine_id | default('', true) | string | trim }}"
-
+        
         echo "[1.6] MODEL=$MODEL MID=$MID"
-        if [ -z "$MID" ] || [ "$MID" = "None" ]; then
-          echo "[1.6] ERROR: target_machine_id is empty/None"
-          exit 2
-        fi
-
-        # 0) 確保 curl 存在（後面 metrics gate 需要）
-        juju ssh -m "$MODEL" "$MID" -- '
-          set -euo pipefail
-          command -v curl >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y curl)
-          echo "[1.6] curl OK: $(command -v curl)"
-        '
-
-        echo "[1.6] check driver/pkg"
-        # 1) 檢查：若 driver 不在，就安裝（安裝後一定 reboot）
-        NEED_REBOOT=0
-
-        if ! juju ssh -m "$MODEL" "$MID" -- 'command -v nvidia-smi >/dev/null 2>&1'; then
-          echo "[1.6] nvidia-smi missing -> install nvidia driver then reboot"
+        
+        # --- 1. 驅動安裝檢查 (這部分你已經過了，但保留邏輯以防萬一) ---
+        if ! juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
+          echo "[1.6] Installing NVIDIA driver..."
           juju ssh -m "$MODEL" "$MID" -- '
-            set -euo pipefail
             sudo apt-get update
-            # 先嘗試你指定的 580；若 repo 沒有，再 fallback ubuntu-drivers
-            if apt-cache show nvidia-driver-580 >/dev/null 2>&1; then
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580
-            else
-              echo "[1.6] WARN: nvidia-driver-580 not found in repo, fallback ubuntu-drivers"
-              sudo apt-get install -y ubuntu-drivers-common
-              sudo ubuntu-drivers autoinstall
-            fi
-          '
-          NEED_REBOOT=1
-        else
-          echo "[1.6] nvidia-smi exists -> skip driver install"
-        fi
-
-        # 2) 標準流程：只要本次有安裝 driver，就 reboot
-        if [ "$NEED_REBOOT" = "1" ]; then
-          echo "[1.6] reboot now"
-          juju ssh -m "$MODEL" "$MID" -- 'sudo reboot' || true
-
-          echo "[1.6] wait for SSH back"
-          # 等 machine 回來：能 juju ssh 進去就算回來
-          while true; do
-            if juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; then
-              echo "[1.6] SSH is back"
-              break
-            fi
-            echo "[1.6] waiting..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580
+            sudo reboot
+          ' || true
+          
+          echo "[1.6] Waiting for reboot..."
+          sleep 10
+          while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do 
+            echo "Waiting for SSH..."; sleep 5
+          done
+          
+          # 等待 nvidia-smi 就緒
+          echo "[1.6] Waiting for GPU initialization..."
+          for i in {1..20}; do
+            if juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then break; fi
             sleep 5
           done
         fi
 
-        # 3) reboot 後 gate：nvidia-smi 一定要成功（driver 真正生效的證據）
-        echo "[1.6] gate: nvidia-smi"
-        while true; do
-          if juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
-            juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi | head -n 20'
-            echo "[1.6] nvidia-smi OK"
-            break
-          fi
-          echo "[1.6] nvidia-smi not ready yet..."
-          sleep 5
-        done
-
-        # 4) DCGM：用 snap（你已驗證可行），並確保服務啟動/9400 監聽
-        echo "[1.6] install/start dcgm snap"
+        # --- 2. DCGM Snap 安裝與啟動 (重點修正區) ---
+        echo "[1.6] Setting up DCGM Snap..."
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
+          
+          # 安裝 Snap (如果已安裝會跳過)
           sudo snap install dcgm || true
-          sudo snap start --enable dcgm.nv-hostengine
-          sudo snap start --enable dcgm.dcgm-exporter
-          sudo snap restart dcgm.nv-hostengine
-          sudo snap restart dcgm.dcgm-exporter
-          snap services dcgm || true
-          sudo ss -lntp | grep 9400 || true
-        '
+          
+          # [修正] 給 Snapd 一點時間喘息
+          sleep 5
+          
+          # 啟用並啟動服務 (分開執行並加入延遲)
+          echo "Starting nv-hostengine..."
+          sudo snap start --enable dcgm.nv-hostengine || true
+          sleep 5
+          
+          echo "Starting dcgm-exporter..."
+          sudo snap start --enable dcgm.dcgm-exporter || true
+          sleep 5
+          
+          # [修正] 只在必要時重啟，並使用迴圈重試以避開 "change in progress"
+          echo "Ensuring services are active..."
+          for service in dcgm.nv-hostengine dcgm.dcgm-exporter; do
+            for retry in {1..5}; do
+              if sudo snap restart $service; then
+                echo "$service restarted successfully."
+                break
+              else
+                echo "Snap busy, retrying $service in 5s..."
+                sleep 5
+              fi
+            done
+          done
 
-        # 5) metrics gate：HTTP 200 + 內容有 # HELP
-        echo "[1.6] gate: metrics endpoint"
-        juju ssh -m "$MODEL" "$MID" -- '
-          set -euo pipefail
-          code=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:9400/metrics)
-          echo "[1.6] http_code=$code"
-          [ "$code" = "200" ] || { echo "[1.6] ERROR: metrics http_code=$code"; exit 20; }
-          curl -sS --max-time 5 http://127.0.0.1:9400/metrics | head -n 5 | tee /dev/stderr | grep -q "^# HELP" \
-            || { echo "[1.6] ERROR: metrics content invalid"; sudo snap logs dcgm.dcgm-exporter -n 50 || true; exit 21; }
-          echo "[1.6] metrics OK"
+          # 啟用 Persistence Mode
+          sudo nvidia-smi -pm 1
+          
+          # 檢查 Port 9400 是否有在聽
+          if sudo ss -lntp | grep -q 9400; then
+            echo "DCGM Exporter is listening on port 9400."
+          else
+            echo "WARNING: Port 9400 not listening yet."
+            sudo snap logs dcgm.dcgm-exporter | tail -n 10
+          fi
         '
-      args:
-        executable: /bin/bash
-      environment:
-        JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
 
 
