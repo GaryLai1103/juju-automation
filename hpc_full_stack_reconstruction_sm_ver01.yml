@@ -95,6 +95,17 @@
         juju scp /tmp/munge.key {{ slurm_model }}:1:/tmp/munge.key
         juju ssh -m {{ slurm_model }} 1 'sudo mv /tmp/munge.key /etc/munge/munge.key && sudo chown munge:munge /etc/munge/munge.key && sudo systemctl restart munge'
         rm /tmp/munge.key
+    - name: 2.5 在 Worker 安裝 GPU 監控 (DCGM Exporter)
+      shell: |
+        juju ssh -m {{ slurm_model }} 1 "
+          sudo snap install dcgm || true
+          sudo snap start --enable dcgm.nv-hostengine
+          sudo snap start --enable dcgm.dcgm-exporter
+          sleep 5
+          sudo snap restart dcgm.nv-hostengine
+          sudo snap restart dcgm.dcgm-exporter
+        "
+      changed_when: true
 
 # ==========================================
 # 第三階段：設定檔深度寫入與啟動
