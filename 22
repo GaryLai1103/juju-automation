@@ -1,0 +1,240 @@
+# =================================================================
+# SKU: HPC-Hybrid-v6.0 (Juju Infra + Native Slurm/GPU)
+# Architecture:
+#   Machine 0: MicroK8s (Juju) + Slurmctld (Ansible)
+#   Machine 1: Ubuntu 24.04 (Juju) + NVIDIA Driver (Ansible) + Slurmd (Ansible)
+# =================================================================
+
+# --- 階段 1: Juju 基礎建設與機器調度 ---
+- name: 1. Juju 資源調度與 MicroK8s 部署
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    model_name: "hpc-hybrid"
+    # [請確認] 這邊填入你想用的 MAAS tags
+    master_constraints: "tags=virtual" 
+    worker_constraints: "tags=slurm-node" 
+    target_os: "ubuntu@24.04"
+
+  tasks:
+    - name: 1.1 建立 Juju Model
+      command: "juju add-model {{ model_name }}"
+      ignore_errors: yes
+
+    - name: 1.2 部署 Machine 0 (Master + MicroK8s)
+      # 直接部署 microk8s charm，它會自動請求一台機器
+      command: "juju deploy microk8s -m {{ model_name }} --constraints {{ master_constraints }} --base {{ target_os }} --channel=1.28/stable"
+      async: 600
+      poll: 0
+      register: deploy_microk8s
+
+    - name: 1.3 請求 Machine 1 (Worker + 純 OS)
+      # 只做 add-machine，不部署 charm，保持純淨 OS
+      command: "juju add-machine -m {{ model_name }} --constraints {{ worker_constraints }} --base {{ target_os }}"
+      register: add_machine_output
+
+    - name: 1.4 等待機器分配 IP (Juju Status Check)
+      shell: |
+        # 迴圈檢查直到兩台機器都有 IP
+        for i in {1..60}; do
+          STATUS=$(juju status -m {{ model_name }} --format=json)
+          # 抓取 MicroK8s 的 IP
+          M0_IP=$(echo "$STATUS" | jq -r '.applications.microk8s.units | to_entries[0].value["public-address"] // empty')
+          # 抓取 Machine 1 的 IP (假設它是 machine ID 1)
+          M1_IP=$(echo "$STATUS" | jq -r '.machines["1"]["dns-name"] // empty')
+          
+          if [[ -n "$M0_IP" && -n "$M1_IP" && "$M0_IP" != "null" && "$M1_IP" != "null" ]]; then
+            echo "$M0_IP|$M1_IP"
+            exit 0
+          fi
+          sleep 10
+        done
+        exit 1
+      register: node_ips
+      changed_when: false
+
+    - name: 1.5 動態加入 Ansible Inventory
+      set_fact:
+        master_ip: "{{ node_ips.stdout.split('|')[0] }}"
+        worker_ip: "{{ node_ips.stdout.split('|')[1] }}"
+    
+    - name: 1.6 註冊主機到暫存群組
+      add_host:
+        name: "{{ master_ip }}"
+        groups: slurm_masters
+        ansible_user: ubuntu
+        # 若需要 SSH Key 請在此指定，或依賴 AWX Credential
+        # ansible_ssh_private_key_file: ~/.ssh/id_rsa 
+
+    - name: 1.7 註冊主機到暫存群組
+      add_host:
+        name: "{{ worker_ip }}"
+        groups: slurm_workers
+        ansible_user: ubuntu
+
+    - name: 1.8 等待 SSH 通暢
+      wait_for:
+        host: "{{ item }}"
+        port: 22
+        timeout: 300
+      loop:
+        - "{{ master_ip }}"
+        - "{{ worker_ip }}"
+
+# --- 階段 2: 基礎環境設置 (Munge & User) ---
+- name: 2. 基礎 Slurm 環境設置
+  hosts: slurm_masters, slurm_workers
+  become: yes
+  vars:
+    # 來自 Phase 1 的動態變數需要重新定義或透過 hostvars 抓取
+    master_addr: "{{ groups['slurm_masters'][0] }}"
+    worker_addr: "{{ groups['slurm_workers'][0] }}"
+  
+  tasks:
+    - name: 2.1 設定 Hosts 解析 (讓節點互認)
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ master_addr }} slurm-master
+          {{ worker_addr }} gpu-node01
+
+    - name: 2.2 建立 Slurm 使用者 (UID 同步)
+      group: { name: slurm, gid: 64030, state: present }
+    - name: 2.3 建立 Slurm 帳號
+      user: { name: slurm, uid: 64030, group: slurm, shell: /bin/bash, state: present }
+
+    - name: 2.4 安裝 Munge
+      apt: { name: [munge, libmunge-dev], state: present, update_cache: yes }
+
+# --- 階段 3: Munge Key 同步 ---
+- name: 3. 同步 Munge Key
+  hosts: slurm_masters
+  become: yes
+  tasks:
+    - name: 3.1 生成 Key
+      command: /usr/sbin/create-munge-key -f
+      args: { creates: /etc/munge/munge.key }
+    - name: 3.2 下載 Key 到 Ansible 控制端
+      fetch: { src: /etc/munge/munge.key, dest: /tmp/munge.key, flat: yes }
+      
+- name: 3.5 上傳 Key 到 Worker
+  hosts: slurm_workers
+  become: yes
+  tasks:
+    - name: 3.6 上傳 Key
+      copy: { src: /tmp/munge.key, dest: /etc/munge/munge.key, owner: munge, group: munge, mode: '0400' }
+    - name: 3.7 重啟 Munge
+      systemd: { name: munge, state: restarted }
+
+# --- 階段 4: Master (Slurmctld) 安裝 ---
+- name: 4. 部署 Slurm Master
+  hosts: slurm_masters
+  become: yes
+  vars:
+    # 這裡填入剛剛釣魚到的真實規格 (RTX 4090 Machine)
+    node_cpus: 18
+    node_mem: 128646
+  tasks:
+    - name: 4.1 安裝 Slurmctld
+      apt: { name: [slurmctld, slurm-client], state: present }
+    
+    - name: 4.2 寫入設定檔 (Golden Config)
+      copy:
+        dest: /etc/slurm/slurm.conf
+        content: |
+          ClusterName=hpc-lab
+          SlurmctldHost=slurm-master
+          MungeSocketPath=/var/run/munge/munge.socket.2
+          ProctrackType=proctrack/cgroup
+          ReturnToService=1
+          SlurmUser=slurm
+          StateSaveLocation=/var/spool/slurmctld
+          SelectType=select/cons_tres
+          SelectTypeParameters=CR_Core_Memory
+          # 節點定義
+          NodeName=gpu-node01 CPUs={{ node_cpus }} Sockets=1 CoresPerSocket={{ node_cpus }} ThreadsPerCore=1 RealMemory={{ node_mem }} Gres=gpu:rtx4090:1 State=UNKNOWN
+          # 分區定義
+          PartitionName=debug Nodes=gpu-node01 Default=YES MaxTime=INFINITE State=UP
+
+    - name: 4.3 建立 cgroup.conf
+      copy:
+        dest: /etc/slurm/cgroup.conf
+        content: "CgroupAutomount=yes\nConstrainCores=yes\nConstrainDevices=yes\nConstrainRAM=yes"
+
+    - name: 4.4 啟動服務
+      systemd: { name: slurmctld, state: restarted, enabled: yes }
+
+# --- 階段 5: Worker (GPU + Slurmd) 安裝 ---
+- name: 5. 部署 Slurm Worker (GPU)
+  hosts: slurm_workers
+  become: yes
+  tasks:
+    - name: 5.1 安裝 Slurmd & Driver 工具
+      apt: { name: [slurmd, slurm-client, ubuntu-drivers-common], state: present }
+
+    - name: 5.2 安裝 NVIDIA Driver (Auto + Reboot)
+      shell: |
+        if ! nvidia-smi; then
+          ubuntu-drivers autoinstall
+          echo "reboot_needed"
+        fi
+      register: driver_install
+      ignore_errors: yes
+
+    - name: 5.3 重開機 (如果剛裝驅動)
+      reboot:
+      when: driver_install.stdout is search("reboot_needed")
+
+    - name: 5.4 建立 gres.conf
+      copy:
+        dest: /etc/slurm/gres.conf
+        content: "Name=gpu Type=rtx4090 File=/dev/nvidia0"
+
+    - name: 5.5 同步 slurm.conf (從 Master 複製過來的內容)
+      # 這裡為簡化直接寫入，實務上可透過 fetch/copy 模組從 master 同步
+      copy:
+        dest: /etc/slurm/slurm.conf
+        content: |
+          ClusterName=hpc-lab
+          SlurmctldHost=slurm-master
+          MungeSocketPath=/var/run/munge/munge.socket.2
+          ProctrackType=proctrack/cgroup
+          ReturnToService=1
+          SlurmUser=slurm
+          StateSaveLocation=/var/spool/slurmctld
+          SelectType=select/cons_tres
+          SelectTypeParameters=CR_Core_Memory
+          NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN
+          PartitionName=debug Nodes=gpu-node01 Default=YES MaxTime=INFINITE State=UP
+
+    - name: 5.6 啟動 Slurmd
+      systemd: { name: slurmd, state: restarted, enabled: yes }
+
+# --- 階段 6: KubeSphere Onboarding 準備 ---
+- name: 6. 輸出 MicroK8s Kubeconfig
+  hosts: slurm_masters
+  become: yes
+  tasks:
+    - name: 6.1 等待 MicroK8s 就緒
+      command: microk8s status --wait-ready
+      changed_when: false
+
+    - name: 6.2 產生標準 Kubeconfig
+      shell: microk8s config > /home/ubuntu/microk8s.kubeconfig
+      
+    - name: 6.3 讀取內容並顯示 (供 KubeSphere 使用)
+      command: cat /home/ubuntu/microk8s.kubeconfig
+      register: kubeconfig_out
+
+    - name: 6.4 顯示操作指引
+      debug:
+        msg: 
+          - "========================================================"
+          - "MicroK8s 與 Slurm 部署完成！"
+          - "Machine 0 (Master) IP: {{ ansible_host }}"
+          - "Machine 1 (Worker) IP: {{ groups['slurm_workers'][0] }}"
+          - "--------------------------------------------------------"
+          - "請複製下方的 Kubeconfig 內容，並在 KubeSphere 執行 'Add Cluster'："
+          - "{{ kubeconfig_out.stdout }}"
+          - "========================================================"
