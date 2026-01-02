@@ -63,25 +63,32 @@
       shell: |
         set -euo pipefail
         MID="{{ target_machine_id | default('') | string | trim }}"
-        MODEL="{{ slurm_model }}"
-        echo "[Gate-1] MID=${MID} MODEL=${MODEL}"
-
+        MODEL="{{ slurm_model | default('') | string | trim }}"
+        echo "[Gate-1] MID='${MID}' MODEL='${MODEL}'"
+        juju whoami || true
+    
         while true; do
-          if juju show-machine "$MID" -m "$MODEL" --format=json \
-            | jq -e --arg mid "$MID" '
-                (.machines[$mid]["machine-status"].current=="running")
-                and (.machines[$mid]["juju-status"].current=="started")
-                and (.machines[$mid]["modification-status"].current=="idle")
-              ' >/dev/null; then
-            echo "[Gate-1] READY"
-            exit 0
-          fi
-          echo "[Gate-1] waiting..."
+          JSON="$(juju show-machine "${MID}" -m "${MODEL}" --format=json 2>/dev/null || true)"
+          echo "${JSON}" | jq -r --arg mid "${MID}" '
+            "[Gate-1] machine-status=" + (.machines[$mid]["machine-status"].current // "NA") +
+            " juju-status=" + (.machines[$mid]["juju-status"].current // "NA") +
+            " modification-status=" + (.machines[$mid]["modification-status"].current // "NA")
+          ' || true
+    
+          echo "${JSON}" | jq -e --arg mid "${MID}" '
+            (.machines[$mid]["machine-status"].current=="running")
+            and (.machines[$mid]["juju-status"].current=="started")
+            and (.machines[$mid]["modification-status"].current=="idle")
+          ' >/dev/null && { echo "[Gate-1] READY"; exit 0; }
+    
           sleep 5
         done
       args:
         executable: /bin/bash
+      environment:
+        JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
+
 
     - name: 1.5b Gate-2：等待 OS cloud-init 完成（boot-finished）- AWX loop
       shell: |
