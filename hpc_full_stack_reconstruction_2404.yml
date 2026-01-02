@@ -288,19 +288,28 @@
         executable: /bin/bash
       changed_when: false
 # ==========================================
-# 第三階段：深度修正
+# 第三階段：深度修正 (v5.8 強制同步版)
 # ==========================================
-- name: 3. 執行自動化環境修正
+- name: 3. 執行自動化環境修正與設定檔同步
   hosts: maasjuju
-  # [修正] 必須在這裡重新定義變數，因為這是新的 Play
   vars:
     slurm_model: "hpc-lab"
   tasks:
-    - name: 3.0 預先獲取 slurmctld IP
-      shell: "juju ssh -m {{ slurm_model }} slurmctld/0 'hostname -I' | awk '{print $1}'"
-      register: ctld_ip_result
+    - name: 3.0 預先獲取 slurmctld IP 與 設定檔內容
+      shell: |
+        # 抓 IP
+        IP=$(juju ssh -m {{ slurm_model }} slurmctld/0 'hostname -I' | awk '{print $1}')
+        # 抓 Master 的設定檔內容 (Base64 編碼以避免特殊字元問題)
+        CONF=$(juju ssh -m {{ slurm_model }} slurmctld/0 'base64 -w0 /etc/slurm/slurm.conf')
+        echo "$IP|$CONF"
+      register: master_data
+    
+    - name: 3.1 解析 Master 資訊
+      set_fact:
+        master_ip: "{{ master_data.stdout.split('|')[0] }}"
+        master_conf_b64: "{{ master_data.stdout.split('|')[1] }}"
 
-    - name: 3.1 修正控制端 (slurmctld)
+    - name: 3.2 修正控制端 (slurmctld)
       shell: |
         juju ssh -m {{ slurm_model }} slurmctld/0 "
         REAL_HOSTNAME=\$(hostname)
@@ -313,23 +322,44 @@
         sudo systemctl restart munge && sudo systemctl restart slurmctld
         "
 
-    - name: 3.2 修正運算端
+    - name: 3.3 修正運算端 (強制寫入設定檔)
       shell: |
-        MASTER_IP="{{ ctld_ip_result.stdout }}"
+        MASTER_IP="{{ master_ip }}"
+        CONF_B64="{{ master_conf_b64 }}"
+        
         juju ssh -m {{ slurm_model }} slurmd/0 "
+        set -x
+        # 1. 設定 Hosts
         sudo sed -i '/slurm-master/d' /etc/hosts
         echo \"\$MASTER_IP slurm-master\" | sudo tee -a /etc/hosts
         
+        # 2. [關鍵修正] 強制寫入 slurm.conf (如果檔案不存在)
+        sudo mkdir -p /etc/slurm
+        echo \"\$CONF_B64\" | base64 -d | sudo tee /etc/slurm/slurm.conf > /dev/null
+        
+        # 3. 執行參數修改
         sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
         sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
+        
+        # 寫入 Gres 設定
         echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
+        
+        # 修改 NodeName (注意：這裡還是硬編碼 gpu-node01，若 hostname 不同會有風險)
+        # 為了保險，我們把這一行變得更有彈性一點，先備份原檔
+        sudo cp /etc/slurm/slurm.conf /etc/slurm/slurm.conf.bak
         
         sudo sed -i '/NodeName=gpu-node01/c\NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN' /etc/slurm/slurm.conf
         
+        # 4. 修復權限並重啟
         sudo mkdir -p /run/slurm && sudo chown slurm:slurm /run/slurm
-        sudo systemctl restart munge && sudo systemctl restart slurmd
+        sudo chown -R slurm:slurm /etc/slurm
+        
+        sudo systemctl restart munge 
+        # 清除失敗狀態並重啟
+        sudo systemctl reset-failed slurmd
+        sudo systemctl restart slurmd
         "
 
-    - name: 3.3 最終節點喚醒
+    - name: 3.4 最終節點喚醒
       shell: |
         juju ssh -m {{ slurm_model }} slurmctld/0 "sudo scontrol update nodename=gpu-node01 state=resume"
