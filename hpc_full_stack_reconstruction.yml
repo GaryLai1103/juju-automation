@@ -30,7 +30,7 @@
     # MicroK8s (原生支援 22.04)
     # =========================================================
     - name: 1.2b 在 Slurm 控制端上共同部署 MicroK8s
-      command: "juju deploy microk8s --to slurmctld/0 --channel=1.31/stable"
+      command: "juju deploy microk8s --to slurmctld/0 --channel=1.28/stable"
       register: deploy_k8s
       failed_when: "(deploy_k8s.rc != 0) and ('already exists' not in deploy_k8s.stderr)"
     - name: 1.2c Gate：等待 MicroK8s 就緒
