@@ -168,7 +168,7 @@
         echo "[1.6] checking nvidia-smi..."
         juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi'
 
-        # --- 4) 關鍵防禦鎖定驅動套件，防止 Juju 覆蓋 ---
+        # --- 4) 鎖定驅動套件，防止 Juju 覆蓋 ---
         echo "[1.6] Locking NVIDIA packages to prevent override..."
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
@@ -176,6 +176,7 @@
           sudo apt-mark hold "^nvidia-.*" "^libnvidia-.*" "^linux-modules-nvidia-.*"
           echo "Packages Locked Status:"
           sudo apt-mark showhold | grep nvidia | head -n 5 || true
+        '
 
         # --- 5) 安裝/啟動 dcgm snap exporter (加上 Retry 機制) ---
         echo "[1.6] installing dcgm snap + starting exporter..."
