@@ -129,36 +129,78 @@
       register: ci_status
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA Driver + 啟動 DCGM Exporter（含 metrics gate）
+    - name: 1.6 安裝 NVIDIA Driver + reboot + 啟動 DCGM Exporter（含 metrics gate）
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
         MID="{{ target_machine_id | default('', true) | string | trim }}"
-    
+
         echo "[1.6] MODEL=$MODEL MID=$MID"
-    
-        # --- 防呆 ---
         if [ -z "$MID" ] || [ "$MID" = "None" ]; then
           echo "[1.6] ERROR: target_machine_id is empty/None"
           exit 2
         fi
-    
-        # --- 1) 確保 curl 存在（後面用來驗證 metrics） ---
+
+        # 0) 確保 curl 存在（後面 metrics gate 需要）
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
           command -v curl >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y curl)
           echo "[1.6] curl OK: $(command -v curl)"
         '
-    
-        # --- 2) 驅動檢查：nvidia-smi 必須成功（你的環境已是 580.95.05，這邊用 gate） ---
+
+        echo "[1.6] check driver/pkg"
+        # 1) 檢查：若 driver 不在，就安裝（安裝後一定 reboot）
+        NEED_REBOOT=0
+
+        if ! juju ssh -m "$MODEL" "$MID" -- 'command -v nvidia-smi >/dev/null 2>&1'; then
+          echo "[1.6] nvidia-smi missing -> install nvidia driver then reboot"
+          juju ssh -m "$MODEL" "$MID" -- '
+            set -euo pipefail
+            sudo apt-get update
+            # 先嘗試你指定的 580；若 repo 沒有，再 fallback ubuntu-drivers
+            if apt-cache show nvidia-driver-580 >/dev/null 2>&1; then
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580
+            else
+              echo "[1.6] WARN: nvidia-driver-580 not found in repo, fallback ubuntu-drivers"
+              sudo apt-get install -y ubuntu-drivers-common
+              sudo ubuntu-drivers autoinstall
+            fi
+          '
+          NEED_REBOOT=1
+        else
+          echo "[1.6] nvidia-smi exists -> skip driver install"
+        fi
+
+        # 2) 標準流程：只要本次有安裝 driver，就 reboot
+        if [ "$NEED_REBOOT" = "1" ]; then
+          echo "[1.6] reboot now"
+          juju ssh -m "$MODEL" "$MID" -- 'sudo reboot' || true
+
+          echo "[1.6] wait for SSH back"
+          # 等 machine 回來：能 juju ssh 進去就算回來
+          while true; do
+            if juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; then
+              echo "[1.6] SSH is back"
+              break
+            fi
+            echo "[1.6] waiting..."
+            sleep 5
+          done
+        fi
+
+        # 3) reboot 後 gate：nvidia-smi 一定要成功（driver 真正生效的證據）
         echo "[1.6] gate: nvidia-smi"
-        juju ssh -m "$MODEL" "$MID" -- '
-          set -euo pipefail
-          command -v nvidia-smi >/dev/null 2>&1 || { echo "[1.6] ERROR: nvidia-smi not found"; exit 10; }
-          nvidia-smi
-        '
-    
-        # --- 3) 安裝/啟動 dcgm snap ---
+        while true; do
+          if juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
+            juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi | head -n 20'
+            echo "[1.6] nvidia-smi OK"
+            break
+          fi
+          echo "[1.6] nvidia-smi not ready yet..."
+          sleep 5
+        done
+
+        # 4) DCGM：用 snap（你已驗證可行），並確保服務啟動/9400 監聽
         echo "[1.6] install/start dcgm snap"
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
@@ -170,8 +212,8 @@
           snap services dcgm || true
           sudo ss -lntp | grep 9400 || true
         '
-    
-        # --- 4) metrics gate：HTTP 200 + 內容有 # HELP ---
+
+        # 5) metrics gate：HTTP 200 + 內容有 # HELP
         echo "[1.6] gate: metrics endpoint"
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
@@ -187,6 +229,7 @@
       environment:
         JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
+
 
 
 # ==========================================
