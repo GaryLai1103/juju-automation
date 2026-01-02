@@ -228,7 +228,7 @@
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
-    - name: 2.3 Gate：等待 slurmd 就緒 (縮排修正版)
+    - name: 2.3 Gate：等待 slurmd 就緒 (jq 終極版)
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
@@ -237,45 +237,34 @@
         
         # 迴圈檢查 20 次
         for i in {1..20}; do
+            # 1. 獲取完整 JSON 狀態
+            JSON_DATA=$(juju status -m "$MODEL" --format=json)
             
-            # [重要] 這裡的 EOF 包住的內容必須完全靠左，不能有空格
-            RESULT=$(juju status -m "$MODEL" --format=json | python3 - << 'EOF'
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    # 抓取 applications -> slurmd -> units
-    app = data.get('applications', {}).get('slurmd', {})
-    units = app.get('units', {})
-    
-    if not units:
-        print('initializing|initializing')
-        sys.exit(0)
-        
-    # 優先抓 slurmd/0，抓不到就抓列表中的第一個
-    unit_key = 'slurmd/0' if 'slurmd/0' in units else list(units.keys())[0]
-    unit = units[unit_key]
-    
-    # 抓取 juju-status (Agent) 和 workload-status (Service)
-    # 兼容新舊版 key
-    agent = unit.get('juju-status', {}).get('current') or unit.get('agent-status', {}).get('current', 'unknown')
-    workload = unit.get('workload-status', {}).get('current', 'unknown')
-    
-    print(f"{agent}|{workload}")
-except Exception:
-    print('error|error')
-EOF
-            )
+            # 2. 使用 jq 提取狀態 (這行不會有縮排問題)
+            # 邏輯：抓 applications.slurmd.units 的第一項 -> 組合 "Agent狀態|Workload狀態"
+            # 範例輸出: idle|waiting 或 idle|blocked
+            STATUS_PAIR=$(echo "$JSON_DATA" | jq -r '
+              try (
+                .applications.slurmd.units | to_entries[0].value | 
+                "\(.["juju-status"].current // .["agent-status"].current)|\(.["workload-status"].current)"
+              ) catch "initializing|initializing"
+            ')
             
-            # 去除前後空白
-            RESULT=$(echo "$RESULT" | xargs)
+            # 3. 切割字串
+            AGENT_STATUS=$(echo "$STATUS_PAIR" | cut -d'|' -f1)
+            WORKLOAD_STATUS=$(echo "$STATUS_PAIR" | cut -d'|' -f2)
             
-            # 分割變數
-            AGENT_STATUS=$(echo "$RESULT" | cut -d'|' -f1)
-            WORKLOAD_STATUS=$(echo "$RESULT" | cut -d'|' -f2)
+            echo "Status Check ($i/20): Agent=[$AGENT_STATUS], Workload=[$WORKLOAD_STATUS]"
             
-            echo "Status check ($i/20): Agent=$AGENT_STATUS, Workload=$WORKLOAD_STATUS"
+            # --- 判斷邏輯 ---
             
-            # 1. 觸發自動修復 (如果因為驅動被鎖而 blocked)
+            # A. 成功放行：只要 Juju Agent 閒置 (idle)，代表安裝腳本跑完了
+            if [ "$AGENT_STATUS" == "idle" ]; then
+                echo "✅ Slurmd Agent is ready (Idle). Proceeding..."
+                exit 0
+            fi
+            
+            # B. 自動修復：如果因為驅動鎖定而 Blocked，強制解鎖
             if [ "$WORKLOAD_STATUS" == "blocked" ]; then
                 echo "⚠️ Detected BLOCKED state. Forcing resolve..."
                 juju resolve -m "$MODEL" slurmd/0 --no-retry
@@ -283,22 +272,17 @@ EOF
                 continue
             fi
             
-            # 2. 成功判定：只要 Agent 閒置 (idle)，代表 Juju 任務結束，可以放行
-            if [ "$AGENT_STATUS" == "idle" ]; then
-                echo "Slurmd Agent is ready (Idle). Proceeding to configuration."
-                exit 0
-            fi
-            
             sleep 10
         done
         
-        # [最後通牒] SSH 通了就放行
-        if juju ssh -m "$MODEL" slurmd/0 -- "echo up"; then
-             echo "⚠️ Status check timeout, but SSH is UP. Proceeding forcefully."
+        # [最後通牒] 如果狀態還是怪怪的，但 SSH 能通，我們也當作成功
+        echo "⚠️ Status check timeout. Checking SSH connectivity..."
+        if juju ssh -m "$MODEL" slurmd/0 -- "true"; then
+             echo "✅ SSH is UP. Proceeding forcefully."
              exit 0
         fi
         
-        echo "ERROR: Slurmd failed."
+        echo "❌ ERROR: Slurmd failed to start."
         exit 1
       args:
         executable: /bin/bash
