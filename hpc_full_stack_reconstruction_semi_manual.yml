@@ -9,7 +9,7 @@
   hosts: maasjuju
   gather_facts: no
   vars:
-    model_name: "hpc-native"
+    model_name: "hpc-lab"
     # [請確認] MAAS Tags
     master_constraints: "tags=virtual" 
     worker_constraints: "tags=slurm-node" 
