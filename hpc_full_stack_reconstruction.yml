@@ -83,15 +83,24 @@
         executable: /bin/bash
       changed_when: false
 
-    - name: 1.5b Gate-2：等待 OS cloud-init 完成（boot-finished）
-      command: >
-        juju ssh -m {{ slurm_model }} {{ target_machine_id }}
-        -- "test -f /var/lib/cloud/instance/boot-finished"
-      register: boot_finished
+    - name: 1.5b Gate-2：等待 OS cloud-init 完成（boot-finished）- AWX loop
+      shell: |
+        set -euo pipefail
+        MID="{{ target_machine_id | default('') | string | trim }}"
+        MODEL="{{ slurm_model }}"
+        echo "[Gate-2] waiting cloud-init MID=${MID} MODEL=${MODEL}"
+
+        while true; do
+          if juju ssh -m "$MODEL" "$MID" -- "test -f /var/lib/cloud/instance/boot-finished" >/dev/null 2>&1; then
+            echo "[Gate-2] cloud-init DONE"
+            exit 0
+          fi
+          echo "[Gate-2] not done yet..."
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
       changed_when: false
-      retries: 120
-      delay: 5
-      until: boot_finished.rc == 0
 
     - name: 1.5c（可選）列印 cloud-init 狀態做紀錄
       command: >
