@@ -59,21 +59,32 @@
       debug:
         msg: "target_machine_id={{ target_machine_id | default('', true) | string | trim }}"
 
-    - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）- AWX loop
+    - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）- AWX loop (clean)
       shell: |
         set -euo pipefail
-        MID="{{ target_machine_id | default('') | string | trim }}"
-        MODEL="{{ slurm_model | default('') | string | trim }}"
+        MID="{{ target_machine_id | default('', true) | string | trim }}"
+        MODEL="{{ slurm_model | default('', true) | string | trim }}"
+    
         echo "[Gate-1] MID='${MID}' MODEL='${MODEL}'"
-        juju whoami || true
+        juju whoami
+    
+        if [ -z "${MID}" ] || [ "${MID}" = "None" ]; then
+          echo "[Gate-1] ERROR: target_machine_id is empty/None"
+          exit 2
+        fi
     
         while true; do
-          JSON="$(juju show-machine "${MID}" -m "${MODEL}" --format=json 2>/dev/null || true)"
+          JSON="$(juju show-machine "${MID}" -m "${MODEL}" --format=json 2>&1)" || {
+            echo "[Gate-1] ERROR: juju show-machine failed:"
+            echo "${JSON}"
+            exit 1
+          }
+    
           echo "${JSON}" | jq -r --arg mid "${MID}" '
             "[Gate-1] machine-status=" + (.machines[$mid]["machine-status"].current // "NA") +
             " juju-status=" + (.machines[$mid]["juju-status"].current // "NA") +
             " modification-status=" + (.machines[$mid]["modification-status"].current // "NA")
-          ' || true
+          '
     
           echo "${JSON}" | jq -e --arg mid "${MID}" '
             (.machines[$mid]["machine-status"].current=="running")
@@ -107,6 +118,8 @@
         done
       args:
         executable: /bin/bash
+      environment:
+        JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
 
     - name: 1.5c（可選）列印 cloud-init 狀態做紀錄
@@ -134,7 +147,7 @@
   tasks:
     - name: 2.1 佈署運算端至指定已就緒機器
       # 使用 1.4 抓到的動態 ID
-      command: "juju deploy slurmd -m {{ slurm_model }} --to {{ target_machine_id.stdout }} --channel=23.11/stable"
+      command: "juju deploy slurmd -m {{ slurm_model }} --to {{ target_machine_id }} --channel=23.11/stable"
       ignore_errors: yes
 
     - name: 2.2 建立整合關係 (大腦與手腳連線)
