@@ -23,7 +23,7 @@
       ignore_errors: yes
 
     - name: 1.2 部署 Machine 0 (Master + MicroK8s)
-      command: "juju deploy microk8s -m {{ model_name }} --constraints {{ master_constraints }} --base {{ target_os }} --channel=latest/edge"
+      command: "juju deploy microk8s -m {{ model_name }} --constraints {{ master_constraints }} --base {{ target_os }} --channel=23.11/stable"
       # 非同步執行，避免 Ansible 等太久斷線 (非同步 10分鐘)
       async: 600
       poll: 10
