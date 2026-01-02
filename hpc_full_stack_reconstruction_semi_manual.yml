@@ -11,7 +11,7 @@
   hosts: maasjuju  
   gather_facts: no
   vars:
-    model_name: "hpc-hybrid"
+    model_name: "hpc-lab"
     master_constraints: "tags=virtual" 
     worker_constraints: "tags=slurm-node" 
     target_os: "ubuntu@24.04"
