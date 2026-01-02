@@ -2,7 +2,7 @@
 # SKU: HPC-Full-Stack-Reconstruction-v3-Parallel
 # ==========================================
 - name: 1. 控制端佈署與運算端硬體準備
-  hosts: all
+  hosts: maasjuju
   gather_facts: no
   vars:
     slurm_model: "hpc-lab"
@@ -13,14 +13,11 @@
       command: "juju add-model {{ slurm_model }}"
       ignore_errors: yes
 
-    # [優化]：先讓大腦上線
     - name: 1.2 佈署控制端 (slurmctld)
-      # [保持不變]
       command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
       ignore_errors: yes
 
     - name: 1.3 向 MAAS 請求 GPU 節點 (強制指定 OS 版本)
-      # [修正重點]：加入 --base 參數，確保 MAAS 不會亂選版本
       command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
       register: add_machine_result
 
@@ -36,8 +33,8 @@
             | trim
           }}
 
-    - name: 1.4b 若解析不到，改用 juju machines --format=json 取最大 Machine ID（不靠 jq）
-      when: target_machine_id == ''
+    - name: 1.4b 若解析不到（含 None/空字串），改用 juju machines --format=json 取最大 Machine ID（不靠 jq）
+      when: (target_machine_id | default('') | string | trim) == ''
       block:
         - name: 讀取 machines json
           command: "juju machines -m {{ slurm_model }} --format=json"
@@ -58,6 +55,10 @@
                 ) | string
               }}
 
+    - name: DEBUG target_machine_id
+      debug:
+        msg: "target_machine_id={{ target_machine_id | default('') | string | trim }}"
+
     - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）
       command: "juju show-machine {{ target_machine_id }} -m {{ slurm_model }} --format=json"
       register: sm
@@ -65,11 +66,20 @@
       retries: 180
       delay: 5
       until: >
-        (sm.stdout | from_json).machines[target_machine_id]['machine-status']['current'] == 'running'
+        (
+          ((sm.stdout | from_json).machines.get(target_machine_id | string, {}))
+          .get('machine-status', {}).get('current', '')
+        ) == 'running'
         and
-        (sm.stdout | from_json).machines[target_machine_id]['juju-status']['current'] == 'started'
+        (
+          ((sm.stdout | from_json).machines.get(target_machine_id | string, {}))
+          .get('juju-status', {}).get('current', '')
+        ) == 'started'
         and
-        (sm.stdout | from_json).machines[target_machine_id]['modification-status']['current'] == 'idle'
+        (
+          ((sm.stdout | from_json).machines.get(target_machine_id | string, {}))
+          .get('modification-status', {}).get('current', '')
+        ) == 'idle'
 
     - name: 1.5b Gate-2：等待 OS cloud-init 完成（boot-finished）
       command: >
