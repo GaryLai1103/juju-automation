@@ -129,27 +129,55 @@
       register: ci_status
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA Driver + DCGM Exporter（Snap 方案）
+    - name: 1.6 安裝 NVIDIA Driver + DCGM Exporter（可觀測 + 必要時重開機）
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
         MID="{{ target_machine_id | default('', true) | string | trim }}"
     
+        echo "[1.6] install driver on MID=$MID MODEL=$MODEL"
+    
+        # 1) 裝 driver（autoinstall 最穩）
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
           sudo apt-get update
+          sudo apt-get install -y ubuntu-drivers-common
+          echo "== ubuntu-drivers devices =="
+          ubuntu-drivers devices || true
+          sudo ubuntu-drivers autoinstall
+        '
     
-          # driver（你可以保留你要的版本；如果之後又遇到找不到 580，再改 autoinstall）
-          sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 || true
+        # 2) 驗證 nvidia-smi；若不存在/失敗就 reboot 再檢一次
+        if ! juju ssh -m "$MODEL" "$MID" -- 'command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1'; then
+          echo "[1.6] nvidia-smi not ready, rebooting..."
+          juju ssh -m "$MODEL" "$MID" -- 'sudo reboot' || true
     
-          # DCGM + exporter（snap）
+          # 等機器回來（簡易 wait：每 10 秒試一次 juju ssh）
+          echo "[1.6] waiting machine back..."
+          for i in $(seq 1 60); do
+            if juju ssh -m "$MODEL" "$MID" -- 'true' >/dev/null 2>&1; then
+              echo "[1.6] machine is back"
+              break
+            fi
+            sleep 10
+          done
+        fi
+    
+        # 3) 最終確認 nvidia-smi
+        echo "[1.6] checking nvidia-smi..."
+        juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi'
+    
+        # 4) 安裝/啟動 dcgm snap exporter
+        echo "[1.6] installing dcgm snap + starting exporter..."
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
           sudo snap install dcgm
           sudo snap start dcgm.nv-hostengine
           sudo snap start dcgm.dcgm-exporter
-    
-          # quick check
-          nvidia-smi || true
-          curl -s localhost:9400/metrics | head -n 20
+          sudo snap restart dcgm.nv-hostengine
+          sudo snap restart dcgm.dcgm-exporter
+          echo "== metrics head =="
+          curl -s http://127.0.0.1:9400/metrics | head -n 30
         '
       args:
         executable: /bin/bash
