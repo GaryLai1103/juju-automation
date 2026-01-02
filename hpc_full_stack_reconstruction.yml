@@ -129,14 +129,34 @@
       register: ci_status
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA 驅動與 DCGM (在佈署 slurmd 前)
+    - name: 1.6 安裝 NVIDIA Driver + DCGM Exporter（Snap 方案）
       shell: |
-        juju ssh -m {{ slurm_model }} {{ target_machine_id }} "
-        sudo apt-get update && \
-        sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager && \
-        sudo systemctl enable --now nvidia-dcgm && \
-        sudo nvidia-smi -pm 1
-        "
+        set -euo pipefail
+        MODEL="{{ slurm_model }}"
+        MID="{{ target_machine_id | default('', true) | string | trim }}"
+    
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
+          sudo apt-get update
+    
+          # driver（你可以保留你要的版本；如果之後又遇到找不到 580，再改 autoinstall）
+          sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 || true
+    
+          # DCGM + exporter（snap）
+          sudo snap install dcgm
+          sudo snap start dcgm.nv-hostengine
+          sudo snap start dcgm.dcgm-exporter
+    
+          # quick check
+          nvidia-smi || true
+          curl -s localhost:9400/metrics | head -n 20
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        JUJU_DATA: "/home/gary/.local/share/juju"
+      changed_when: false
+
 # ==========================================
 # 第二階段：佈署運算端並建立連動
 # ==========================================
