@@ -106,24 +106,47 @@
     node_cpus: 18
     node_mem: 128646
   tasks:
-    - name: 3.1 寫入 Master slurm.conf
+    - name: 3.1 寫入 Master slurm.conf (語法修正版)
       shell: |
         juju ssh -m {{ slurm_model }} 0 "
-        sudo bash -c 'cat > /etc/slurm/slurm.conf <<EOF
+        # 1. 建立必要目錄
+        sudo mkdir -p /var/spool/slurmctld /var/run/slurm /var/log/slurm
+        sudo chown -R slurm:slurm /var/spool/slurmctld /var/run/slurm /var/log/slurm
+        
+        # 2. 寫入設定檔 (移除不相容的 MungeSocketPath)
+        sudo bash -c \"cat > /etc/slurm/slurm.conf <<'EOF'
         ClusterName=hpc-lab
         SlurmctldHost=\$(hostname)
-        MungeSocketPath=/var/run/munge/munge.socket.2
+        
+        # [修正] 移除 MungeSocketPath，讓 AuthType 插件自行處理
+        AuthType=auth/munge
         SlurmUser=slurm
+        
+        # PID 與路徑
+        SlurmctldPidFile=/var/run/slurm/slurmctld.pid
+        SlurmdPidFile=/var/run/slurm/slurmd.pid
         StateSaveLocation=/var/spool/slurmctld
         SlurmdSpoolDir=/var/spool/slurmd
+        
+        # 日誌
+        SlurmctldLogFile=/var/log/slurm/slurmctld.log
+        SlurmdLogFile=/var/log/slurm/slurmd.log
+        
+        # 插件設定
+        GresTypes=gpu
         ProctrackType=proctrack/cgroup
-        TaskPlugin=task/affinity
+        TaskPlugin=task/affinity,task/cgroup
         SelectType=select/cons_tres
         SelectTypeParameters=CR_Core_Memory
-        NodeName=gpu-node01 CPUs={{ node_cpus }} Sockets=1 CoresPerSocket={{ node_cpus }} ThreadsPerCore=1 RealMemory={{ node_mem }} Gres=gpu:rtx4090:1 State=UNKNOWN
+        
+        # 節點定義
+        NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN
         PartitionName=debug Nodes=gpu-node01 Default=YES MaxTime=INFINITE State=UP
-        EOF'
-        sudo mkdir -p /var/spool/slurmctld && sudo chown slurm:slurm /var/spool/slurmctld
+        EOF\"
+        
+        # 3. 權限與啟動
+        sudo chown slurm:slurm /etc/slurm/slurm.conf
+        sudo systemctl restart munge
         sudo systemctl restart slurmctld
         "
 
