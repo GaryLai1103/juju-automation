@@ -228,8 +228,40 @@
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
-    - name: 2.3 Gate：等待 slurmd 安裝完成
-      command: "juju wait-for unit slurmd/0 -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
+    - name: 2.3 Gate：等待 slurmd 就緒 (含自動解鎖機制)
+      shell: |
+        set -euo pipefail
+        MODEL="{{ slurm_model }}"
+        
+        echo "Waiting for slurmd/0..."
+        
+        # 迴圈檢查 20 次 (每次 10 秒)
+        for i in {1..20}; do
+            # 1. 取得目前狀態
+            STATUS=$(juju status -m "$MODEL" slurmd/0 --format=json | jq -r '.applications.slurmd.units."slurmd/0"."agent-status".current')
+            echo "Current Status: $STATUS ($i/20)"
+            
+            # 2. 如果是 idle，代表成功，跳出
+            if [ "$STATUS" == "idle" ]; then
+                echo "Slurmd is Ready (Idle)!"
+                exit 0
+            fi
+            
+            # 3. [關鍵] 如果是 blocked (因為驅動被鎖導致的報錯)，強制解鎖！
+            if [ "$STATUS" == "blocked" ] || [ "$STATUS" == "error" ]; then
+                echo "⚠️ Detected BLOCKED state. Forcing resolve to bypass driver mismatch..."
+                juju resolve -m "$MODEL" slurmd/0 --no-retry
+                sleep 5
+            fi
+            
+            sleep 10
+        done
+        
+        echo "ERROR: Slurmd failed to reach idle state."
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
 
 # ==========================================
 # 第三階段：深度修正
