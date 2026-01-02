@@ -228,7 +228,7 @@
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
-    - name: 2.3 Gate：等待 slurmd 就緒 (Python 雙重檢查版)
+    - name: 2.3 Gate：等待 slurmd 就緒 (Python HEREDOC 修正版)
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
@@ -237,35 +237,45 @@
         
         # 迴圈檢查 20 次
         for i in {1..20}; do
-            # 使用 Python 解析 JSON，同時抓取 juju-status 和 workload-status
-            RESULT=$(juju status -m "$MODEL" --format=json | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    # 抓取第一台 slurmd unit
-    units = data.get('applications', {}).get('slurmd', {}).get('units', {})
-    if not units:
-        print('initializing|initializing')
-        sys.exit(0)
-        
-    # 優先抓 slurmd/0，抓不到就抓第一台
-    unit_key = 'slurmd/0' if 'slurmd/0' in units else list(units.keys())[0]
-    unit = units[unit_key]
-    
-    # Juju 3.x 使用 'juju-status'，舊版使用 'agent-status'
-    agent = unit.get('juju-status', {}).get('current') or unit.get('agent-status', {}).get('current', 'unknown')
-    workload = unit.get('workload-status', {}).get('current', 'unknown')
-    
-    print(f'{agent}|{workload}')
-except Exception:
-    print('error|error')
-")
+            # [修正] 使用 HEREDOC (<< 'EOF') 來包過 Python 代碼
+            # 這樣不需要擔心引號衝突，YAML 解析也不會報錯
+            RESULT=$(juju status -m "$MODEL" --format=json | python3 - << 'EOF'
+        import sys, json
+        try:
+            # 讀取標準輸入 (stdin)
+            data = json.load(sys.stdin)
+            
+            # 抓取第一台 slurmd unit
+            # 使用 .get() 避免報錯
+            app = data.get('applications', {}).get('slurmd', {})
+            units = app.get('units', {})
+            
+            if not units:
+                print('initializing|initializing')
+                sys.exit(0)
+                
+            # 優先抓 slurmd/0，抓不到就抓列表中的第一個
+            unit_key = 'slurmd/0' if 'slurmd/0' in units else list(units.keys())[0]
+            unit = units[unit_key]
+            
+            # Juju 3.x 使用 'juju-status'，舊版使用 'agent-status'
+            agent = unit.get('juju-status', {}).get('current') or unit.get('agent-status', {}).get('current', 'unknown')
+            workload = unit.get('workload-status', {}).get('current', 'unknown')
+            
+            print(f"{agent}|{workload}")
+        except Exception:
+            print('error|error')
+        EOF
+            )
+            
+            # 去除前後空白 (Trim)
+            RESULT=$(echo "$RESULT" | xargs)
             
             # 分割變數
             AGENT_STATUS=$(echo "$RESULT" | cut -d'|' -f1)
             WORKLOAD_STATUS=$(echo "$RESULT" | cut -d'|' -f2)
             
-            echo "Status: Agent=$AGENT_STATUS, Workload=$WORKLOAD_STATUS ($i/20)"
+            echo "Status check ($i/20): Agent=$AGENT_STATUS, Workload=$WORKLOAD_STATUS"
             
             # 1. 觸發自動修復 (如果因為驅動被鎖而 blocked)
             if [ "$WORKLOAD_STATUS" == "blocked" ]; then
@@ -276,7 +286,6 @@ except Exception:
             fi
             
             # 2. 成功判定：只要 Agent 閒置 (idle)，無論 Workload 是 waiting 還是 blocked，都放行
-            # 因為後面的 Task 3 會負責修復設定檔讓它變綠燈
             if [ "$AGENT_STATUS" == "idle" ]; then
                 echo "Slurmd Agent is ready (Idle). Proceeding to configuration."
                 exit 0
