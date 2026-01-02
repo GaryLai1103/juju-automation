@@ -168,7 +168,7 @@
         echo "[1.6] checking nvidia-smi..."
         juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi'
 
-        # --- [關鍵防禦] 4) 鎖定驅動套件，防止 Juju 覆蓋 ---
+        # --- 4) 關鍵防禦鎖定驅動套件，防止 Juju 覆蓋 ---
         echo "[1.6] Locking NVIDIA packages to prevent override..."
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
