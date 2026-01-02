@@ -1,17 +1,16 @@
 # =================================================================
-# SKU: HPC-Hybrid-v6.0 (Juju Infra + Native Slurm/GPU)
-# Architecture:
-#   Machine 0: MicroK8s (Juju) + Slurmctld (Ansible)
-#   Machine 1: Ubuntu 24.04 (Juju) + NVIDIA Driver (Ansible) + Slurmd (Ansible)
+# SKU: HPC-Native-v2.0 (Pure Ansible Stack)
+# Infrastructure: Juju (OS Provisioning Only)
+# Software: K3s + Slurm + NVIDIA Drivers (All Ansible)
 # =================================================================
 
-# --- 階段 1: Juju 基礎建設與機器調度 (修正版) ---
-- name: 1. Juju 資源調度與 MicroK8s 部署
-  # [修正] 不要在 localhost 跑，要在有裝 Juju CLI 的跳板機跑
-  hosts: maasjuju  
+# --- 階段 1: 基礎建設 (向 MAAS 要乾淨的機器) ---
+- name: 1. Juju 機器調度 (純 OS)
+  hosts: maasjuju
   gather_facts: no
   vars:
-    model_name: "hpc-lab"
+    model_name: "hpc-native"
+    # [請確認] MAAS Tags
     master_constraints: "tags=virtual" 
     worker_constraints: "tags=slurm-node" 
     target_os: "ubuntu@24.04"
@@ -19,33 +18,30 @@
   tasks:
     - name: 1.1 建立 Juju Model
       command: "juju add-model {{ model_name }}"
-      # 若 Model 已存在可能會報錯，忽略即可
       ignore_errors: yes
 
-    - name: 1.2 部署 Machine 0 (Master + MicroK8s)
-      command: "juju deploy microk8s -m {{ model_name }} --constraints {{ master_constraints }} --base {{ target_os }} --channel=23.11/stable"
-      # 非同步執行，避免 Ansible 等太久斷線 (非同步 10分鐘)
-      async: 600
-      poll: 10
-      register: deploy_microk8s
+    - name: 1.2 請求 Machine 0 (未來的主控節點)
+      # 只執行 add-machine，不 deploy 任何 charm
+      command: "juju add-machine -m {{ model_name }} --constraints {{ master_constraints }} --base {{ target_os }}"
+      register: machine0_req
 
-    - name: 1.3 請求 Machine 1 (Worker + 純 OS)
+    - name: 1.3 請求 Machine 1 (未來的運算節點)
       command: "juju add-machine -m {{ model_name }} --constraints {{ worker_constraints }} --base {{ target_os }}"
-      register: add_machine_output
+      register: machine1_req
 
-    - name: 1.4 等待機器分配 IP (Juju Status Check)
+    - name: 1.4 等待機器分配 IP
       shell: |
-        # 迴圈檢查直到兩台機器都有 IP
+        # 迴圈檢查直到兩台機器都有 DNS/IP
         for i in {1..60}; do
           STATUS=$(juju status -m {{ model_name }} --format=json)
           
-          # 抓取 MicroK8s 的 IP (App IP)
-          M0_IP=$(echo "$STATUS" | jq -r '.applications.microk8s.units | to_entries[0].value["public-address"] // empty')
-          
-          # 抓取 Machine 1 的 IP (直接抓 machines 列表中的第 2 台機器，通常 ID 為 1)
-          # 注意：這裡假設第一台是 0 (microk8s), 第二台是 1 (worker)
+          # Juju 的機器 ID 通常從 0 開始
+          # Machine 0 IP
+          M0_IP=$(echo "$STATUS" | jq -r '.machines["0"]["dns-name"] // empty')
+          # Machine 1 IP
           M1_IP=$(echo "$STATUS" | jq -r '.machines["1"]["dns-name"] // empty')
           
+          # 確保抓到的不是 pending 或空值
           if [[ -n "$M0_IP" && -n "$M1_IP" && "$M0_IP" != "null" && "$M1_IP" != "null" ]]; then
             echo "$M0_IP|$M1_IP"
             exit 0
@@ -54,23 +50,22 @@
         done
         exit 1
       register: node_ips
-      # 告訴 Ansible 這一行指令不算是對系統做變更 (不會顯示 Changed)
       changed_when: false
 
-    - name: 1.5 動態加入 Ansible Inventory
+    - name: 1.5 解析 IP 並加入 Inventory
       set_fact:
         master_ip: "{{ node_ips.stdout.split('|')[0] }}"
         worker_ip: "{{ node_ips.stdout.split('|')[1] }}"
-    
-    - name: 1.6 註冊主機到暫存群組 (Master)
+
+    - name: 1.6 註冊主機
       add_host:
         name: "{{ master_ip }}"
         groups: slurm_masters
         ansible_user: ubuntu
-        # 如果需要透過跳板機連線，可以加上這些參數 (視你的網路環境而定)
+        # 若需要 SSH 跳板設定
         # ansible_ssh_common_args: '-o ProxyCommand="ssh -W %h:%p -q ubuntu@maasjuju"'
 
-    - name: 1.7 註冊主機到暫存群組 (Worker)
+    - name: 1.7 註冊主機
       add_host:
         name: "{{ worker_ip }}"
         groups: slurm_workers
@@ -80,34 +75,32 @@
       wait_for:
         host: "{{ item }}"
         port: 22
-        timeout: 300
+        timeout: 600
         search_regex: OpenSSH
       loop:
         - "{{ master_ip }}"
         - "{{ worker_ip }}"
-      # [關鍵] 因為 add_host 是動態的，這個檢查必須在 localhost 執行去連遠端，
-      # 或者在 maasjuju 上執行去連遠端。這裡建議用 delegate_to: maasjuju
       delegate_to: maasjuju
-# --- 階段 2: 基礎環境設置 (Munge & User) ---
+
+# --- 階段 2: 基礎環境 (Munge & User) ---
 - name: 2. 基礎 Slurm 環境設置
   hosts: slurm_masters, slurm_workers
   become: yes
   vars:
-    # 來自 Phase 1 的動態變數需要重新定義或透過 hostvars 抓取
     master_addr: "{{ groups['slurm_masters'][0] }}"
     worker_addr: "{{ groups['slurm_workers'][0] }}"
   
   tasks:
-    - name: 2.1 設定 Hosts 解析 (讓節點互認)
+    - name: 2.1 設定 Hosts 解析
       blockinfile:
         path: /etc/hosts
         block: |
           {{ master_addr }} slurm-master
           {{ worker_addr }} gpu-node01
 
-    - name: 2.2 建立 Slurm 使用者 (UID 同步)
+    - name: 2.2 建立 Slurm 帳號 (UID 同步)
       group: { name: slurm, gid: 64030, state: present }
-    - name: 2.3 建立 Slurm 帳號
+    - name: 2.3 建立 Slurm 使用者
       user: { name: slurm, uid: 64030, group: slurm, shell: /bin/bash, state: present }
 
     - name: 2.4 安裝 Munge
@@ -121,9 +114,9 @@
     - name: 3.1 生成 Key
       command: /usr/sbin/create-munge-key -f
       args: { creates: /etc/munge/munge.key }
-    - name: 3.2 下載 Key 到 Ansible 控制端
+    - name: 3.2 下載 Key
       fetch: { src: /etc/munge/munge.key, dest: /tmp/munge.key, flat: yes }
-      
+
 - name: 3.5 上傳 Key 到 Worker
   hosts: slurm_workers
   become: yes
@@ -133,19 +126,37 @@
     - name: 3.7 重啟 Munge
       systemd: { name: munge, state: restarted }
 
-# --- 階段 4: Master (Slurmctld) 安裝 ---
-- name: 4. 部署 Slurm Master
+# --- 階段 4: Master 建置 (K3s + Slurmctld) ---
+- name: 4. Master 軟體堆疊 (K3s & Slurm)
   hosts: slurm_masters
   become: yes
   vars:
-    # 這裡填入剛剛釣魚到的真實規格 (RTX 4090 Machine)
+    # RTX 4090 規格
     node_cpus: 18
     node_mem: 128646
   tasks:
-    - name: 4.1 安裝 Slurmctld
+    # --- 4A. K3s 安裝 ---
+    - name: 4.1 安裝 K3s (Master Mode)
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --write-kubeconfig-mode 644 \
+          --disable traefik \
+          --disable servicelb
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: 4.2 等待 K3s 就緒
+      shell: k3s kubectl get nodes | grep -q "Ready"
+      register: k3s_ready
+      until: k3s_ready.rc == 0
+      retries: 20
+      delay: 5
+
+    # --- 4B. Slurmctld 安裝 ---
+    - name: 4.3 安裝 Slurm Master
       apt: { name: [slurmctld, slurm-client], state: present }
-    
-    - name: 4.2 寫入設定檔 (Golden Config)
+
+    - name: 4.4 寫入 slurm.conf
       copy:
         dest: /etc/slurm/slurm.conf
         content: |
@@ -163,23 +174,23 @@
           # 分區定義
           PartitionName=debug Nodes=gpu-node01 Default=YES MaxTime=INFINITE State=UP
 
-    - name: 4.3 建立 cgroup.conf
+    - name: 4.5 建立 cgroup.conf
       copy:
         dest: /etc/slurm/cgroup.conf
         content: "CgroupAutomount=yes\nConstrainCores=yes\nConstrainDevices=yes\nConstrainRAM=yes"
 
-    - name: 4.4 啟動服務
+    - name: 4.6 啟動 Slurmctld
       systemd: { name: slurmctld, state: restarted, enabled: yes }
 
-# --- 階段 5: Worker (GPU + Slurmd) 安裝 ---
-- name: 5. 部署 Slurm Worker (GPU)
+# --- 階段 5: Worker 建置 (GPU + Slurmd) ---
+- name: 5. Worker 軟體堆疊
   hosts: slurm_workers
   become: yes
   tasks:
-    - name: 5.1 安裝 Slurmd & Driver 工具
+    - name: 5.1 安裝 Slurmd
       apt: { name: [slurmd, slurm-client, ubuntu-drivers-common], state: present }
 
-    - name: 5.2 安裝 NVIDIA Driver (Auto + Reboot)
+    - name: 5.2 安裝 GPU 驅動
       shell: |
         if ! nvidia-smi; then
           ubuntu-drivers autoinstall
@@ -188,17 +199,16 @@
       register: driver_install
       ignore_errors: yes
 
-    - name: 5.3 重開機 (如果剛裝驅動)
+    - name: 5.3 重開機生效
       reboot:
       when: driver_install.stdout is search("reboot_needed")
 
-    - name: 5.4 建立 gres.conf
+    - name: 5.4 寫入 gres.conf
       copy:
         dest: /etc/slurm/gres.conf
         content: "Name=gpu Type=rtx4090 File=/dev/nvidia0"
 
-    - name: 5.5 同步 slurm.conf (從 Master 複製過來的內容)
-      # 這裡為簡化直接寫入，實務上可透過 fetch/copy 模組從 master 同步
+    - name: 5.5 同步 slurm.conf (與 Master 一致)
       copy:
         dest: /etc/slurm/slurm.conf
         content: |
@@ -217,30 +227,22 @@
     - name: 5.6 啟動 Slurmd
       systemd: { name: slurmd, state: restarted, enabled: yes }
 
-# --- 階段 6: KubeSphere Onboarding 準備 ---
-- name: 6. 輸出 MicroK8s Kubeconfig
+# --- 階段 6: 收尾 (KubeSphere 準備) ---
+- name: 6. 輸出 Kubeconfig
   hosts: slurm_masters
   become: yes
   tasks:
-    - name: 6.1 等待 MicroK8s 就緒
-      command: microk8s status --wait-ready
-      changed_when: false
+    - name: 6.1 抓取並修正 Kubeconfig (將 127.0.0.1 換成外部 IP)
+      shell: |
+        cat /etc/rancher/k3s/k3s.yaml | sed "s/127.0.0.1/{{ ansible_host }}/g"
+      register: k3s_config
 
-    - name: 6.2 產生標準 Kubeconfig
-      shell: microk8s config > /home/ubuntu/microk8s.kubeconfig
-      
-    - name: 6.3 讀取內容並顯示 (供 KubeSphere 使用)
-      command: cat /home/ubuntu/microk8s.kubeconfig
-      register: kubeconfig_out
-
-    - name: 6.4 顯示操作指引
+    - name: 6.2 顯示連線資訊
       debug:
         msg: 
           - "========================================================"
-          - "MicroK8s 與 Slurm 部署完成！"
-          - "Machine 0 (Master) IP: {{ ansible_host }}"
-          - "Machine 1 (Worker) IP: {{ groups['slurm_workers'][0] }}"
+          - "K3s 安裝完成！(Juju 僅提供 OS)"
+          - "請複製下方的設定檔內容，在 KubeSphere 進行 'Add Cluster' (Direct Connection)"
           - "--------------------------------------------------------"
-          - "請複製下方的 Kubeconfig 內容，並在 KubeSphere 執行 'Add Cluster'："
-          - "{{ kubeconfig_out.stdout }}"
+          - "{{ k3s_config.stdout }}"
           - "========================================================"
