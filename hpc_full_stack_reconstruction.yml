@@ -26,15 +26,15 @@
         target_machine_id: >-
           {{
             (
-              add_machine_result.stdout | default('') |
-              regex_search('(?i)machine\\s+(\\d+)') | default('')
+              add_machine_result.stdout | default('', true) |
+              regex_search('(?i)machine\\s+(\\d+)') | default('', true)
             )
             | regex_replace('(?i).*machine\\s+(\\d+).*', '\\1')
             | trim
           }}
 
     - name: 1.4b 若解析不到（含 None/空字串），改用 juju machines --format=json 取最大 Machine ID（不靠 jq）
-      when: (target_machine_id | default('') | string | trim) == ''
+      when: (target_machine_id | default('', true) | string | trim) == ''
       block:
         - name: 讀取 machines json
           command: "juju machines -m {{ slurm_model }} --format=json"
@@ -57,7 +57,7 @@
 
     - name: DEBUG target_machine_id
       debug:
-        msg: "target_machine_id={{ target_machine_id | default('') | string | trim }}"
+        msg: "target_machine_id={{ target_machine_id | default('', true) | string | trim }}"
 
     - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）- AWX loop
       shell: |
