@@ -54,32 +54,18 @@
         JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
 
-    - name: 1.2b Install k3s on machine 0 (slurmctld/0 host)
-      shell: |
-        set -euo pipefail
-        MODEL="{{ slurm_model }}"
-        echo "[1.2b] install k3s on slurmctld/0 host, model=${MODEL}"
-        juju ssh -m "$MODEL" slurmctld/0 -- '
-          set -euo pipefail
-          if ! command -v curl >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y curl
-          fi
-          if command -v k3s >/dev/null 2>&1 && sudo systemctl is-active --quiet k3s; then
-            echo "[k3s] already installed"
-          else
-            echo "[k3s] installing..."
-            curl -sfL https://get.k3s.io | sudo sh -s - server \
-              --write-kubeconfig-mode 644 \
-              --disable traefik \
-              --disable servicelb
-          fi
-          # 簡單等待 Ready
-          while ! sudo k3s kubectl get nodes | grep -q " Ready "; do sleep 5; done
-        '
-      args:
-        executable: /bin/bash
-      changed_when: false
+      # [替換掉原本的 Shell 手動安裝]
+    - name: 1.2b 在 Slurm 控制端上共同部署 K3s (跟隨部署)
+      # 魔法參數：--to slurmctld/0
+      # 意思：不管 slurmctld/0 在哪台機器（0, 1, 2...），把 k3s 裝在同一台！
+      command: "juju deploy k3s --to slurmctld/0 --channel=latest/stable"
+      register: deploy_k3s
+      # 忽略「已經存在」的報錯，讓腳本可以重複執行
+      failed_when: "(deploy_k3s.rc != 0) and ('already exists' not in deploy_k3s.stderr)"
+
+    - name: 1.2c Gate：等待 K3s 應用程式就緒
+      # 這次我們監控的是 Juju 的單位狀態，直到它變綠燈 (active)
+      command: "juju wait-for unit k3s/0 -m {{ slurm_model }} --query='workload-status==\"active\"' --timeout 10m"
 
     - name: 1.4 取得運算節點 Machine ID
       set_fact:
