@@ -268,6 +268,9 @@
 # ==========================================
 - name: 3. 執行自動化環境修正
   hosts: maasjuju
+  # [修正] 必須在這裡重新定義變數，因為這是新的 Play
+  vars:
+    slurm_model: "hpc-lab"
   tasks:
     - name: 3.0 預先獲取 slurmctld IP
       shell: "juju ssh -m {{ slurm_model }} slurmctld/0 'hostname -I' | awk '{print $1}'"
