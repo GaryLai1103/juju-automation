@@ -24,23 +24,76 @@
       command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
       register: add_machine_result
 
-    - name: 1.4 獲取運算節點 Machine ID
-      # [保持不變]
-      shell: "juju machines -m {{ slurm_model }} --format json | jq -r '.machines | keys | last'"
-      register: target_machine_id
+    - name: 1.4 取得運算節點 Machine ID（優先從 add-machine 回傳解析）
+      set_fact:
+        target_machine_id: >-
+          {{
+            (add_machine_result.stdout | regex_search('(?i)(?:machine)\\s+(\\d+)', '\\1'))
+            | default('', true)
+            | trim
+          }}
 
-    - name: 1.5 等待運算節點實體啟動 (對齊表格 State)
-      # 查詢表格中顯示的 "started" 狀態
-      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='machine-status=="running" && juju-status=="started" && modification-status=="idle"' --timeout 15m"
+    - name: 1.4b 若解析不到，改用 juju machines --format=json 取最新 Machine ID（max key）
+      when: target_machine_id == ''
+      block:
+        - name: 讀取 machines json
+          command: "juju machines -m {{ slurm_model }} --format=json"
+          register: machines_json
+          changed_when: false
+
+        - name: 由 machines json 推導 target_machine_id（取最大 id）
+          set_fact:
+            target_machine_id: >-
+              {{
+                (
+                  (machines_json.stdout | from_json).machines
+                  | dict2items
+                  | map(attribute='key')
+                  | map('int')
+                  | list
+                  | max
+                ) | string
+              }}
+
+    - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）
+      command: "juju show-machine {{ target_machine_id }} -m {{ slurm_model }} --format=json"
+      register: sm
+      changed_when: false
+      retries: 180
+      delay: 5
+      until: >
+        (sm.stdout | from_json).machines[target_machine_id]['machine-status']['current'] == 'running'
+        and
+        (sm.stdout | from_json).machines[target_machine_id]['juju-status']['current'] == 'started'
+        and
+        (sm.stdout | from_json).machines[target_machine_id]['modification-status']['current'] == 'idle'
+
+    - name: 1.5b Gate-2：等待 OS cloud-init 完成（boot-finished）
+      command: >
+        juju ssh -m {{ slurm_model }} {{ target_machine_id }}
+        -- "test -f /var/lib/cloud/instance/boot-finished"
+      register: boot_finished
+      changed_when: false
+      retries: 120
+      delay: 5
+      until: boot_finished.rc == 0
+
+    - name: 1.5c（可選）列印 cloud-init 狀態做紀錄
+      command: >
+        juju ssh -m {{ slurm_model }} {{ target_machine_id }}
+        -- "cloud-init status || true"
+      register: ci_status
+      changed_when: false
 
     - name: 1.6 安裝 NVIDIA 驅動與 DCGM (在佈署 slurmd 前)
       shell: |
-        juju ssh -m {{ slurm_model }} {{ target_machine_id.stdout }} "
+        juju ssh -m {{ slurm_model }} {{ target_machine_id }} "
         sudo apt-get update && \
         sudo apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager && \
         sudo systemctl enable --now nvidia-dcgm && \
         sudo nvidia-smi -pm 1
         "
+
 
 # ==========================================
 # 第二階段：佈署運算端並建立連動
