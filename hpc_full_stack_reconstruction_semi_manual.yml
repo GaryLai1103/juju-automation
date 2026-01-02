@@ -5,14 +5,13 @@
 #   Machine 1: Ubuntu 24.04 (Juju) + NVIDIA Driver (Ansible) + Slurmd (Ansible)
 # =================================================================
 
-# --- 階段 1: Juju 基礎建設與機器調度 ---
+# --- 階段 1: Juju 基礎建設與機器調度 (修正版) ---
 - name: 1. Juju 資源調度與 MicroK8s 部署
-  hosts: localhost
-  connection: local
+  # [修正] 不要在 localhost 跑，要在有裝 Juju CLI 的跳板機跑
+  hosts: maasjuju  
   gather_facts: no
   vars:
-    model_name: "hpc-lab"
-    # [請確認] 這邊填入你想用的 MAAS tags
+    model_name: "hpc-hybrid"
     master_constraints: "tags=virtual" 
     worker_constraints: "tags=slurm-node" 
     target_os: "ubuntu@24.04"
@@ -20,17 +19,17 @@
   tasks:
     - name: 1.1 建立 Juju Model
       command: "juju add-model {{ model_name }}"
+      # 若 Model 已存在可能會報錯，忽略即可
       ignore_errors: yes
 
     - name: 1.2 部署 Machine 0 (Master + MicroK8s)
-      # 直接部署 microk8s charm，它會自動請求一台機器
       command: "juju deploy microk8s -m {{ model_name }} --constraints {{ master_constraints }} --base {{ target_os }} --channel=1.28/stable"
+      # 非同步執行，避免 Ansible 等太久斷線 (非同步 10分鐘)
       async: 600
-      poll: 0
+      poll: 10
       register: deploy_microk8s
 
     - name: 1.3 請求 Machine 1 (Worker + 純 OS)
-      # 只做 add-machine，不部署 charm，保持純淨 OS
       command: "juju add-machine -m {{ model_name }} --constraints {{ worker_constraints }} --base {{ target_os }}"
       register: add_machine_output
 
@@ -39,9 +38,12 @@
         # 迴圈檢查直到兩台機器都有 IP
         for i in {1..60}; do
           STATUS=$(juju status -m {{ model_name }} --format=json)
-          # 抓取 MicroK8s 的 IP
+          
+          # 抓取 MicroK8s 的 IP (App IP)
           M0_IP=$(echo "$STATUS" | jq -r '.applications.microk8s.units | to_entries[0].value["public-address"] // empty')
-          # 抓取 Machine 1 的 IP (假設它是 machine ID 1)
+          
+          # 抓取 Machine 1 的 IP (直接抓 machines 列表中的第 2 台機器，通常 ID 為 1)
+          # 注意：這裡假設第一台是 0 (microk8s), 第二台是 1 (worker)
           M1_IP=$(echo "$STATUS" | jq -r '.machines["1"]["dns-name"] // empty')
           
           if [[ -n "$M0_IP" && -n "$M1_IP" && "$M0_IP" != "null" && "$M1_IP" != "null" ]]; then
@@ -52,6 +54,7 @@
         done
         exit 1
       register: node_ips
+      # 告訴 Ansible 這一行指令不算是對系統做變更 (不會顯示 Changed)
       changed_when: false
 
     - name: 1.5 動態加入 Ansible Inventory
@@ -59,15 +62,15 @@
         master_ip: "{{ node_ips.stdout.split('|')[0] }}"
         worker_ip: "{{ node_ips.stdout.split('|')[1] }}"
     
-    - name: 1.6 註冊主機到暫存群組
+    - name: 1.6 註冊主機到暫存群組 (Master)
       add_host:
         name: "{{ master_ip }}"
         groups: slurm_masters
         ansible_user: ubuntu
-        # 若需要 SSH Key 請在此指定，或依賴 AWX Credential
-        # ansible_ssh_private_key_file: ~/.ssh/id_rsa 
+        # 如果需要透過跳板機連線，可以加上這些參數 (視你的網路環境而定)
+        # ansible_ssh_common_args: '-o ProxyCommand="ssh -W %h:%p -q ubuntu@maasjuju"'
 
-    - name: 1.7 註冊主機到暫存群組
+    - name: 1.7 註冊主機到暫存群組 (Worker)
       add_host:
         name: "{{ worker_ip }}"
         groups: slurm_workers
@@ -78,10 +81,13 @@
         host: "{{ item }}"
         port: 22
         timeout: 300
+        search_regex: OpenSSH
       loop:
         - "{{ master_ip }}"
         - "{{ worker_ip }}"
-
+      # [關鍵] 因為 add_host 是動態的，這個檢查必須在 localhost 執行去連遠端，
+      # 或者在 maasjuju 上執行去連遠端。這裡建議用 delegate_to: maasjuju
+      delegate_to: maasjuju
 # --- 階段 2: 基礎環境設置 (Munge & User) ---
 - name: 2. 基礎 Slurm 環境設置
   hosts: slurm_masters, slurm_workers
