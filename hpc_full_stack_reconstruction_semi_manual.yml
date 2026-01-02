@@ -11,7 +11,7 @@
   connection: local
   gather_facts: no
   vars:
-    model_name: "hpc-hybrid"
+    model_name: "hpc-lab"
     # [請確認] 這邊填入你想用的 MAAS tags
     master_constraints: "tags=virtual" 
     worker_constraints: "tags=slurm-node" 
