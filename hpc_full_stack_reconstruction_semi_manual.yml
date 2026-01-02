@@ -42,6 +42,7 @@
           M1_IP=$(echo "$STATUS" | jq -r '.machines["1"]["dns-name"] // empty')
           
           # 確保抓到的不是 pending 或空值
+          # [[ ... ]] 是 Bash 語法，必須指定 executable: /bin/bash
           if [[ -n "$M0_IP" && -n "$M1_IP" && "$M0_IP" != "null" && "$M1_IP" != "null" ]]; then
             echo "$M0_IP|$M1_IP"
             exit 0
@@ -51,6 +52,8 @@
         exit 1
       register: node_ips
       changed_when: false
+      args:
+        executable: /bin/bash  # <--- 關鍵修正：指定使用 Bash
 
     - name: 1.5 解析 IP 並加入 Inventory
       set_fact:
