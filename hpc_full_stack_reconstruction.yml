@@ -1,11 +1,12 @@
 # ==========================================
-# SKU: HPC-Full-Stack-Reconstruction-v3.2-Final
+# SKU: HPC-Full-Stack-Reconstruction-v4.1 (Compatibility Fix)
 # ==========================================
 - name: 1. 控制端佈署與運算端硬體準備
   hosts: maasjuju
   gather_facts: no
   vars:
     slurm_model: "hpc-lab"
+    # 維持 22.04 以支援 MicroK8s
     target_os: "ubuntu@22.04"
 
   tasks:
@@ -14,58 +15,31 @@
       ignore_errors: yes
 
     - name: 1.2 佈署控制端 (slurmctld)
-      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=1.28/stable"
-      ignore_errors: yes    
+      # [修正] 改用 latest/edge，這是目前唯一支援 22.04 的 Slurm Charm 通道
+      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=latest/edge"
+      ignore_errors: yes
 
-    - name: 1.3 向 MAAS 請求 GPU 節點 (強制指定 OS 版本)
+    # =========================================================
+    # 運算節點 (GPU Node) - Part-1
+    # =========================================================
+    - name: 1.3 向 MAAS 請求 GPU 節點
       command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
       register: add_machine_result
-      
-    # --- K3s 與 並行安裝段 ---
-    - name: 1.2a Gate：等待 slurmctld/0 SSH 通暢且 APT 閒置
-      shell: |
-        set -euo pipefail
-        MODEL="{{ slurm_model }}"
-        echo "[1.2a] wait slurmctld/0..."
-        
-        # 1. 循環等待 SSH 連線成功
-        while ! juju ssh -m "$MODEL" slurmctld/0 -- 'echo up' >/dev/null 2>&1; do
-          echo "[1.2a] waiting for SSH..."
-          sleep 5
-        done
-        echo "[1.2a] SSH is ready"
 
-        # 2. 等待 cloud-init 完成
-        echo "[1.2a] waiting for cloud-init..."
-        juju ssh -m "$MODEL" slurmctld/0 -- 'cloud-init status --wait' >/dev/null 2>&1 || true
-
-        # 3. 等待 APT 鎖釋放 (避免與 Juju agent 衝突)
-        echo "[1.2a] waiting for apt/dpkg lock release..."
-        juju ssh -m "$MODEL" slurmctld/0 -- '
-          while sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-            echo "Waiting for apt lock..."
-            sleep 5
-          done
-        '
-        echo "[1.2a] System is ready for K3s installation"
-      args:
-        executable: /bin/bash
-      environment:
-        JUJU_DATA: "/home/gary/.local/share/juju"
-      changed_when: false
-
-      # [修正] 改用 MicroK8s (Canonical 官方支援的 K8s Charm)
+    # =========================================================
+    # MicroK8s (原生支援 22.04)
+    # =========================================================
     - name: 1.2b 在 Slurm 控制端上共同部署 MicroK8s
-      # 使用 --to slurmctld/0 讓它跟隨控制器
-      # channel 建議鎖定版本 (例如 1.31/stable) 或用 latest/stable
       command: "juju deploy microk8s --to slurmctld/0 --channel=1.31/stable"
       register: deploy_k8s
       failed_when: "(deploy_k8s.rc != 0) and ('already exists' not in deploy_k8s.stderr)"
-
     - name: 1.2c Gate：等待 MicroK8s 就緒
-      # 等待 unit 變為 active
-      command: "juju wait-for unit microk8s/0 -m {{ slurm_model }} --query='workload-status==\"active\"' --timeout 15m"
+      command: "juju wait-for unit microk8s/0 -m {{ slurm_model }} --query='workload-status==\"active\"' --timeout 20m"
 
+    # =========================================================
+    # 運算節點 (GPU Node) - Part-2
+    # =========================================================
+    
     - name: 1.4 取得運算節點 Machine ID
       set_fact:
         target_machine_id: >-
@@ -92,20 +66,13 @@
                 ((machines_json.stdout | from_json).machines.keys() | list | map('int') | max) | string
               }}
 
-    - name: DEBUG target_machine_id
-      debug:
-        msg: "Target Machine ID: {{ target_machine_id }}"
-
-    - name: 1.5 Gate-1：等待 Juju Machine 實體連線就緒
+    - name: 1.5 Gate-1：等待運算節點 SSH 連線就緒
       shell: |
         set -euo pipefail
         MID="{{ target_machine_id }}"
         MODEL="{{ slurm_model }}"
-        
-        # 這裡直接用 SSH 測試最準確，不用管 Juju 內部狀態
         echo "Waiting for SSH on Machine $MID..."
         while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do
-           echo "Waiting for connection..."
            sleep 5
         done
         echo "Machine $MID SSH Ready"
@@ -113,69 +80,43 @@
         executable: /bin/bash
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA Driver + DCGM Snap (已修正 pipefail)
+    - name: 1.6 安裝 NVIDIA Driver + DCGM Snap (Ubuntu 22.04)
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
-        MID="{{ target_machine_id | default('', true) | string | trim }}"
+        MID="{{ target_machine_id }}"
         
-        echo "[1.6] Installing/Checking GPU Drivers on Machine $MID"
-        
-        # 1. 驅動安裝
         if ! juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
           echo "Installing NVIDIA driver..."
           juju ssh -m "$MODEL" "$MID" -- '
             sudo apt-get update
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580
+            # 22.04 需要 Keyring 才能抓到 580
+            wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager
             sudo reboot
           ' || true
           
           echo "Waiting for reboot..."
           sleep 10
-          while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do 
-            sleep 5
-          done
+          while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do sleep 5; done
           
-          # 等待 nvidia-smi 載入
           for i in {1..20}; do
             if juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then break; fi
             sleep 5
           done
         fi
 
-        # 2. DCGM Snap 安裝
-        echo "Setting up DCGM Snap..."
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
           sudo snap install dcgm || true
           sleep 5
-          
-          # 分開啟動並等待
           sudo snap start --enable dcgm.nv-hostengine || true
           sleep 3
           sudo snap start --enable dcgm.dcgm-exporter || true
           sleep 3
-          
-          # 確保服務活躍 (避開 race condition)
-          for service in dcgm.nv-hostengine dcgm.dcgm-exporter; do
-            for retry in {1..5}; do
-              if sudo snap restart $service; then
-                break
-              else
-                echo "Snap busy, retrying..."
-                sleep 5
-              fi
-            done
-          done
-
           sudo nvidia-smi -pm 1
-          
-          # 驗證 Port 9400
-          if sudo ss -lntp | grep -q 9400; then
-            echo "DCGM Exporter OK"
-          else
-            echo "WARNING: Port 9400 not listening"
-          fi
         '
       args:
         executable: /bin/bash
@@ -190,26 +131,23 @@
     slurm_model: "hpc-lab"
   tasks:
     - name: 2.1 佈署運算端至指定機器
-      # 使用 1.4 抓到的動態 ID
-      command: "juju deploy slurmd -m {{ slurm_model }} --to {{ target_machine_id }} --channel=23.11/stable"
+      # [修正] 同步改用 latest/edge
+      command: "juju deploy slurmd -m {{ slurm_model }} --to {{ target_machine_id }} --channel=latest/edge"
       ignore_errors: yes
 
-    - name: 2.2 建立整合關係 (大腦與手腳連線)
+    - name: 2.2 建立整合關係
       command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
       ignore_errors: yes
 
-    # [關鍵新增] Gate: 等待 Slurm 安裝完成
-    # 必須等到 agent-status 變成 idle，代表 install/config hook 跑完了，檔案才會存在
-    - name: 2.3 Gate：等待 slurmd 軟體安裝完成
+    - name: 2.3 Gate：等待 slurmd 安裝完成
       command: "juju wait-for unit slurmd/0 -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
 
 # ==========================================
-# 第三階段：深度修正 (插件、網路、DCGM Exporter)
+# 第三階段：深度修正
 # ==========================================
 - name: 3. 執行自動化環境修正
   hosts: maasjuju
   tasks:
-    # [優化邏輯] 先在本機抓好 Control IP，不要去遠端抓
     - name: 3.0 預先獲取 slurmctld IP
       shell: "juju ssh -m {{ slurm_model }} slurmctld/0 'hostname -I' | awk '{print $1}'"
       register: ctld_ip_result
@@ -220,6 +158,7 @@
         REAL_HOSTNAME=\$(hostname)
         sudo sed -i \"/127.0.0.1/s/$/ \$REAL_HOSTNAME slurm-master/\" /etc/hosts
         sudo sed -i 's/SlurmctldHost=.*/SlurmctldHost='\$REAL_HOSTNAME'/g' /etc/slurm/slurm.conf
+        # 修正：Slurm Edge 版可能預設插件不同，保險起見強制設定
         sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
         sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
         sudo sed -i '1i SlurmdParameters=config_overrides' /etc/slurm/slurm.conf
@@ -227,24 +166,17 @@
         sudo systemctl restart munge && sudo systemctl restart slurmctld
         "
 
-    - name: 3.2 修正運算端 (傳入變數，不再遠端執行 juju)
+    - name: 3.2 修正運算端
       shell: |
-        # 這裡直接引用 Ansible 變數 {{ ctld_ip_result.stdout }}
         MASTER_IP="{{ ctld_ip_result.stdout }}"
-        
         juju ssh -m {{ slurm_model }} slurmd/0 "
-        # 1. 網路與 Slurm 修正
         sudo sed -i '/slurm-master/d' /etc/hosts
         echo \"\$MASTER_IP slurm-master\" | sudo tee -a /etc/hosts
         
-        # 2. 修正 Slurm 設定 (現在檔案一定存在了)
         sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
         sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
-        
-        # 3. 寫入 GRES 設定
         echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
         
-        # 4. 強制寫入節點規格
         sudo sed -i '/NodeName=gpu-node01/c\NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN' /etc/slurm/slurm.conf
         
         sudo mkdir -p /run/slurm && sudo chown slurm:slurm /run/slurm
