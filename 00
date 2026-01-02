@@ -1,0 +1,231 @@
+# ==========================================
+# SKU: HPC-Full-Stack-v5.0 (Ubuntu 24.04 + Manual K3s)
+# ==========================================
+- name: 1. 控制端佈署與運算端硬體準備
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    slurm_model: "hpc-lab"
+    # [回歸] 使用最新的 24.04 LTS
+    target_os: "ubuntu@24.04"
+
+  tasks:
+    - name: 1.1 建立全新 Model
+      command: "juju add-model {{ slurm_model }}"
+      ignore_errors: yes
+
+    - name: 1.2 佈署控制端 (slurmctld)
+      # [回歸] 24.04 完美支援 23.11/stable 通道，不需要用 edge 了
+      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
+      ignore_errors: yes
+
+    # =========================================================
+    # [手動模式] K3s 安裝 (Side-load)
+    # =========================================================
+    - name: 1.2a Gate：等待 Slurmctld SSH 通暢且 APT 閒置
+      shell: |
+        set -euo pipefail
+        MODEL="{{ slurm_model }}"
+        echo "[1.2a] Waiting for slurmctld/0..."
+        
+        # 1. 等待 SSH
+        while ! juju ssh -m "$MODEL" slurmctld/0 -- 'echo up' >/dev/null 2>&1; do
+          sleep 5
+        done
+
+        # 2. [關鍵] 等待 Ubuntu 24.04 的自動更新鎖釋放
+        # 24.04 開機時 apt-daily-upgrade 會跑很久，必須等它跑完
+        juju ssh -m "$MODEL" slurmctld/0 -- '
+          echo "Waiting for apt locks..."
+          while sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+        '
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: 1.2b 手動安裝 K3s (不透過 Juju)
+      shell: |
+        set -euo pipefail
+        MODEL="{{ slurm_model }}"
+        
+        juju ssh -m "$MODEL" slurmctld/0 -- '
+          set -euo pipefail
+          # 雙重檢查：如果已經有 Ready 的節點，就跳過
+          if command -v kubectl >/dev/null 2>&1 && sudo kubectl get nodes | grep -q "Ready"; then
+            echo "K3s already installed and ready."
+            exit 0
+          fi
+
+          echo "Installing K3s..."
+          curl -sfL https://get.k3s.io | sudo sh -s - server \
+            --write-kubeconfig-mode 644 \
+            --disable traefik \
+            --disable servicelb
+          
+          echo "Waiting for K3s Ready..."
+          for i in {1..30}; do
+             if sudo kubectl get nodes 2>/dev/null | grep -q "Ready"; then
+                echo "K3s is Ready!"
+                exit 0
+             fi
+             sleep 5
+          done
+        '
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # =========================================================
+    # 運算節點 (GPU Node)
+    # =========================================================
+    - name: 1.3 向 MAAS 請求 GPU 節點
+      command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
+      register: add_machine_result
+
+    - name: 1.4 取得運算節點 Machine ID
+      set_fact:
+        target_machine_id: >-
+          {{
+            (
+              add_machine_result.stdout | default('', true) |
+              regex_search('(?i)machine\\s+(\\d+)') | default('', true)
+            )
+            | regex_replace('(?i).*machine\\s+(\\d+).*', '\\1')
+            | trim
+          }}
+
+    - name: 1.4b 若解析不到，改用 CLI JSON 解析
+      when: (target_machine_id | default('', true) | string | trim) == ''
+      block:
+        - name: 讀取 machines json
+          command: "juju machines -m {{ slurm_model }} --format=json"
+          register: machines_json
+          changed_when: false
+        - name: 由 machines json 推導 target_machine_id
+          set_fact:
+            target_machine_id: >-
+              {{
+                ((machines_json.stdout | from_json).machines.keys() | list | map('int') | max) | string
+              }}
+
+    - name: 1.5 Gate-1：等待運算節點 SSH 連線就緒
+      shell: |
+        set -euo pipefail
+        MID="{{ target_machine_id }}"
+        MODEL="{{ slurm_model }}"
+        echo "Waiting for SSH on Machine $MID..."
+        while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do
+           sleep 5
+        done
+        echo "Machine $MID SSH Ready"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: 1.6 安裝 NVIDIA Driver + DCGM Snap (Ubuntu 24.04 版)
+      shell: |
+        set -euo pipefail
+        MODEL="{{ slurm_model }}"
+        MID="{{ target_machine_id }}"
+        
+        if ! juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
+          echo "Installing NVIDIA driver..."
+          juju ssh -m "$MODEL" "$MID" -- '
+            sudo apt-get update
+            # [修正] 針對 24.04 (noble) 的 CUDA Keyring
+            wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580 nvidia-utils-580 datacenter-gpu-manager
+            sudo reboot
+          ' || true
+          
+          echo "Waiting for reboot..."
+          sleep 10
+          while ! juju ssh -m "$MODEL" "$MID" -- 'echo up' >/dev/null 2>&1; do sleep 5; done
+          
+          for i in {1..20}; do
+            if juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then break; fi
+            sleep 5
+          done
+        fi
+
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
+          sudo snap install dcgm || true
+          sleep 5
+          sudo snap start --enable dcgm.nv-hostengine || true
+          sleep 3
+          sudo snap start --enable dcgm.dcgm-exporter || true
+          sleep 3
+          sudo nvidia-smi -pm 1
+        '
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+# ==========================================
+# 第二階段：佈署 Slurm 運算端
+# ==========================================
+- name: 2. 佈署 Slurm 運算端
+  hosts: maasjuju
+  vars:
+    slurm_model: "hpc-lab"
+  tasks:
+    - name: 2.1 佈署運算端至指定機器
+      # [同步] 使用 23.11/stable 配合 24.04
+      command: "juju deploy slurmd -m {{ slurm_model }} --to {{ target_machine_id }} --channel=23.11/stable"
+      ignore_errors: yes
+
+    - name: 2.2 建立整合關係
+      command: "juju integrate slurmctld slurmd -m {{ slurm_model }}"
+      ignore_errors: yes
+
+    - name: 2.3 Gate：等待 slurmd 安裝完成
+      command: "juju wait-for unit slurmd/0 -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 15m"
+
+# ==========================================
+# 第三階段：深度修正
+# ==========================================
+- name: 3. 執行自動化環境修正
+  hosts: maasjuju
+  tasks:
+    - name: 3.0 預先獲取 slurmctld IP
+      shell: "juju ssh -m {{ slurm_model }} slurmctld/0 'hostname -I' | awk '{print $1}'"
+      register: ctld_ip_result
+
+    - name: 3.1 修正控制端 (slurmctld)
+      shell: |
+        juju ssh -m {{ slurm_model }} slurmctld/0 "
+        REAL_HOSTNAME=\$(hostname)
+        sudo sed -i \"/127.0.0.1/s/$/ \$REAL_HOSTNAME slurm-master/\" /etc/hosts
+        sudo sed -i 's/SlurmctldHost=.*/SlurmctldHost='\$REAL_HOSTNAME'/g' /etc/slurm/slurm.conf
+        sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
+        sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
+        sudo sed -i '1i SlurmdParameters=config_overrides' /etc/slurm/slurm.conf
+        sudo mkdir -p /var/spool/slurmctld && sudo chown slurm:slurm /var/spool/slurmctld
+        sudo systemctl restart munge && sudo systemctl restart slurmctld
+        "
+
+    - name: 3.2 修正運算端
+      shell: |
+        MASTER_IP="{{ ctld_ip_result.stdout }}"
+        juju ssh -m {{ slurm_model }} slurmd/0 "
+        sudo sed -i '/slurm-master/d' /etc/hosts
+        echo \"\$MASTER_IP slurm-master\" | sudo tee -a /etc/hosts
+        
+        sudo sed -i 's/select\/cons_res/select\/cons_tres/g' /etc/slurm/slurm.conf
+        sudo sed -i '/MungeSocketDir/d' /etc/slurm/slurm.conf
+        echo 'Name=gpu Type=rtx4090 File=/dev/nvidia0' | sudo tee /etc/slurm/gres.conf
+        
+        sudo sed -i '/NodeName=gpu-node01/c\NodeName=gpu-node01 CPUs=18 Sockets=1 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=128646 Gres=gpu:rtx4090:1 State=UNKNOWN' /etc/slurm/slurm.conf
+        
+        sudo mkdir -p /run/slurm && sudo chown slurm:slurm /run/slurm
+        sudo systemctl restart munge && sudo systemctl restart slurmd
+        "
+
+    - name: 3.3 最終節點喚醒
+      shell: |
+        juju ssh -m {{ slurm_model }} slurmctld/0 "sudo scontrol update nodename=gpu-node01 state=resume"
