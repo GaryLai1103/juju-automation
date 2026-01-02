@@ -212,7 +212,7 @@
         
         echo "[1.6] MODEL=$MODEL MID=$MID"
         
-        # --- 1. 驅動安裝檢查 (這部分你已經過了，但保留邏輯以防萬一) ---
+        # --- 1. 驅動安裝檢查 ---
         if ! juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi >/dev/null 2>&1'; then
           echo "[1.6] Installing NVIDIA driver..."
           juju ssh -m "$MODEL" "$MID" -- '
@@ -235,18 +235,16 @@
           done
         fi
 
-        # --- 2. DCGM Snap 安裝與啟動 (重點修正區) ---
+        # --- 2. DCGM Snap 安裝與啟動 ---
         echo "[1.6] Setting up DCGM Snap..."
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
           
-          # 安裝 Snap (如果已安裝會跳過)
+          # 安裝 Snap
           sudo snap install dcgm || true
-          
-          # [修正] 給 Snapd 一點時間喘息
           sleep 5
           
-          # 啟用並啟動服務 (分開執行並加入延遲)
+          # 啟用並啟動服務
           echo "Starting nv-hostengine..."
           sudo snap start --enable dcgm.nv-hostengine || true
           sleep 5
@@ -255,7 +253,7 @@
           sudo snap start --enable dcgm.dcgm-exporter || true
           sleep 5
           
-          # [修正] 只在必要時重啟，並使用迴圈重試以避開 "change in progress"
+          # 迴圈重試以避開 "change in progress"
           echo "Ensuring services are active..."
           for service in dcgm.nv-hostengine dcgm.dcgm-exporter; do
             for retry in {1..5}; do
@@ -272,7 +270,7 @@
           # 啟用 Persistence Mode
           sudo nvidia-smi -pm 1
           
-          # 檢查 Port 9400 是否有在聽
+          # 檢查 Port 9400
           if sudo ss -lntp | grep -q 9400; then
             echo "DCGM Exporter is listening on port 9400."
           else
@@ -280,6 +278,9 @@
             sudo snap logs dcgm.dcgm-exporter | tail -n 10
           fi
         '
+      # [關鍵修正] 指定使用 bash 來執行，因為腳本用了 pipefail
+      args:
+        executable: /bin/bash
       changed_when: false
 
 
