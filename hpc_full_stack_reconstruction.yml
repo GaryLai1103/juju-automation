@@ -129,61 +129,65 @@
       register: ci_status
       changed_when: false
 
-    - name: 1.6 安裝 NVIDIA Driver + DCGM Exporter（可觀測 + 必要時重開機）
+    - name: 1.6 安裝 NVIDIA Driver + 啟動 DCGM Exporter（含 metrics gate）
       shell: |
         set -euo pipefail
         MODEL="{{ slurm_model }}"
         MID="{{ target_machine_id | default('', true) | string | trim }}"
     
-        echo "[1.6] install driver on MID=$MID MODEL=$MODEL"
+        echo "[1.6] MODEL=$MODEL MID=$MID"
     
-        # 1) 裝 driver（autoinstall 最穩）
-        juju ssh -m "$MODEL" "$MID" -- '
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ubuntu-drivers-common
-          echo "== ubuntu-drivers devices =="
-          ubuntu-drivers devices || true
-          sudo ubuntu-drivers autoinstall
-        '
-    
-        # 2) 驗證 nvidia-smi；若不存在/失敗就 reboot 再檢一次
-        if ! juju ssh -m "$MODEL" "$MID" -- 'command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1'; then
-          echo "[1.6] nvidia-smi not ready, rebooting..."
-          juju ssh -m "$MODEL" "$MID" -- 'sudo reboot' || true
-    
-          # 等機器回來（簡易 wait：每 10 秒試一次 juju ssh）
-          echo "[1.6] waiting machine back..."
-          for i in $(seq 1 60); do
-            if juju ssh -m "$MODEL" "$MID" -- 'true' >/dev/null 2>&1; then
-              echo "[1.6] machine is back"
-              break
-            fi
-            sleep 10
-          done
+        # --- 防呆 ---
+        if [ -z "$MID" ] || [ "$MID" = "None" ]; then
+          echo "[1.6] ERROR: target_machine_id is empty/None"
+          exit 2
         fi
     
-        # 3) 最終確認 nvidia-smi
-        echo "[1.6] checking nvidia-smi..."
-        juju ssh -m "$MODEL" "$MID" -- 'nvidia-smi'
-    
-        # 4) 安裝/啟動 dcgm snap exporter
-        echo "[1.6] installing dcgm snap + starting exporter..."
+        # --- 1) 確保 curl 存在（後面用來驗證 metrics） ---
         juju ssh -m "$MODEL" "$MID" -- '
           set -euo pipefail
-          sudo snap install dcgm
-          sudo snap start dcgm.nv-hostengine
-          sudo snap start dcgm.dcgm-exporter
+          command -v curl >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y curl)
+          echo "[1.6] curl OK: $(command -v curl)"
+        '
+    
+        # --- 2) 驅動檢查：nvidia-smi 必須成功（你的環境已是 580.95.05，這邊用 gate） ---
+        echo "[1.6] gate: nvidia-smi"
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
+          command -v nvidia-smi >/dev/null 2>&1 || { echo "[1.6] ERROR: nvidia-smi not found"; exit 10; }
+          nvidia-smi
+        '
+    
+        # --- 3) 安裝/啟動 dcgm snap ---
+        echo "[1.6] install/start dcgm snap"
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
+          sudo snap install dcgm || true
+          sudo snap start --enable dcgm.nv-hostengine
+          sudo snap start --enable dcgm.dcgm-exporter
           sudo snap restart dcgm.nv-hostengine
           sudo snap restart dcgm.dcgm-exporter
-          echo "== metrics head =="
-          curl -s http://127.0.0.1:9400/metrics | head -n 30
+          snap services dcgm || true
+          sudo ss -lntp | grep 9400 || true
+        '
+    
+        # --- 4) metrics gate：HTTP 200 + 內容有 # HELP ---
+        echo "[1.6] gate: metrics endpoint"
+        juju ssh -m "$MODEL" "$MID" -- '
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:9400/metrics)
+          echo "[1.6] http_code=$code"
+          [ "$code" = "200" ] || { echo "[1.6] ERROR: metrics http_code=$code"; exit 20; }
+          curl -sS --max-time 5 http://127.0.0.1:9400/metrics | head -n 5 | tee /dev/stderr | grep -q "^# HELP" \
+            || { echo "[1.6] ERROR: metrics content invalid"; sudo snap logs dcgm.dcgm-exporter -n 50 || true; exit 21; }
+          echo "[1.6] metrics OK"
         '
       args:
         executable: /bin/bash
       environment:
         JUJU_DATA: "/home/gary/.local/share/juju"
       changed_when: false
+
 
 # ==========================================
 # 第二階段：佈署運算端並建立連動
