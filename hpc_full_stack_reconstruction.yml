@@ -34,10 +34,26 @@
       command: "juju wait-for unit slurmctld/0 -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 20m"
 
     # =========================================================
-    # MicroK8s (原生支援 22.04)
+    # [動態獲取] 尋找標籤為 tags=virtual 的機器 ID
     # =========================================================
-    - name: 1.2b 在 Slurm 控制端上共同部署 MicroK8s
-      command: "juju deploy microk8s --to slurmctld/0 --channel=1.28/stable"
+    - name: 1.2b-pre 獲取 Slurm 控制端 (virtual) 的 Machine ID
+      # 解析 Juju machines JSON，找出 constraints 包含 "tags=virtual" 的機器 ID
+      shell: |
+        juju machines -m {{ slurm_model }} --format=json | \
+        jq -r '.machines | to_entries[] | select(.value.constraints and (.value.constraints | contains("tags=virtual"))) | .key' | \
+        head -n 1
+      register: virtual_node_id
+
+    - name: DEBUG 確認抓到的機器 ID
+      debug:
+        msg: "Found Slurm Controller on Machine ID: {{ virtual_node_id.stdout }}"
+
+    # =========================================================
+    # [精準部署] 將 MicroK8s 部署到該機器上
+    # =========================================================
+    - name: 1.2b 在 Slurm 控制端上共同部署 MicroK8s (指定 ID)
+      # 使用抓到的 ID 變數 {{ virtual_node_id.stdout }}
+      command: "juju deploy microk8s --to {{ virtual_node_id.stdout }} --channel=1.28/stable"
       register: deploy_k8s
       failed_when: "(deploy_k8s.rc != 0) and ('already exists' not in deploy_k8s.stderr)"
 
