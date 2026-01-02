@@ -6,7 +6,7 @@
   gather_facts: no
   vars:
     slurm_model: "hpc-lab"
-    target_os: "ubuntu@24.04"
+    target_os: "ubuntu@22.04"
 
   tasks:
     - name: 1.1 建立全新 Model
