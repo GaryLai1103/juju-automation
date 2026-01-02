@@ -27,12 +27,20 @@
       register: add_machine_result
 
     # =========================================================
+    # [新增] Gate: 確保 Slurm 先裝完，釋放 apt 鎖，再裝 K8s
+    # =========================================================
+    - name: 1.2a Gate：等待 Slurm 控制端 Agent 閒置 (Idle)
+      # agent-status=="idle" 代表安裝腳本跑完了，系統處於靜止狀態
+      command: "juju wait-for unit slurmctld/0 -m {{ slurm_model }} --query='agent-status==\"idle\"' --timeout 20m"
+
+    # =========================================================
     # MicroK8s (原生支援 22.04)
     # =========================================================
     - name: 1.2b 在 Slurm 控制端上共同部署 MicroK8s
       command: "juju deploy microk8s --to slurmctld/0 --channel=1.28/stable"
       register: deploy_k8s
       failed_when: "(deploy_k8s.rc != 0) and ('already exists' not in deploy_k8s.stderr)"
+
     - name: 1.2c Gate：等待 MicroK8s 就緒
       command: "juju wait-for unit microk8s/0 -m {{ slurm_model }} --query='workload-status==\"active\"' --timeout 20m"
 
