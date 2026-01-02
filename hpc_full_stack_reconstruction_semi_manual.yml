@@ -29,21 +29,21 @@
       command: "juju add-machine -m {{ model_name }} --constraints {{ worker_constraints }} --base {{ target_os }}"
       register: machine1_req
 
-    - name: 1.4 等待機器分配 IP
+    - name: 1.4 等待機器分配 IP (強制抓取 IPv4)
       shell: |
-        # 迴圈檢查直到兩台機器都有 DNS/IP
+        # 迴圈檢查直到兩台機器都有 IPv4
         for i in {1..60}; do
           STATUS=$(juju status -m {{ model_name }} --format=json)
           
-          # Juju 的機器 ID 通常從 0 開始
+          # [修改點] 使用 select 和 test 正則表達式來過濾出 IPv4 (數字.數字...)
           # Machine 0 IP
-          M0_IP=$(echo "$STATUS" | jq -r '.machines["0"]["dns-name"] // empty')
-          # Machine 1 IP
-          M1_IP=$(echo "$STATUS" | jq -r '.machines["1"]["dns-name"] // empty')
+          M0_IP=$(echo "$STATUS" | jq -r '.machines["0"]["ip-addresses"][] | select(test("^[0-9]+\\."))' | head -n 1)
           
-          # 確保抓到的不是 pending 或空值
-          # [[ ... ]] 是 Bash 語法，必須指定 executable: /bin/bash
-          if [[ -n "$M0_IP" && -n "$M1_IP" && "$M0_IP" != "null" && "$M1_IP" != "null" ]]; then
+          # Machine 1 IP
+          M1_IP=$(echo "$STATUS" | jq -r '.machines["1"]["ip-addresses"][] | select(test("^[0-9]+\\."))' | head -n 1)
+          
+          # 確保抓到的不是空值
+          if [[ -n "$M0_IP" && -n "$M1_IP" ]]; then
             echo "$M0_IP|$M1_IP"
             exit 0
           fi
@@ -53,7 +53,7 @@
       register: node_ips
       changed_when: false
       args:
-        executable: /bin/bash  # <--- 關鍵修正：指定使用 Bash
+        executable: /bin/bash
 
     - name: 1.5 解析 IP 並加入 Inventory
       set_fact:
