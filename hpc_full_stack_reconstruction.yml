@@ -31,7 +31,7 @@
 
     - name: 1.5 等待運算節點實體啟動 (對齊表格 State)
       # 查詢表格中顯示的 "started" 狀態
-      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='instance-status==\"running\"' --timeout 15m"
+      command: "juju wait-for machine {{ target_machine_id.stdout }} -m {{ slurm_model }} --query='machine-status=="running" && juju-status=="started" && modification-status=="idle"' --timeout 15m"
 
     - name: 1.6 安裝 NVIDIA 驅動與 DCGM (在佈署 slurmd 前)
       shell: |
