@@ -24,16 +24,19 @@
       command: "juju add-machine -m {{ slurm_model }} --constraints tags=slurm-node --base {{ target_os }}"
       register: add_machine_result
 
-    - name: 1.4 取得運算節點 Machine ID（優先從 add-machine 回傳解析）
+    - name: 1.4 取得運算節點 Machine ID（從 add-machine stdout 解析，AWX 相容）
       set_fact:
         target_machine_id: >-
           {{
-            (add_machine_result.stdout | regex_search('(?i)(?:machine)\\s+(\\d+)', '\\1'))
-            | default('', true)
+            (
+              add_machine_result.stdout | default('') |
+              regex_search('(?i)machine\\s+(\\d+)') | default('')
+            )
+            | regex_replace('(?i).*machine\\s+(\\d+).*', '\\1')
             | trim
           }}
 
-    - name: 1.4b 若解析不到，改用 juju machines --format=json 取最新 Machine ID（max key）
+    - name: 1.4b 若解析不到，改用 juju machines --format=json 取最大 Machine ID（不靠 jq）
       when: target_machine_id == ''
       block:
         - name: 讀取 machines json
@@ -93,8 +96,6 @@
         sudo systemctl enable --now nvidia-dcgm && \
         sudo nvidia-smi -pm 1
         "
-
-
 # ==========================================
 # 第二階段：佈署運算端並建立連動
 # ==========================================
