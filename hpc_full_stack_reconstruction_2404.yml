@@ -16,7 +16,7 @@
 
     - name: 1.2 佈署控制端 (slurmctld)
       # [回歸] 24.04 完美支援 23.11/stable 通道
-      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --latest/edge"
+      command: "juju deploy slurmctld -m {{ slurm_model }} --constraints tags=virtual --base {{ target_os }} --channel=23.11/stable"
       ignore_errors: yes
 
     # =========================================================
