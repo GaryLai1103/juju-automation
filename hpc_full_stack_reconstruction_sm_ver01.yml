@@ -124,7 +124,7 @@
       shell: |
         # 從 Master 抓 Key 到跳板機，再傳給 Worker
         juju ssh -m {{ slurm_model }} {{ master_id }} 'sudo cat /etc/munge/munge.key' > /tmp/munge.key
-        juju scp /tmp/munge.key {{ slurm_model }}:1:/tmp/munge.key
+        juju scp /tmp/munge.key {{ slurm_model }}:{{ worker_id }}:/tmp/munge.key
         juju ssh -m {{ slurm_model }} {{ worker_id }} 'sudo mv /tmp/munge.key /etc/munge/munge.key && sudo chown munge:munge /etc/munge/munge.key && sudo systemctl restart munge'
         rm /tmp/munge.key
     - name: 2.5 在 Worker 安裝 GPU 監控 (DCGM Exporter)
