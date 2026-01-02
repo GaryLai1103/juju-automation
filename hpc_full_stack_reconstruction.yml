@@ -59,27 +59,29 @@
       debug:
         msg: "target_machine_id={{ target_machine_id | default('') | string | trim }}"
 
-    - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）
-      command: "juju show-machine {{ target_machine_id }} -m {{ slurm_model }} --format=json"
-      register: sm
+    - name: 1.5 Gate-1：等待 Juju Machine 狀態穩定（running/started/idle）- AWX loop
+      shell: |
+        set -euo pipefail
+        MID="{{ target_machine_id | default('') | string | trim }}"
+        MODEL="{{ slurm_model }}"
+        echo "[Gate-1] MID=${MID} MODEL=${MODEL}"
+
+        while true; do
+          if juju show-machine "$MID" -m "$MODEL" --format=json \
+            | jq -e --arg mid "$MID" '
+                (.machines[$mid]["machine-status"].current=="running")
+                and (.machines[$mid]["juju-status"].current=="started")
+                and (.machines[$mid]["modification-status"].current=="idle")
+              ' >/dev/null; then
+            echo "[Gate-1] READY"
+            exit 0
+          fi
+          echo "[Gate-1] waiting..."
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
       changed_when: false
-      retries: 180
-      delay: 5
-      until: >
-        (
-          ((sm.stdout | from_json).machines.get(target_machine_id | string, {}))
-          .get('machine-status', {}).get('current', '')
-        ) == 'running'
-        and
-        (
-          ((sm.stdout | from_json).machines.get(target_machine_id | string, {}))
-          .get('juju-status', {}).get('current', '')
-        ) == 'started'
-        and
-        (
-          ((sm.stdout | from_json).machines.get(target_machine_id | string, {}))
-          .get('modification-status', {}).get('current', '')
-        ) == 'idle'
 
     - name: 1.5b Gate-2：等待 OS cloud-init 完成（boot-finished）
       command: >
