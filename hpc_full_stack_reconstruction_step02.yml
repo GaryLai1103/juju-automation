@@ -1,13 +1,10 @@
 ---
 - name: 5.4 Fix Member Cluster Monitoring (Post-GUI)
-  hosts: ks_host
+  # 修改這裡：改成 all，讓 AWX 的 Inventory 設定來決定跑哪台
+  hosts: all  
   gather_facts: no
   vars:
-    # 預設叢集名稱，您可以根據需要在 AWX 啟動時覆寫此變數
     cluster_name: "{{ k8s_cluster | default('hpc-native-cluster') }}"
-    
-    # 指向 Member Cluster Kubeconfig 的路徑
-    # 請確保這個檔案已經存在於您的 Host Cluster (ks_host) 機器上
     member_cluster_kubeconfig: "/tmp/kubeconfig-{{ cluster_name }}"
 
   tasks:
