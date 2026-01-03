@@ -1,23 +1,31 @@
 ---
-- name: 5.4 Fix Member Cluster Monitoring (Post-GUI)
-  # 修改這裡：改成 all，讓 AWX 的 Inventory 設定來決定跑哪台
-  hosts: all  
+- name: 5.4 Fix Member Cluster Monitoring (Auto-generate Kubeconfig)
+  hosts: all  # 確保這裡是用 all，讓 Inventory 決定跑哪台
   gather_facts: no
   vars:
     cluster_name: "{{ k8s_cluster | default('hpc-native-cluster') }}"
+    # 設定 kubeconfig 的暫存路徑
     member_cluster_kubeconfig: "/tmp/kubeconfig-{{ cluster_name }}"
 
   tasks:
-    - name: 0. 檢查 Kubeconfig 是否存在
-      stat:
-        path: "{{ member_cluster_kubeconfig }}"
-      register: kubeconfig_file
-
-    - name: 0.1 終止 (如果找不到 Kubeconfig)
+    # ======================================================
+    # 新增步驟：動態從 KubeSphere 抓取並產生 Kubeconfig
+    # 這能解決 "找不到檔案" 的問題
+    # ======================================================
+    - name: 0. 從 Host Cluster 匯出 Member Cluster 的 Kubeconfig
+      shell: |
+        # 直接從 KubeSphere 的 Cluster 物件中讀取 kubeconfig (Base64 編碼) 並解碼存檔
+        kubectl get cluster {{ cluster_name }} -o jsonpath='{.spec.connection.kubeconfig}' | base64 -d > {{ member_cluster_kubeconfig }}
+      register: gen_kubeconfig
+      
+    - name: 0.1 確保 Kubeconfig 產生成功
       fail:
-        msg: "找不到 Kubeconfig 檔案: {{ member_cluster_kubeconfig }}，請檢查路徑或是變數 k8s_cluster 設定。"
-      when: not kubeconfig_file.stat.exists
+        msg: "無法產生 Kubeconfig，請確認叢集名稱 {{ cluster_name }} 正確且存在於 Host Cluster 中。"
+      when: gen_kubeconfig.rc != 0
 
+    # ======================================================
+    # 以下是原本的修復邏輯
+    # ======================================================
     - name: 1. 等待監控 Namespace 出現 (確保 GUI 安裝已生效)
       shell: |
         kubectl --kubeconfig {{ member_cluster_kubeconfig }} get namespace kubesphere-monitoring-system
@@ -26,14 +34,13 @@
       retries: 20
       delay: 10
       ignore_errors: yes
-      # 這會每 10 秒檢查一次，最多等 200 秒，確保 Agent 已經被 Host 推送下去
 
-    - name: 2. 補裝 ServiceMonitor CRD (解決 "no matches for kind" 報錯)
+    - name: 2. 補裝 ServiceMonitor CRD
       shell: |
         kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
-      # 如果已經存在，它會顯示 configured，不會報錯
+      ignore_errors: yes
 
-    - name: 3. 注入 GPU 採集規則 (連接 Machine 1 的關鍵)
+    - name: 3. 注入 GPU 採集規則
       shell: |
         cat <<EOF | kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f -
         apiVersion: monitoring.coreos.com/v1
@@ -46,7 +53,6 @@
         spec:
           selector:
             matchLabels:
-              # 這裡對應您在 Machine 1 上部署的 dcgm-exporter Service
               app: dcgm-exporter
           endpoints:
           - port: metrics
@@ -56,3 +62,10 @@
             matchNames:
             - kubesphere-monitoring-system
         EOF
+      register: sm_result
+
+    - name: 4. 清理暫存檔案 (可選，保持環境整潔)
+      file:
+        path: "{{ member_cluster_kubeconfig }}"
+        state: absent
+      when: sm_result.rc == 0
