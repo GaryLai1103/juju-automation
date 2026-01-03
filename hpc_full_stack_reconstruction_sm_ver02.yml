@@ -256,12 +256,16 @@
       changed_when: false
 
     - name: 3.4 配置 K3s 監控對接 (GPU Metrics to K8s)
-      shell: >
-        W_IP=$(juju ssh -m {{ slurm_model }} {{ worker_id }} 'hostname -I' | awk '{print $1}') &&
+      shell: |
+        # 1. 在本地執行 juju 指令抓取 Worker IP
+        W_IP=$(juju ssh -m {{ slurm_model }} {{ worker_id }} 'hostname -I' | awk '{print $1}')
+        
+        # 2. 在 Master (Machine 0) 透過一行指令完成命名空間與文件寫入
+        # 我們將 YAML 內容寫入 /tmp/gpu-metrics.yaml 避開 EOF 縮排問題
         juju ssh -m {{ slurm_model }} {{ master_id }} "
-        sudo kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | sudo kubectl apply -f - &&
-        sudo kubectl apply -f - <<'EOF'
-        apiVersion: v1
+          sudo kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | sudo kubectl apply -f -
+          
+          echo \"apiVersion: v1
         kind: Endpoints
         metadata:
           name: gpu-metrics-worker
@@ -284,8 +288,9 @@
           ports:
             - name: metrics
               port: 9400
-              targetPort: 9400
-        EOF
+              targetPort: 9400\" > /tmp/gpu-metrics.yaml
+
+          sudo kubectl apply -f /tmp/gpu-metrics.yaml
         "
       vars:
         slurm_model: "hpc-lab"
