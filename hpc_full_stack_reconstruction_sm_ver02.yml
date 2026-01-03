@@ -316,7 +316,7 @@
     # ----------------------------------------------------------------
     # 1. 在 Machine 0 取得 K3s Config
     # ----------------------------------------------------------------
-    # 步驟 A: 先抓 IP，存入 Ansible 變數 (就像 MicroK8s 那樣)
+    # 步驟 A: 先抓 IP，存入 Ansible 變數
     - name: 4.0 獲取 Machine 0 實體 IP
       shell: "juju ssh -m {{ slurm_model }} {{ master_id }} 'hostname -I' | awk '{print $1}'"
       register: master_ip_result
@@ -324,7 +324,6 @@
     # 步驟 B: 透過 Ansible 變數直接寫死 IP 進去
     - name: 4.1 產生 K3s Kubeconfig Base64
       shell: |
-        # 注意這裡：直接用 {{ ... }}，Ansible 會幫你填好數字
         juju ssh -m {{ slurm_model }} {{ master_id }} "sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1/{{ master_ip_result.stdout | trim }}/g' | base64 -w 0"
       register: k3s_kubeconfig_b64
 
