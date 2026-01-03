@@ -257,35 +257,46 @@
 
     - name: 3.4 配置 K3s 監控對接 (GPU Metrics to K8s)
       shell: |
-        # 1. 抓取 Worker IP
+        # 1. 抓取 Worker IP 並存入變數
         W_IP=$(juju ssh -m {{ slurm_model }} {{ worker_id }} 'hostname -I' | awk '{print $1}')
         
-        # 2. 在 Master 注入監控配置 (Service + Endpoints)
+        # 2. 在 Master 注入監控配置
+        # 使用單引號包裹指令，避免本地 shell 提前解析 $ 符號
         juju ssh -m {{ slurm_model }} {{ master_id }} "
           # 確保命名空間存在
-          kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | kubectl apply -f -
+          sudo kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | sudo kubectl apply -f -
           
-          # 建立靜態 Endpoints 指向 Machine 1 的 Port 9400
-          cat <<EOF | kubectl apply -f -
-          apiVersion: v1
-          kind: Endpoints
-          metadata:
-            name: gpu-metrics-worker
-            namespace: kubesphere-monitoring-system
-          subsets:
-            - addresses: [{ip: \$W_IP}]
-              ports: [{name: metrics, port: 9400}]
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: gpu-metrics-worker
-            namespace: kubesphere-monitoring-system
-            labels: {app: dcgm-exporter}
-          spec:
-            ports: [{name: metrics, port: 9400}]
-          EOF
+          # 建立靜態 Endpoints 與 Service
+          sudo kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Endpoints
+    metadata:
+      name: gpu-metrics-worker
+      namespace: kubesphere-monitoring-system
+    subsets:
+      - addresses:
+          - ip: $W_IP
+        ports:
+          - name: metrics
+            port: 9400
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: gpu-metrics-worker
+      namespace: kubesphere-monitoring-system
+      labels:
+        app: dcgm-exporter
+    spec:
+      ports:
+        - name: metrics
+          port: 9400
+          targetPort: 9400
+    EOF
         "
+      vars:
+        # 確保此 Play 內變數可用
+        slurm_model: "hpc-lab"
 # ==========================================
 # 第四階段：多叢集登錄與監控自動激活
 # ==========================================
