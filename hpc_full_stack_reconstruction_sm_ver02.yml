@@ -286,3 +286,83 @@
             ports: [{name: metrics, port: 9400}]
           EOF
         "
+# ==========================================
+# 第四階段：多叢集登錄與監控自動激活
+# ==========================================
+- name: 4. Register Cluster to KubeSphere and Enable Monitoring
+  hosts: maasjuju
+  vars:
+    # 請根據 AWX Survey 傳入或手動定義
+    k8s_cluster: "hpc-native-cluster" 
+    ks_host_ip: "192.168.100.4"
+    ks_host_user: "ubuntu"
+    slurm_model: "hpc-lab"
+
+  tasks:
+    # ----------------------------------------------------------------
+    # 1. 在 Machine 0 取得 K3s Config
+    # ----------------------------------------------------------------
+    - name: 4.1 取得 Machine 0 的 Kubeconfig (Base64)
+      shell: |
+        # 抓取 IP 並將 127.0.0.1 換成實體 IP，轉為 Base64
+        NODE_IP=$(juju ssh -m {{ slurm_model }} {{ master_id }} 'hostname -I' | awk '{print $1}')
+        juju ssh -m {{ slurm_model }} {{ master_id }} "sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1/'\$NODE_IP'/g' | base64 -w 0"
+      register: k3s_kubeconfig_b64
+
+    - name: 4.2 將 KubeSphere Host 加入臨時 Inventory
+      add_host:
+        name: "ks_host"
+        ansible_host: "{{ ks_host_ip }}"
+        ansible_user: "{{ ks_host_user }}"
+        cluster_name: "{{ k8s_cluster }}"
+        cluster_config: "{{ k3s_kubeconfig_b64.stdout }}"
+
+# ==========================================
+# 第五階段：在 KubeSphere Host 執行註冊與監控宣告
+# ==========================================
+- name: 5. 執行 KubeSphere 資源注入
+  hosts: ks_host
+  gather_facts: no
+  tasks:
+    - name: 5.1 注入 Cluster CRD (直接連接模式)
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ cluster_name }}
+          labels:
+            kubesphere.io/managed: "true"
+            cluster-role.kubesphere.io/member: ""
+            cluster-role.kubesphere.io/public: ""
+        spec:
+          provider: k3s
+          joinFederation: true
+          connection:
+            type: direct
+            kubeconfig: {{ cluster_config }}
+        EOF
+
+    - name: 5.2 自動啟用 WhizardTelemetry 監控代理
+      # 這是對應您圖片中 "Agent Config" 的自動化步驟
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: extensions.kubesphere.io/v1alpha1
+        kind: ClusterExtension
+        metadata:
+          name: whizard-telemetry-monitoring
+        spec:
+          clusterName: {{ cluster_name }}
+          enabled: true
+          # 這裡可以預先配置 GPU 指標的抓取規則
+          config: |
+            monitoring:
+              gpu:
+                enabled: true
+        EOF
+      register: extension_result
+      ignore_errors: yes
+
+    - name: 🚀 註冊成功訊息
+      debug:
+        msg: "🎉 集群 {{ cluster_name }} 已成功註冊。請前往 KubeSphere 擴展中心查看 Agent 狀態。"
