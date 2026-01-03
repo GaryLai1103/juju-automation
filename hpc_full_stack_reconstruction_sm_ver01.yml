@@ -135,9 +135,11 @@
         juju ssh -m {{ slurm_model }} {{ worker_id }} "
           sudo snap install dcgm || true
           sudo snap start --enable dcgm.nv-hostengine
+          sleep 5
           sudo snap start --enable dcgm.dcgm-exporter
           sleep 5
           sudo snap restart dcgm.nv-hostengine
+          sleep 10
           sudo snap restart dcgm.dcgm-exporter
         "
       changed_when: true
