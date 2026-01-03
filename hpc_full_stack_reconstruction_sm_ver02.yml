@@ -256,41 +256,36 @@
       changed_when: false
 
     - name: 3.4 配置 K3s 監控對接 (GPU Metrics to K8s)
-      shell: |
-        # 1. 抓取 Worker IP 並存入變數
-        W_IP=$(juju ssh -m {{ slurm_model }} {{ worker_id }} 'hostname -I' | awk '{print $1}')
-        
-        # 2. 在 Master 注入監控配置
-        # 注意：內部的 EOF 內容必須對齊，避免 YAML 解析錯誤
+      shell: >
+        W_IP=$(juju ssh -m {{ slurm_model }} {{ worker_id }} 'hostname -I' | awk '{print $1}') &&
         juju ssh -m {{ slurm_model }} {{ master_id }} "
-          sudo kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | sudo kubectl apply -f -
-          
-          sudo kubectl apply -f - <<'EOF'
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: gpu-metrics-worker
-  namespace: kubesphere-monitoring-system
-subsets:
-  - addresses:
-      - ip: $W_IP
-    ports:
-      - name: metrics
-        port: 9400
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gpu-metrics-worker
-  namespace: kubesphere-monitoring-system
-  labels:
-    app: dcgm-exporter
-spec:
-  ports:
-    - name: metrics
-      port: 9400
-      targetPort: 9400
-EOF
+        sudo kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | sudo kubectl apply -f - &&
+        sudo kubectl apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Endpoints
+        metadata:
+          name: gpu-metrics-worker
+          namespace: kubesphere-monitoring-system
+        subsets:
+          - addresses:
+              - ip: $W_IP
+            ports:
+              - name: metrics
+                port: 9400
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: gpu-metrics-worker
+          namespace: kubesphere-monitoring-system
+          labels:
+            app: dcgm-exporter
+        spec:
+          ports:
+            - name: metrics
+              port: 9400
+              targetPort: 9400
+        EOF
         "
       vars:
         slurm_model: "hpc-lab"
