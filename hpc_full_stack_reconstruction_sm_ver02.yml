@@ -254,3 +254,35 @@
         sleep 2
         juju ssh -m {{ slurm_model }} {{ master_id }} "sudo scontrol update nodename=gpu-node01 state=resume"
       changed_when: false
+
+    - name: 3.4 配置 K3s 監控對接 (GPU Metrics to K8s)
+      shell: |
+        # 1. 抓取 Worker IP
+        W_IP=$(juju ssh -m {{ slurm_model }} {{ worker_id }} 'hostname -I' | awk '{print $1}')
+        
+        # 2. 在 Master 注入監控配置 (Service + Endpoints)
+        juju ssh -m {{ slurm_model }} {{ master_id }} "
+          # 確保命名空間存在
+          kubectl create ns kubesphere-monitoring-system --dry-run=client -o yaml | kubectl apply -f -
+          
+          # 建立靜態 Endpoints 指向 Machine 1 的 Port 9400
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Endpoints
+          metadata:
+            name: gpu-metrics-worker
+            namespace: kubesphere-monitoring-system
+          subsets:
+            - addresses: [{ip: \$W_IP}]
+              ports: [{name: metrics, port: 9400}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: gpu-metrics-worker
+            namespace: kubesphere-monitoring-system
+            labels: {app: dcgm-exporter}
+          spec:
+            ports: [{name: metrics, port: 9400}]
+          EOF
+        "
