@@ -83,6 +83,9 @@
     # 黃金規格數值
     node_cpus: 18
     node_mem: 128646
+    # 硬體標籤定義
+    master_tags: "tags=virtual"
+    worker_tags: "tags=slurm-node"
   tasks:
     - name: 2.0.1 根據 MAAS Tag 動態偵測 Machine ID
       shell: |
@@ -148,6 +151,9 @@
     slurm_model: "hpc-lab"
     node_cpus: 18
     node_mem: 128646
+    # 硬體標籤定義
+    master_tags: "tags=virtual"
+    worker_tags: "tags=slurm-node"
   tasks:
     - name: 3.0.1 根據 MAAS Tag 動態偵測 Machine ID
       shell: |
