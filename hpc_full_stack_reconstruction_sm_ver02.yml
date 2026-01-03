@@ -336,12 +336,19 @@
         cluster_config: "{{ k3s_kubeconfig_b64.stdout }}"
 
 # ==========================================
-# 第五階段：在 KubeSphere Host 執行註冊與監控宣告
+# 第五階段：在 KubeSphere Host 執行註冊與監控鋪路
 # ==========================================
-- name: 5. 執行 KubeSphere 資源注入
+- name: 5. 執行 KubeSphere 資源注入與監控修復
   hosts: ks_host
   gather_facts: no
+  vars:
+    # 臨時 Kubeconfig 路徑
+    member_cluster_kubeconfig: "/tmp/kubeconfig-{{ cluster_name }}"
+
   tasks:
+    # --------------------------------------------------------
+    # 5.1 註冊叢集 (讓 KubeSphere 納管 K3s)
+    # --------------------------------------------------------
     - name: 5.1 注入 Cluster CRD (直接連接模式)
       shell: |
         cat <<EOF | kubectl apply -f -
@@ -358,29 +365,71 @@
           joinFederation: true
           connection:
             type: direct
+            # 這裡使用上一階段傳過來的 base64 變數
             kubeconfig: {{ cluster_config }}
         EOF
+      register: register_result
 
-    - name: 5.2 自動啟用 WhizardTelemetry 監控代理
-      # 這是對應您圖片中 "Agent Config" 的自動化步驟
+    # --------------------------------------------------------
+    # 5.2 準備監控環境 (取代舊的自動 Agent 安裝)
+    # 說明：這裡不直接開 Agent，而是先把路鋪好 (CRD + ServiceMonitor)
+    # 這樣您在 UI 點選啟用後，GPU 數據會馬上通
+    # --------------------------------------------------------
+    
+    - name: 5.2.1 產生臨時 Kubeconfig 檔案 (用於後續修復)
       shell: |
-        cat <<EOF | kubectl apply -f -
-        apiVersion: extensions.kubesphere.io/v1alpha1
-        kind: ClusterExtension
-        metadata:
-          name: whizard-telemetry-monitoring
-        spec:
-          clusterName: {{ cluster_name }}
-          enabled: true
-          # 這裡可以預先配置 GPU 指標的抓取規則
-          config: |
-            monitoring:
-              gpu:
-                enabled: true
-        EOF
-      register: extension_result
+        # 將變數中的 Kubeconfig 解碼並存成檔案，供 kubectl 使用
+        echo "{{ cluster_config }}" | base64 -d > {{ member_cluster_kubeconfig }}
+      
+    - name: 5.2.2 等待叢集註冊生效 (簡單檢查 Namespace)
+      shell: |
+        # 嘗試連線 Member Cluster，確保註冊成功且網路互通
+        kubectl --kubeconfig {{ member_cluster_kubeconfig }} get nodes
+      register: cluster_check
+      until: cluster_check.rc == 0
+      retries: 10
+      delay: 5
+
+    - name: 5.2.3 預先補裝 ServiceMonitor CRD
+      shell: |
+        # 這是為了防止 Agent 安裝時報錯 "no matches for kind ServiceMonitor"
+        kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
       ignore_errors: yes
 
-    - name: 🚀 註冊成功訊息
+    - name: 5.2.4 預先注入 GPU 採集規則 (ServiceMonitor)
+      shell: |
+        # 這是連接 Machine 1 dcgm-exporter 的關鍵橋樑
+        cat <<EOF | kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f -
+        apiVersion: monitoring.coreos.com/v1
+        kind: ServiceMonitor
+        metadata:
+          name: gpu-bridge-monitor
+          namespace: kubesphere-monitoring-system
+          labels:
+            app.kubernetes.io/vendor: kubesphere
+        spec:
+          selector:
+            matchLabels:
+              app: dcgm-exporter
+          endpoints:
+          - port: metrics
+            interval: 15s
+            path: /metrics
+          namespaceSelector:
+            matchNames:
+            - kubesphere-monitoring-system
+        EOF
+
+    - name: 5.3 清理臨時檔案
+      file:
+        path: "{{ member_cluster_kubeconfig }}"
+        state: absent
+
+    - name: 🚀 部署完成提示
       debug:
-        msg: "🎉 集群 {{ cluster_name }} 已成功註冊。請前往 KubeSphere 擴展中心查看 Agent 狀態。"
+        msg: 
+          - "🎉 基礎建設與叢集註冊已完成！"
+          - "⚠️ 最後一步：請前往 KubeSphere 網頁介面 -> 擴展中心 (Marketplace)"
+          - "   -> WhizardTelemetry -> Agent Configs"
+          - "   -> 勾選 '{{ cluster_name }}' 並確認開啟 GPU 選項。"
+          - "   (因為監控規則已在 5.2.4 預先注入，您啟用後數據會立刻出現)"
