@@ -44,13 +44,19 @@
         master_id: "{{ detected_ids.stdout.split('|')[0] }}"
         worker_id: "{{ detected_ids.stdout.split('|')[1] }}"
 
-    - name: 1.3 Machine 0：安裝 K3s (手動模式)
+    - name: 1.3 Machine 0：安裝 K3s (包含 TLS SAN 修正)
       shell: |
         juju ssh -m {{ slurm_model }} {{ master_id }} '
+          # 1. 自動抓取這台機器的實體 IP
+          NODE_IP=$(hostname -I | awk "{print \$1}")
+          
+          # 2. 安裝 K3s 並注入 TLS SAN
           curl -sfL https://get.k3s.io | sudo sh -s - server \
             --write-kubeconfig-mode 644 \
+            --tls-san $NODE_IP \
             --disable traefik \
             --disable servicelb
+            
           sudo kubectl get nodes
         '
       changed_when: false
@@ -310,11 +316,12 @@
     # ----------------------------------------------------------------
     # 1. 在 Machine 0 取得 K3s Config
     # ----------------------------------------------------------------
-    - name: 4.1 取得 Machine 0 的 Kubeconfig (Base64)
+    - name: 4.1 產生 K3s Kubeconfig Base64 (對接 Host Cluster)
       shell: |
-        # 抓取 IP 並將 127.0.0.1 換成實體 IP，轉為 Base64
-        NODE_IP=$(juju ssh -m {{ slurm_model }} {{ master_id }} 'hostname -I' | awk '{print $1}')
-        juju ssh -m {{ slurm_model }} {{ master_id }} "sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1/'\$NODE_IP'/g' | base64 -w 0"
+        # 先抓 IP
+        NODE_IP=$(juju ssh -m {{ slurm_model }} {{ master_id }} "hostname -I | awk '{print \$1}'")
+        # 讀取 config 並把 127.0.0.1 換成實體 IP
+        juju ssh -m {{ slurm_model }} {{ master_id }} "sudo cat /etc/rancher/k3s/k3s.yaml | sed \"s/127.0.0.1/\$NODE_IP/g\" | base64 -w 0"
       register: k3s_kubeconfig_b64
 
     - name: 4.2 將 KubeSphere Host 加入臨時 Inventory
