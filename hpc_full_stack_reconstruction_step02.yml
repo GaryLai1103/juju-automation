@@ -1,31 +1,43 @@
 ---
-- name: 5.4 Post-UI Configuration for Member Cluster
+- name: 5.4 Fix Member Cluster Monitoring (Post-GUI)
   hosts: ks_host
   gather_facts: no
   vars:
-    # 確保這個路徑指向您存放 Member Cluster Kubeconfig 的位置
-    member_cluster_kubeconfig: "/tmp/kubeconfig-{{ k8s_cluster | default('hpc-native-cluster') }}"
+    # 預設叢集名稱，您可以根據需要在 AWX 啟動時覆寫此變數
+    cluster_name: "{{ k8s_cluster | default('hpc-native-cluster') }}"
+    
+    # 指向 Member Cluster Kubeconfig 的路徑
+    # 請確保這個檔案已經存在於您的 Host Cluster (ks_host) 機器上
+    member_cluster_kubeconfig: "/tmp/kubeconfig-{{ cluster_name }}"
 
   tasks:
-    - name: 等待 Agent 安裝完成 (檢查 Namespace 是否存在)
+    - name: 0. 檢查 Kubeconfig 是否存在
+      stat:
+        path: "{{ member_cluster_kubeconfig }}"
+      register: kubeconfig_file
+
+    - name: 0.1 終止 (如果找不到 Kubeconfig)
+      fail:
+        msg: "找不到 Kubeconfig 檔案: {{ member_cluster_kubeconfig }}，請檢查路徑或是變數 k8s_cluster 設定。"
+      when: not kubeconfig_file.stat.exists
+
+    - name: 1. 等待監控 Namespace 出現 (確保 GUI 安裝已生效)
       shell: |
         kubectl --kubeconfig {{ member_cluster_kubeconfig }} get namespace kubesphere-monitoring-system
       register: ns_check
       until: ns_check.rc == 0
-      retries: 10
+      retries: 20
       delay: 10
       ignore_errors: yes
-      # 這是一個保險，確保您 UI 點完後，Member Cluster 已經準備好了
+      # 這會每 10 秒檢查一次，最多等 200 秒，確保 Agent 已經被 Host 推送下去
 
-    - name: 1. 補裝 ServiceMonitor CRD (預防 "no matches for kind" 錯誤)
+    - name: 2. 補裝 ServiceMonitor CRD (解決 "no matches for kind" 報錯)
       shell: |
-        # 即使 UI 裝了 Agent，有時 CRD 定義沒這麼快生效，我們手動補一次最保險
         kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
-      ignore_errors: yes
+      # 如果已經存在，它會顯示 configured，不會報錯
 
-    - name: 2. 注入 GPU 採集規則 (ServiceMonitor)
+    - name: 3. 注入 GPU 採集規則 (連接 Machine 1 的關鍵)
       shell: |
-        # 這是讓 Prometheus 知道 "要去抓 Machine 1 的 GPU 數據" 的關鍵設定
         cat <<EOF | kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f -
         apiVersion: monitoring.coreos.com/v1
         kind: ServiceMonitor
@@ -37,7 +49,7 @@
         spec:
           selector:
             matchLabels:
-              # 對應到您之前部署的 Service (NodePort/ClusterIP)
+              # 這裡對應您在 Machine 1 上部署的 dcgm-exporter Service
               app: dcgm-exporter
           endpoints:
           - port: metrics
@@ -47,9 +59,3 @@
             matchNames:
             - kubesphere-monitoring-system
         EOF
-      register: sm_result
-
-    - name: 顯示執行結果
-      debug:
-        msg: "監控規則已注入！請前往 KubeSphere 自定義監控查詢 'DCGM_FI_DEV_GPU_TEMP'"
-      when: sm_result.rc == 0
