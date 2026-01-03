@@ -1,0 +1,55 @@
+---
+- name: 5.4 Post-UI Configuration for Member Cluster
+  hosts: ks_host
+  gather_facts: no
+  vars:
+    # 確保這個路徑指向您存放 Member Cluster Kubeconfig 的位置
+    member_cluster_kubeconfig: "/tmp/kubeconfig-{{ k8s_cluster | default('hpc-native-cluster') }}"
+
+  tasks:
+    - name: 等待 Agent 安裝完成 (檢查 Namespace 是否存在)
+      shell: |
+        kubectl --kubeconfig {{ member_cluster_kubeconfig }} get namespace kubesphere-monitoring-system
+      register: ns_check
+      until: ns_check.rc == 0
+      retries: 10
+      delay: 10
+      ignore_errors: yes
+      # 這是一個保險，確保您 UI 點完後，Member Cluster 已經準備好了
+
+    - name: 1. 補裝 ServiceMonitor CRD (預防 "no matches for kind" 錯誤)
+      shell: |
+        # 即使 UI 裝了 Agent，有時 CRD 定義沒這麼快生效，我們手動補一次最保險
+        kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+      ignore_errors: yes
+
+    - name: 2. 注入 GPU 採集規則 (ServiceMonitor)
+      shell: |
+        # 這是讓 Prometheus 知道 "要去抓 Machine 1 的 GPU 數據" 的關鍵設定
+        cat <<EOF | kubectl --kubeconfig {{ member_cluster_kubeconfig }} apply -f -
+        apiVersion: monitoring.coreos.com/v1
+        kind: ServiceMonitor
+        metadata:
+          name: gpu-bridge-monitor
+          namespace: kubesphere-monitoring-system
+          labels:
+            app.kubernetes.io/vendor: kubesphere
+        spec:
+          selector:
+            matchLabels:
+              # 對應到您之前部署的 Service (NodePort/ClusterIP)
+              app: dcgm-exporter
+          endpoints:
+          - port: metrics
+            interval: 15s
+            path: /metrics
+          namespaceSelector:
+            matchNames:
+            - kubesphere-monitoring-system
+        EOF
+      register: sm_result
+
+    - name: 顯示執行結果
+      debug:
+        msg: "監控規則已注入！請前往 KubeSphere 自定義監控查詢 'DCGM_FI_DEV_GPU_TEMP'"
+      when: sm_result.rc == 0
