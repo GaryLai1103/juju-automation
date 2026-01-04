@@ -1,25 +1,25 @@
 ---
 # ==========================================
-# SKU: Slinky-MicroK8s-v2.0 (The Bundle Strategy)
-# 目標：回歸最簡單的部署體驗
-# 核心：使用 Juju Bundle 實現 "Fire and Forget"
+# SKU: Slinky-MicroK8s-v3.0 (Scalable Architecture)
+# 目標：建立一個具備高度擴充性的生產級架構
+# 架構：
+#   - k8s-master (VM): 負責控制平面
+#   - k8s-worker (Bare Metal GPU): 負責 Slinky 運算
 # 優勢：
-#   1. 完全不需要 Retry Loop，指令下達即成功
-#   2. 精確控制：Unit 0 -> VM, Unit 1 -> GPU Bare Metal
-#   3. 符合您記憶中 "一次部署好" 的體驗
+#   1. 未來擴充 GPU 節點只需 add-unit k8s-worker，會自動繼承配置
+#   2. 使用 Bundle 部署，解決 "Relation not found" 的時間差問題
 # ==========================================
-- name: Infrastructure Test - Deploy MicroK8s via Juju Bundle
+- name: Infrastructure Test - Scalable MicroK8s Deployment
   hosts: maasjuju
   gather_facts: no
   vars:
     test_model: "slinky-cluster"
-    target_os: "ubuntu@22.04"
     k8s_channel: "1.28/stable"
-    # 定義標籤
-    tag_master: "virtual"
-    tag_worker: "slurm-node"
-    # 定義 Bundle 檔案路徑
-    bundle_path: "/tmp/slinky-bundle.yaml"
+    # 定義標籤約束 (Constraints)
+    # 這確保未來擴充時，Juju 知道要去抓哪種機器
+    constraint_master: "tags=virtual"
+    constraint_worker: "tags=slurm-node"
+    bundle_path: "/tmp/slinky-scalable-bundle.yaml"
 
   tasks:
     # -------------------------------------------------------
@@ -41,73 +41,70 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 製作 Juju Bundle (魔法的核心)
-    # 說明：我們用 YAML 定義機器與應用的對應關係，讓 Juju 自己去處理依賴
+    # 2. 定義可擴充架構 (Bundle)
+    # 說明：這裡我們定義兩個 Application，但使用同一個 Charm (microk8s)
     # -------------------------------------------------------
-    - name: 2.1 產生 Bundle YAML 文件
+    - name: 2.1 產生 Scalable Bundle 文件
       copy:
         dest: "{{ bundle_path }}"
         content: |
-          description: Slinky MicroK8s Cluster Bundle
-          series: jammy  # Ubuntu 22.04
-          machines:
-            "0":
-              constraints: tags={{ tag_master }}
-            "1":
-              constraints: tags={{ tag_worker }}
+          description: Slinky Scalable Cluster
+          series: jammy
           applications:
-            microk8s:
+            # --- 控制平面群組 ---
+            k8s-master:
               charm: microk8s
               channel: {{ k8s_channel }}
-              num_units: 2
-              to: ["0", "1"]
-              # 在這裡直接指定差異化配置是不行的，Bundle 中應用配置是全域的
-              # 所以我們保持原廠設定，後面再開啟功能
-      
+              num_units: 1
+              constraints: {{ constraint_master }}
+              # Master 不需要 GPU，可以預先關閉不需要的 addon
+              options:
+                hostpath_storage: "true"
+                dns: "true"
+                rbac: "true"
+
+            # --- 運算平面群組 (未來擴充重點) ---
+            k8s-worker:
+              charm: microk8s
+              channel: {{ k8s_channel }}
+              num_units: 1
+              constraints: {{ constraint_worker }}
+              # Worker 未來擴充時，會自動繼承這些設定
+              options:
+                hostpath_storage: "true"
+                dns: "true"
+                rbac: "true"
+          
+          # --- 自動連接邏輯 ---
+          relations:
+            # 將 Worker 連接到 Master，形成叢集
+            - ["k8s-master:microk8s", "k8s-worker:microk8s"]
+
     # -------------------------------------------------------
-    # 3. 部署 Bundle (一次到位，不會報錯)
+    # 3. 執行部署 (Fire and Forget)
+    # 說明：Juju 會解析 Bundle，自動處理下載 Charm、申請機器、建立關聯的順序
     # -------------------------------------------------------
-    - name: 3.1 執行 Juju Deploy Bundle
+    - name: 3.1 部署 Scalable Bundle
       shell: |
-        # 這行指令會告訴 Juju：「這是計畫，去執行吧」
-        # Juju 會自動申請機器 -> 等機器好 -> 安裝軟體 -> 組建 Cluster
         juju deploy {{ bundle_path }} --model {{ test_model }}
 
     # -------------------------------------------------------
-    # 4. 部署後驗收 (這裡只需要單純的等待)
+    # 4. 部署後驗收 (等待 MaaS 安裝 OS)
     # -------------------------------------------------------
-    - name: 4.1 等待機器安裝 OS 並完成 Clustering
+    - name: 4.1 等待 Master 與 Worker 就緒
       shell: |
-        # 監控 agent-status 是否變為 started (或 active)
-        # 裸機安裝比較慢，所以這裡還是要給它時間，但不會報紅字錯誤
+        # 我們等待至少 2 台機器進入 started 狀態
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
       register: machine_ready
       until: machine_ready.stdout | int >= 2
-      retries: 240  # 40 分鐘 (裸機安裝時間)
+      retries: 240  # 40 分鐘 (容許裸機 PXE 安裝時間)
       delay: 10
       ignore_errors: yes 
 
     # -------------------------------------------------------
-    # 5. 功能啟用 (Day 2 Ops)
+    # 5. 針對 Worker 群組啟用 GPU
     # -------------------------------------------------------
-    - name: 5.1 啟用基礎設施 (Master / Unit 0)
+    - name: 5.1 在 Worker 群組啟用 GPU
       shell: |
-        # 只要機器變成 started，這裡就可以執行了
-        juju run microk8s/0 enable addon=dns --model {{ test_model }}
-        juju run microk8s/0 enable addon=rbac --model {{ test_model }}
-        juju run microk8s/0 enable addon=hostpath-storage --model {{ test_model }}
-      register: action_result
-      until: action_result.rc == 0
-      retries: 20
-      delay: 15
-      ignore_errors: yes
-
-    - name: 5.2 啟用 GPU (Worker / Unit 1)
-      shell: |
-        # 針對 GPU 節點啟用
-        juju run microk8s/1 enable addon=gpu --model {{ test_model }}
-      ignore_errors: yes
-
-    - name: ✅ 部署指令完成
-      debug:
-        msg: "Bundle 部署已送出！Juju 正在後台處理所有機器的安裝與叢集組建。無需任何額外操作。"
+        # 這裡是對 "Application" 下指令，而不是單一 Unit
+        # 這意味著：目前這台 Worker，以及"未來擴
