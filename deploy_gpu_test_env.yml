@@ -1,0 +1,56 @@
+---
+- name: 部署 PyTorch GPU 測試環境 (Restore Burn Tool)
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    # 這是預設值，實際會被 AWX Survey 覆蓋
+    slurm_model: "hpc-lab"
+    worker_tag: "slurm-node"
+
+  tasks:
+    # ====================================================
+    # 1. 自動偵測 GPU Worker 的 ID (Machine 1)
+    # ====================================================
+    - name: 1. 偵測 GPU Worker ID
+      shell: |
+        # 抓取 Juju 機器列表並解析 JSON
+        STATUS=$(juju machines -m {{ slurm_model }} --format json)
+        
+        # 使用 jq 過濾出帶有 'slurm-node' 標籤的機器 ID
+        # 如果您的標籤不同，請修改上面的 vars
+        WORKER_ID=$(echo $STATUS | jq -r '.machines | to_entries[] | select(.value.constraints | contains("tags={{ worker_tag }}")) | .key' | head -n 1)
+        
+        # 如果找不到，預設回退到 '1' (假設 Machine 1)
+        if [ -z "$WORKER_ID" ]; then echo "1"; else echo "$WORKER_ID"; fi
+      register: worker_id_result
+      changed_when: false
+
+    - name: 1.1 顯示偵測到的 Worker ID
+      debug:
+        msg: "即將部署到 Model: {{ slurm_model }}, Machine ID: {{ worker_id_result.stdout }}"
+
+    # ====================================================
+    # 2. 遠端安裝 Python 環境與 PyTorch
+    # ====================================================
+    - name: 2. 安裝 venv 並建立 PyTorch 環境 (這可能需要幾分鐘)
+      shell: |
+        juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
+          # A. 安裝系統套件
+          echo '📦 Updating apt and installing venv...'
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-venv python3-pip
+
+          # B. 建立虛擬環境 (如果已存在則跳過)
+          if [ ! -d 'gpu-test-env' ]; then
+            echo '📂 Creating virtual environment...'
+            python3 -m venv gpu-test-env
+          fi
+
+          # C. 安裝 PyTorch (直接呼叫 venv 裡的 pip，確保裝在虛擬環境內)
+          echo '🔥 Installing PyTorch (CUDA 12.1)... This takes time!'
+          ./gpu-test-env/bin/pip install --upgrade pip
+          ./gpu-test-env/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+        "
+      # 設定較長的 timeout，因為下載 PyTorch 很慢 (30分鐘)
+      async: 1800
+      poll: 10
