@@ -1,11 +1,9 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.7 (Retry Logic)
-# 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
+# SKU: Infra-Test-MicroK8s-v0.7.1 (Syntax Fix)
 # 修正：
-#   1. 移除無效的 Metadata 檢查
-#   2. 在 "juju integrate" 加入 Retry 機制，解決 Race Condition
-#   3. 修正 Action 名稱為 "enable"
+#   1. 修復 YAML 語法錯誤 (Task 4.2 名稱中的冒號問題)
+#   2. 包含 Retry 機制與正確的 Action 名稱
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -57,7 +55,6 @@
 
     # -------------------------------------------------------
     # 3. 建立關聯 (整合 Retry 機制)
-    # 說明：如果報錯 "no relation"，Ansible 會等待並重試，直到 Charm 載入完畢
     # -------------------------------------------------------
     - name: 3.1 建立 Master 與 Worker 的叢集關係
       shell: |
@@ -65,7 +62,7 @@
       register: integrate_result
       until: integrate_result.rc == 0
       retries: 20       # 最多重試 20 次
-      delay: 10         # 每次間隔 10 秒 (總共給 Juju 200秒的時間來下載定義檔)
+      delay: 10         # 每次間隔 10 秒
 
     # -------------------------------------------------------
     # 4. 部署後驗收與功能啟用
@@ -79,7 +76,7 @@
       delay: 10
       ignore_errors: yes 
 
-    - name: 4.2 啟用基礎設施插件 (Action: enable)
+    - name: "4.2 啟用基礎設施插件 (Action: enable)" # <--- 這裡加了引號
       shell: |
         # 修正：MicroK8s Charm 的動作名稱是 "enable"
         # 我們也加上 Retry，防止機器剛開機還沒準備好接 Action
