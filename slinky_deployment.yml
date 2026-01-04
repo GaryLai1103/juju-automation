@@ -56,14 +56,19 @@
           --base {{ target_os }}
 
     # -------------------------------------------------------
-    # 2.3 安全檢查 (防止 Race Condition)
+    # 2.3 修正後的等待邏輯：等待 Charm Metadata 載入
+    # 說明：我們檢查 Juju 是否已經知道這個 App 支援 "microk8s" 關聯
     # -------------------------------------------------------
-    - name: 2.3 等待應用程式物件建立
-      shell: juju status -m {{ test_model }} --format json | jq -r '.applications | keys[]'
-      register: app_list
-      until: '"k8s-master" in app_list.stdout and "k8s-worker" in app_list.stdout'
-      retries: 20
+    - name: 2.3 等待 Charm 定義檔載入 (防止 Relation 報錯)
+      shell: |
+        # 查詢應用的詳細資訊，如果 metadata 沒載入，這行通常會失敗或內容不全
+        juju show-application k8s-master -m {{ test_model }}
+      register: app_info
+      # 我們等待直到輸出內容包含 "microk8s" 這個字眼 (代表關聯定義已載入)
+      until: '"microk8s" in app_info.stdout'
+      retries: 60
       delay: 5
+      ignore_errors: yes 
 
     # -------------------------------------------------------
     # 3. 建立關聯 (Clustering)
@@ -71,7 +76,7 @@
     - name: 3.1 建立 Master 與 Worker 的叢集關係
       shell: |
         juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
-
+        
     # -------------------------------------------------------
     # 4. 部署後驗收與功能啟用 (Day 2 Ops)
     # -------------------------------------------------------
