@@ -1,4 +1,4 @@
-- name: 部署 PyTorch GPU 測試環境 (Restore Burn Tool)
+- name: 部署 PyTorch GPU 測試環境 (含排程測試工具)
   hosts: maasjuju
   gather_facts: no
   vars:
@@ -8,18 +8,12 @@
 
   tasks:
     # ====================================================
-    # 1. 自動偵測 GPU Worker 的 ID (Machine 1)
+    # 1. 自動偵測 GPU Worker 的 ID
     # ====================================================
     - name: 1. 偵測 GPU Worker ID
       shell: |
-        # 抓取 Juju 機器列表並解析 JSON
         STATUS=$(juju machines -m {{ slurm_model }} --format json)
-        
-        # 使用 jq 過濾出帶有 'slurm-node' 標籤的機器 ID
-        # 如果您的標籤不同，請修改上面的 vars
         WORKER_ID=$(echo $STATUS | jq -r '.machines | to_entries[] | select(.value.constraints | contains("tags={{ worker_tag }}")) | .key' | head -n 1)
-        
-        # 如果找不到，預設回退到 '1' (假設 Machine 1)
         if [ -z "$WORKER_ID" ]; then echo "1"; else echo "$WORKER_ID"; fi
       register: worker_id_result
       changed_when: false
@@ -31,44 +25,39 @@
     # ====================================================
     # 2. 遠端安裝 Python 環境與 PyTorch
     # ====================================================
-    - name: 2. 安裝 venv 並建立 PyTorch 環境 (這可能需要幾分鐘)
+    - name: 2. 安裝 venv 並建立 PyTorch 環境
       shell: |
         juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
-          # A. 安裝系統套件
-          echo '📦 Updating apt and installing venv...'
+          echo '📦 Updating apt...'
           sudo apt-get update -qq
           sudo apt-get install -y python3-venv python3-pip
 
-          # B. 建立虛擬環境 (如果已存在則跳過)
           if [ ! -d 'gpu-test-env' ]; then
             echo '📂 Creating virtual environment...'
             python3 -m venv gpu-test-env
           fi
 
-          # C. 安裝 PyTorch (直接呼叫 venv 裡的 pip，確保裝在虛擬環境內)
-          echo '🔥 Installing PyTorch (CUDA 12.1)... This takes time!'
+          echo '🔥 Installing PyTorch (CUDA 12.1)...'
           ./gpu-test-env/bin/pip install --upgrade pip
           ./gpu-test-env/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
         "
-      # 設定較長的 timeout，因為下載 PyTorch 很慢 (30分鐘)
       async: 1800
       poll: 10
 
     # ====================================================
-    # 3. 自動寫入測試與監控腳本 (修正縮排問題)
+    # 3. 自動寫入測試腳本 (共 3 個)
     # ====================================================
 
-    # 3.1 部署 Burn GPU (含監控的燒機腳本)
-    - name: 3.1 部署 burn_gpu.py (壓力測試 + 儀表板)
+    # 3.1 部署 Burn GPU (無限迴圈壓力測試)
+    - name: 3.1 部署 burn_gpu.py (無限燒機 + 儀表板)
       shell: |
         juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
-        cat <<EOF > burn_gpu.py
+        cat << 'EOF' > burn_gpu.py
         import torch
         import time
         import os
         import sys
 
-        # 1. 檢查 GPU
         if not torch.cuda.is_available():
             print('❌ Error: No GPU found!')
             sys.exit(1)
@@ -80,21 +69,119 @@
             name = 'Unknown Device'
 
         print(f'✅ Dedicated GPU: {name}')
-        print('🔥 Starting Stress Test... Press [Ctrl+C] to STOP! 🔥')
+        print('🔥 Starting Infinite Stress Test... Press [Ctrl+C] to STOP! 🔥')
         print('-' * 80)
 
-        # 2. 準備大矩陣 (10000x10000)
         N = 10000
         x = torch.randn(N, N, device=device)
         y = torch.randn(N, N, device=device)
 
         try:
             while True:
-                # --- 階段 A: 產生熱量 ---
                 for _ in range(10):
                     z = torch.mm(x, y)
                 
-                # --- 階段 B: 監控數據 ---
+                cmd = 'nvidia-smi --query-gpu=temperature.gpu,fan.speed,utilization.gpu,power.draw --format=csv,noheader,nounits'
+                try:
+                    output = os.popen(cmd).read().strip()
+                    parts = output.split(',')
+                    if len(parts) >= 4:
+                        temp, fan, util, power = [p.strip() for p in parts]
+                    else:
+                        raise ValueError
+                except:
+                    temp = fan = util = power = 'N/A'
+
+                sys.stdout.write(f'\r🌡️  Temp: {temp:>3}°C | 🌪️ Fan: {fan:>3}% | 📊 Load: {util:>3}% | ⚡ Power: {power:>6}W | Status: BURNING... ')
+                sys.stdout.flush()
+                time.sleep(0.5)
+
+        except KeyboardInterrupt:
+            print('\n\n🛑 Test Stopped by User. Cooling down...')
+        EOF
+        "
+
+    # 3.2 部署 Watch GPU (純監控)
+    - name: 3.2 部署 watch_gpu.py (純監控)
+      shell: |
+        juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
+        cat << 'EOF' > watch_gpu.py
+        import time
+        import os
+        import sys
+
+        print('🔍 GPU Monitor Started... Press [Ctrl+C] to STOP!')
+        print('-' * 60)
+
+        try:
+            while True:
+                cmd = 'nvidia-smi --query-gpu=temperature.gpu,fan.speed,utilization.gpu,power.draw --format=csv,noheader,nounits'
+                output = os.popen(cmd).read().strip()
+                try:
+                    parts = output.split(',')
+                    if len(parts) >= 4:
+                        temp, fan, util, power = [p.strip() for p in parts]
+                    else:
+                        raise ValueError
+                except:
+                    temp = fan = util = power = 'N/A'
+
+                sys.stdout.write(f'\r🌡️  Temp: {temp:>3}°C | 🌪️ Fan: {fan:>3}% | 📊 Load: {util:>3}% | ⚡ Power: {power:>6}W    ')
+                sys.stdout.flush()
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            print('\n\n🛑 Monitoring Stopped.')
+        EOF
+        "
+
+    # 3.3 部署 SLURM 排程測試腳本 (新增的部分)
+    - name: 3.3 部署 Job_queue.py (30秒排程測試 + SLURM 整合)
+      shell: |
+        juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
+        cat << 'EOF' > Job_queue.py
+        import torch
+        import time
+        import os
+        import socket
+        import sys
+
+        # 1. 獲取 SLURM 資訊
+        job_id = os.environ.get('SLURM_JOB_ID', 'Local')
+        task_id = os.environ.get('SLURM_ARRAY_TASK_ID', '0')
+        node_name = socket.gethostname()
+
+        print(f'[{time.strftime(\"%H:%M:%S\")}] 🚀 Job {job_id} (Task {task_id}) started on {node_name}')
+
+        # 2. 檢查 GPU
+        if not torch.cuda.is_available():
+            print('❌ Error: No GPU found! Exiting.')
+            sys.exit(1)
+
+        device = torch.device('cuda')
+        name = torch.cuda.get_device_name(0)
+        print(f'    - GPU Detected: {name}')
+
+        # 3. 準備大矩陣
+        N = 10000
+        x = torch.randn(N, N, device=device)
+        y = torch.randn(N, N, device=device)
+
+        # --- 設定 30 秒 ---
+        duration = 30
+        print(f'    - 🔥 Status: BURNING GPU for {duration} seconds with Live Monitor...')
+        print('-' * 80)
+
+        # 4. 燒機迴圈
+        start_time = time.time()
+
+        try:
+            while (time.time() - start_time) < duration:
+                # A. 產生負載
+                for _ in range(10):
+                    z = torch.mm(x, y)
+
+                # B. 監控數據
                 cmd = 'nvidia-smi --query-gpu=temperature.gpu,fan.speed,utilization.gpu,power.draw --format=csv,noheader,nounits'
                 try:
                     output = os.popen(cmd).read().strip()
@@ -109,61 +196,34 @@
                 except:
                     temp = fan = util = power = 'N/A'
 
-                # --- 階段 C: 顯示資訊 ---
-                sys.stdout.write(f'\r🌡️  Temp: {temp:>3}°C | 🌪️ Fan: {fan:>3}% | 📊 Load: {util:>3}% | ⚡ Power: {power:>6}W | Status: BURNING... ')
+                # C. 顯示資訊
+                elapsed = time.time() - start_time
+                remain = max(0, duration - elapsed)
+
+                msg = f'\r⏳ {remain:4.1f}s | 🌡️  Temp: {temp:>3}°C | 🌪️ Fan: {fan:>3}% | 📊 Load: {util:>3}% | ⚡ Power: {power:>6}W '
+                sys.stdout.write(msg)
                 sys.stdout.flush()
-                
+
                 time.sleep(0.5)
 
         except KeyboardInterrupt:
-            print('\n\n🛑 Test Stopped by User. Cooling down...')
-            del x, y, z
-            torch.cuda.empty_cache()
+            pass
+
+        sys.stdout.write('\n')
+        print('-' * 80)
+        print(f'[{time.strftime(\"%H:%M:%S\")}] ✅ Job {job_id} finished. GPU cooldown initiated.')
         EOF
         "
 
-    # 3.2 部署 Watch GPU (純監控腳本)
-    - name: 3.2 部署 watch_gpu.py (純監控不燒機)
-      shell: |
-        juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
-        cat <<EOF > watch_gpu.py
-        import time
-        import os
-        import sys
-
-        print('🔍 GPU Monitor Started... Press [Ctrl+C] to STOP!')
-        print('-' * 60)
-
-        try:
-            while True:
-                cmd = 'nvidia-smi --query-gpu=temperature.gpu,fan.speed,utilization.gpu,power.draw --format=csv,noheader,nounits'
-                output = os.popen(cmd).read().strip()
-                
-                try:
-                    parts = output.split(',')
-                    if len(parts) >= 4:
-                        temp = parts[0].strip()
-                        fan = parts[1].strip()
-                        util = parts[2].strip()
-                        power = parts[3].strip()
-                    else:
-                        temp = fan = util = power = 'N/A'
-                except:
-                    temp = fan = util = power = 'N/A'
-
-                sys.stdout.write(f'\r🌡️  Temp: {temp}°C | 🌪️ Fan: {fan}% | 📊 Load: {util}% | ⚡ Power: {power}W    ')
-                sys.stdout.flush()
-                
-                time.sleep(1)
-
-        except KeyboardInterrupt:
-            print('\n\n🛑 Monitoring Stopped.')
-        EOF
-        "
-
+    # ====================================================
+    # 4. 完成提示
+    # ====================================================
     - name: 🚀 完成提示
       debug:
         msg: 
           - "環境部署完畢！請登入 Worker: juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }}"
-          - "1. 執行燒機測試: ./gpu-test-env/bin/python burn_gpu.py"
-          - "2. 僅執行監控:   ./gpu-test-env/bin/python watch_gpu.py"
+          - "---------------------------------------------------------"
+          - "檔案 1 (手動壓力測試): ./gpu-test-env/bin/python burn_gpu.py"
+          - "檔案 2 (僅監控儀表板): ./gpu-test-env/bin/python watch_gpu.py"
+          - "檔案 3 (SLURM 排程用): ./gpu-test-env/bin/python Job_queue.py"
+          - "---------------------------------------------------------"
