@@ -150,11 +150,11 @@
           sudo snap restart dcgm.dcgm-exporter
         "
       changed_when: true
-          
-    - name: 2.6 更新 DCGM 指標清單 (加入風扇與記憶體溫度)
+      
+    - name: 2.6 設定 DCGM Exporter (強制掛載 CSV & 重啟)
       shell: |
         juju ssh -m {{ slurm_model }} {{ worker_id }} "
-          # 1. 寫入完整的自定義指標 (含 Fan Speed, Mem Temp)
+          # 1. 寫入 CSV (確保檔案存在)
           sudo bash -c 'cat <<EOF > /var/snap/dcgm/common/custom-metrics.csv
           DCGM_FI_DEV_DEC_UTIL,      gauge, Decoder utilization (in %).
           DCGM_FI_DEV_ENC_UTIL,      gauge, Encoder utilization (in %).
@@ -171,7 +171,14 @@
           DCGM_FI_DEV_MEMORY_TEMP,   gauge, Memory temperature (in C).
           EOF'
 
-          # 2. 重啟服務以套用新指標
+          # 2. [關鍵修正] 強制指定收集器路徑
+          # 建立 systemd override 來注入環境變數
+          sudo mkdir -p /etc/systemd/system/snap.dcgm.dcgm-exporter.service.d/
+          echo '[Service]
+          Environment=\"DCGM_EXPORTER_COLLECTORS=/var/snap/dcgm/common/custom-metrics.csv\"' | sudo tee /etc/systemd/system/snap.dcgm.dcgm-exporter.service.d/override.conf
+
+          # 3. 重載設定並重啟服務
+          sudo systemctl daemon-reload
           sudo snap restart dcgm.dcgm-exporter
         "
       changed_when: true
