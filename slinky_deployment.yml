@@ -1,18 +1,21 @@
 ---
 # ==========================================
-# SKU: Slinky-MicroK8s-v3.1 (Syntax Fix)
-# 目標：建立一個具備高度擴充性的生產級架構
-# 修正：移除 Shell 模組內的中文註解與引號，避免 Jinja2 解析錯誤
+# SKU: Slinky-MicroK8s-v4.0 (Pure CLI)
+# 目標：不使用 YAML 文件，純粹透過 Juju Charm 指令部署
+# 架構：
+#   1. k8s-master (App): 綁定 tags=virtual
+#   2. k8s-worker (App): 綁定 tags=slurm-node
+#   3. 自動 Integrate
 # ==========================================
-- name: Infrastructure Test - Scalable MicroK8s Deployment
+- name: Infrastructure Test - Scalable MicroK8s Deployment (CLI)
   hosts: maasjuju
   gather_facts: no
   vars:
     test_model: "slinky-cluster"
     k8s_channel: "1.28/stable"
+    # 定義約束條件
     constraint_master: "tags=virtual"
     constraint_worker: "tags=slurm-node"
-    bundle_path: "/tmp/slinky-scalable-bundle.yaml"
 
   tasks:
     # -------------------------------------------------------
@@ -34,63 +37,68 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 定義可擴充架構 (Bundle)
+    # 2. 部署控制平面 (Master)
+    # 說明：直接在 deploy 指令中帶入 config 和 constraints
     # -------------------------------------------------------
-    - name: 2.1 產生 Scalable Bundle YAML 文件
-      copy:
-        dest: "{{ bundle_path }}"
-        content: |
-          description: Slinky Scalable Cluster
-          series: jammy
-          applications:
-            k8s-master:
-              charm: microk8s
-              channel: {{ k8s_channel }}
-              num_units: 1
-              constraints: {{ constraint_master }}
-              options:
-                hostpath_storage: "true"
-                dns: "true"
-                rbac: "true"
-            k8s-worker:
-              charm: microk8s
-              channel: {{ k8s_channel }}
-              num_units: 1
-              constraints: {{ constraint_worker }}
-              options:
-                hostpath_storage: "true"
-                dns: "true"
-                rbac: "true"
-          relations:
-            - ["k8s-master:microk8s", "k8s-worker:microk8s"]
+    - name: 2.1 部署 k8s-master (VM)
+      shell: |
+        juju deploy microk8s k8s-master \
+          --model {{ test_model }} \
+          --channel {{ k8s_channel }} \
+          --constraints "{{ constraint_master }}" \
+          --config hostpath_storage=true \
+          --config dns=true \
+          --config rbac=true
 
     # -------------------------------------------------------
-    # 3. 執行部署 (Fire and Forget)
+    # 3. 部署運算平面 (Worker)
+    # 說明：這是未來擴充的基礎，新增節點也會使用這個 App 名稱
     # -------------------------------------------------------
-    - name: 3.1 部署 Scalable Bundle
+    - name: 3.1 部署 k8s-worker (GPU Bare Metal)
       shell: |
-        juju deploy {{ bundle_path }} --model {{ test_model }}
+        juju deploy microk8s k8s-worker \
+          --model {{ test_model }} \
+          --channel {{ k8s_channel }} \
+          --constraints "{{ constraint_worker }}" \
+          --config hostpath_storage=true \
+          --config dns=true \
+          --config rbac=true
 
     # -------------------------------------------------------
-    # 4. 部署後驗收 (等待 MaaS 安裝 OS)
+    # 4. 建立關聯 (Integrate)
+    # 說明：這裡必須使用 Retry，因為 CLI 下指令很快，但 Charm 下載需要時間
     # -------------------------------------------------------
-    - name: 4.1 等待 Master 與 Worker 就緒
+    - name: 4.1 連接 Master 與 Worker
       shell: |
+        juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
+      register: integrate_result
+      until: integrate_result.rc == 0
+      retries: 60       # 給予 10 分鐘讓 Charm Metadata 下載完成
+      delay: 10
+      ignore_errors: yes
+
+    # -------------------------------------------------------
+    # 5. 部署後驗收 (等待 OS 安裝)
+    # -------------------------------------------------------
+    - name: 5.1 等待 Master 與 Worker 就緒
+      shell: |
+        # 監控 agent-status 是否變為 started (active)
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
       register: machine_ready
       until: machine_ready.stdout | int >= 2
-      retries: 240  # 40 分鐘
+      retries: 240  # 40 分鐘 (裸機安裝時間)
       delay: 10
       ignore_errors: yes 
 
     # -------------------------------------------------------
-    # 5. 針對 Worker 群組啟用 GPU
+    # 6. 功能啟用 (GPU)
     # -------------------------------------------------------
-    - name: 5.1 在 Worker 群組啟用 GPU
+    - name: 6.1 在 Worker 群組啟用 GPU
       shell: |
+        # 針對 k8s-worker 群組的第一個單元啟用
         juju run k8s-worker/0 enable addon=gpu --model {{ test_model }}
       ignore_errors: yes
 
-    - name: ✅ 架構部署完成
+    - name: ✅ 部署指令完成
       debug:
-        msg: "可擴充架構 (Bundle) 部署請求已完成。請持續監控 Juju Status 直到 OS 安裝完畢。"
+        msg: "CLI 部署已完成。Juju 正在背景處理 MaaS 機器申請與 OS 安裝。"
