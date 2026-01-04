@@ -151,35 +151,25 @@
         "
       changed_when: true
       
-    - name: 2.6 設定 DCGM Exporter (強制掛載 CSV & 重啟)
+    - name: 2.6 設定 DCGM Exporter (終極版：寫入所有關鍵指標 & 重啟)
       shell: |
         juju ssh -m {{ slurm_model }} {{ worker_id }} "
-          # 1. 寫入 CSV (確保檔案存在)
-          sudo bash -c 'cat <<EOF > /var/snap/dcgm/common/custom-metrics.csv
-          DCGM_FI_DEV_DEC_UTIL,      gauge, Decoder utilization (in %).
-          DCGM_FI_DEV_ENC_UTIL,      gauge, Encoder utilization (in %).
-          DCGM_FI_DEV_GPU_TEMP,      gauge, GPU temperature (in C).
-          DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %).
-          DCGM_FI_DEV_MEM_CLOCK,     gauge, Memory clock frequency (in MHz).
-          DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
-          DCGM_FI_DEV_POWER_USAGE,   gauge, Power usage (in W).
-          DCGM_FI_DEV_SM_CLOCK,      gauge, SM clock frequency (in MHz).
-          DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption since boot (in mJ).
-          DCGM_FI_DEV_FB_USED,       gauge, Framebuffer memory used (in MiB).
-          DCGM_FI_DEV_FB_FREE,       gauge, Framebuffer memory free (in MiB).
-          DCGM_FI_DEV_FAN_SPEED,     gauge, Fan speed (in %).
-          DCGM_FI_DEV_MEMORY_TEMP,   gauge, Memory temperature (in C).
-          EOF'
+          # 1. [清理] 移除舊檔
+          sudo rm -f /var/snap/dcgm/common/custom-metrics.csv
 
-          # 2. [關鍵修正] 強制指定收集器路徑
-          # 建立 systemd override 來注入環境變數
+          # 2. [寫入] 使用 printf 寫入完整指標清單 (包含 PCIe, XID, Power, Clocks, Fan)
+          # 注意：描述中的 % 符號已轉義為 %% 以防止 printf 錯誤
+          sudo bash -c 'printf \"DCGM_FI_DEV_DEC_UTIL,      gauge, Decoder utilization (in %%%%)\nDCGM_FI_DEV_ENC_UTIL,      gauge, Encoder utilization (in %%%%)\nDCGM_FI_DEV_GPU_TEMP,      gauge, GPU temperature (in C)\nDCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %%%%)\nDCGM_FI_DEV_MEM_CLOCK,     gauge, Memory clock frequency (in MHz)\nDCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %%%%)\nDCGM_FI_DEV_POWER_USAGE,   gauge, Power usage (in W)\nDCGM_FI_DEV_SM_CLOCK,      gauge, SM clock frequency (in MHz)\nDCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption since boot (in mJ)\nDCGM_FI_DEV_FB_USED,       gauge, Framebuffer memory used (in MiB)\nDCGM_FI_DEV_FB_FREE,       gauge, Framebuffer memory free (in MiB)\nDCGM_FI_DEV_FAN_SPEED,     gauge, Fan speed (in %%%%)\nDCGM_FI_DEV_MEMORY_TEMP,   gauge, Memory temperature (in C)\nDCGM_FI_DEV_PCIE_TX_THROUGHPUT, gauge, PCIe TX throughput (in KB/s)\nDCGM_FI_DEV_PCIE_RX_THROUGHPUT, gauge, PCIe RX throughput (in KB/s)\nDCGM_FI_DEV_PCIE_REPLAY_COUNTER, counter, PCIe replay counter\nDCGM_FI_DEV_XID_ERRORS,    gauge, Value of the last XID error encountered\nDCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Total double-bit ECC errors\nDCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Total single-bit ECC errors\" > /var/snap/dcgm/common/custom-metrics.csv'
+
+          # 3. [設定] 強制指定收集器路徑
           sudo mkdir -p /etc/systemd/system/snap.dcgm.dcgm-exporter.service.d/
           echo '[Service]
           Environment=\"DCGM_EXPORTER_COLLECTORS=/var/snap/dcgm/common/custom-metrics.csv\"' | sudo tee /etc/systemd/system/snap.dcgm.dcgm-exporter.service.d/override.conf
 
-          # 3. 重載設定並重啟服務
+          # 4. [重啟] 確保套用
           sudo systemctl daemon-reload
-          sudo snap restart dcgm.dcgm-exporter
+          sudo snap stop dcgm.dcgm-exporter
+          sudo snap start dcgm.dcgm-exporter
         "
       changed_when: true
           
