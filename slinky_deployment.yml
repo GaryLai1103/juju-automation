@@ -1,10 +1,11 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.6 (Final Polish)
+# SKU: Infra-Test-MicroK8s-v0.7 (Retry Logic)
 # 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
 # 修正：
-#   1. 整合增強版 Cleanup 與 Metadata 等待邏輯
-#   2. 修正 Task 4 的 Juju Action 名稱 (microk8s-enable -> enable)
+#   1. 移除無效的 Metadata 檢查
+#   2. 在 "juju integrate" 加入 Retry 機制，解決 Race Condition
+#   3. 修正 Action 名稱為 "enable"
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -55,23 +56,16 @@
           --base {{ target_os }}
 
     # -------------------------------------------------------
-    # 2.3 關鍵修正：等待 Charm Metadata 載入
-    # -------------------------------------------------------
-    - name: 2.3 等待 Charm 定義檔載入 (防止 Relation 報錯)
-      shell: |
-        juju show-application k8s-master -m {{ test_model }}
-      register: app_info
-      until: '"microk8s" in app_info.stdout'
-      retries: 60
-      delay: 5
-      ignore_errors: yes 
-
-    # -------------------------------------------------------
-    # 3. 建立關聯 (Clustering)
+    # 3. 建立關聯 (整合 Retry 機制)
+    # 說明：如果報錯 "no relation"，Ansible 會等待並重試，直到 Charm 載入完畢
     # -------------------------------------------------------
     - name: 3.1 建立 Master 與 Worker 的叢集關係
       shell: |
         juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
+      register: integrate_result
+      until: integrate_result.rc == 0
+      retries: 20       # 最多重試 20 次
+      delay: 10         # 每次間隔 10 秒 (總共給 Juju 200秒的時間來下載定義檔)
 
     # -------------------------------------------------------
     # 4. 部署後驗收與功能啟用
@@ -85,12 +79,17 @@
       delay: 10
       ignore_errors: yes 
 
-    - name: 4.2 啟用基礎設施插件 (修正 Action 名稱)
+    - name: 4.2 啟用基礎設施插件 (Action: enable)
       shell: |
         # 修正：MicroK8s Charm 的動作名稱是 "enable"
+        # 我們也加上 Retry，防止機器剛開機還沒準備好接 Action
         juju run k8s-master/0 enable addon=dns --model {{ test_model }}
         juju run k8s-master/0 enable addon=rbac --model {{ test_model }}
         juju run k8s-master/0 enable addon=hostpath-storage --model {{ test_model }}
+      register: action_result
+      until: action_result.rc == 0
+      retries: 5
+      delay: 10
       ignore_errors: yes
 
     - name: 4.3 在 Worker 啟用 GPU
