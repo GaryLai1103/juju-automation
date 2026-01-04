@@ -1,30 +1,35 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.1
+# SKU: Infra-Test-MicroK8s-v0.2 (Fix Race Condition)
 # 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
+# 修正：移除 async/poll，確保 App 註冊完成才進行整合
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
   gather_facts: no
   vars:
-    # 測試用的 Model 名稱，測試完可隨時刪除
     test_model: "slinky-cluster"
     target_os: "ubuntu@22.04"
-    # Channel: 使用 1.28 或 1.29 較為穩定，或者直接測 1.32
     k8s_channel: "1.32/stable"
-    
-    # 定義 MaaS Tags (請確認您的 MaaS 機器已有這些 Tag)
-    master_tag: "virtual"    # 用於 Control Plane
-    worker_tag: "slurm-node" # 用於 GPU Worker
+    master_tag: "virtual"
+    worker_tag: "slurm-node"
 
   tasks:
-    # 1. 環境清理與初始化
-    - name: 1.1 確保測試 Model 是乾淨的 (若存在則忽略錯誤)
-      shell: juju add-model {{ test_model }}
+    # 1. 環境清理 (確保是一個乾淨的開始)
+    - name: 1.0 強制清理舊的測試模型 (若存在)
+      shell: juju destroy-model {{ test_model }} --force --no-wait --destroy-storage
       ignore_errors: yes
 
-    # 2. 請求機器 (Juju -> MaaS)
-    - name: 2.1 請求 Control Plane 節點
+    - name: 1.1 等待模型釋放
+      pause:
+        seconds: 10
+
+    - name: 1.2 建立全新 Juju Model
+      shell: juju add-model {{ test_model }}
+
+    # 2. 請求機器 (同步模式 - Sync Mode)
+    # 說明：移除 async/poll，讓 Ansible 等待 Juju 回傳 "App Created" 訊號
+    - name: 2.1 請求 Control Plane (k8s-master)
       shell: |
         juju deploy microk8s k8s-master \
           --model {{ test_model }} \
@@ -34,10 +39,8 @@
           --config hostpath_storage=true \
           --config dns=true \
           --config rbac=true
-      async: 600
-      poll: 0
 
-    - name: 2.2 請求 GPU Worker 節點
+    - name: 2.2 請求 GPU Worker (k8s-worker)
       shell: |
         juju deploy microk8s k8s-worker \
           --model {{ test_model }} \
@@ -47,34 +50,37 @@
           --config hostpath_storage=true \
           --config dns=true \
           --config rbac=true
-      async: 600
-      poll: 0
+
+    # 2.3 安全檢查：確保 App 已在庫中
+    - name: 2.3 等待應用程式物件建立
+      shell: juju status -m {{ test_model }} --format json | jq -r '.applications | keys[]'
+      register: app_list
+      until: '"k8s-master" in app_list.stdout and "k8s-worker" in app_list.stdout'
+      retries: 20
+      delay: 3
 
     # 3. 建立關聯 (Clustering)
     - name: 3.1 建立 Master 與 Worker 的叢集關係
       shell: |
-        # 這會觸發 MicroK8s 的 join 動作
         juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
 
-    # 4. 啟用 GPU (關鍵測試點)
-    - name: 4.1 等待 Juju 部署完成 (主動輪詢)
+    # 4. 部署後驗收
+    - name: 4.1 等待機器分配與部署 (這一步會比較久)
       shell: |
-        # 簡單檢查是否所有 Unit 都進入 active 或 idle 狀態
-        # 若還在 allocating 或 executing 則失敗重試
-        juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -v "started" | wc -l
-      register: status_check
-      until: status_check.stdout == "0"
-      retries: 60  # 等待 10 分鐘
+        # 檢查是否所有 Unit 都已脫離 "allocating" 或 "pending" 狀態
+        juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
+      register: machine_ready
+      # 我們期待至少 2 台機器 ready
+      until: machine_ready.stdout | int >= 2
+      retries: 100  # 約 16 分鐘 (10s * 100)
       delay: 10
-      ignore_errors: yes # 允許超時，讓我們手動檢查
+      ignore_errors: yes 
 
     - name: 4.2 在 Worker 啟用 GPU Addon
       shell: |
-        # 針對 Worker Unit 啟用 GPU
-        # 注意：Juju unit 名稱通常是 application-name/0
         juju run k8s-worker/0 microk8s-enable addon=gpu --model {{ test_model }}
-      ignore_errors: yes # 若硬體沒準備好可能會報錯，先忽略以便除錯
+      ignore_errors: yes
 
-    - name: ✅ 測試部署請求已發送
+    - name: ✅ 部署指令完成
       debug:
-        msg: "Juju 指令已全部發送。請登入 maasjuju 透過 CLI 進行詳細驗收。"
+        msg: "基礎建設部署請求已完成。請登入 maasjuju 使用 'juju status -m {{ test_model }} --watch 1s' 查看即時進度。"
