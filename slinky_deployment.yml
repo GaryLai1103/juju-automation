@@ -1,8 +1,8 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.2 (Fix Race Condition)
+# SKU: Infra-Test-MicroK8s-v0.3 (Fix Channel)
 # 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
-# 修正：移除 async/poll，確保 App 註冊完成才進行整合
+# 修正：降級 Channel 至 1.28/stable 以符合 Charm Store 現況
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -10,7 +10,10 @@
   vars:
     test_model: "slinky-cluster"
     target_os: "ubuntu@22.04"
-    k8s_channel: "1.32/stable"
+    
+    # [修正] 根據報錯日誌，改用目前可用的最高穩定版
+    k8s_channel: "1.28/stable"
+    
     master_tag: "virtual"
     worker_tag: "slurm-node"
 
@@ -22,13 +25,12 @@
 
     - name: 1.1 等待模型釋放
       pause:
-        seconds: 10
+        seconds: 15  # 稍微增加等待時間讓 MaaS 回收機器
 
     - name: 1.2 建立全新 Juju Model
       shell: juju add-model {{ test_model }}
 
-    # 2. 請求機器 (同步模式 - Sync Mode)
-    # 說明：移除 async/poll，讓 Ansible 等待 Juju 回傳 "App Created" 訊號
+    # 2. 請求機器 (同步模式)
     - name: 2.1 請求 Control Plane (k8s-master)
       shell: |
         juju deploy microk8s k8s-master \
@@ -51,13 +53,13 @@
           --config dns=true \
           --config rbac=true
 
-    # 2.3 安全檢查：確保 App 已在庫中
+    # 2.3 安全檢查：確保 App 已在庫中 (關鍵修正：避免 Race Condition)
     - name: 2.3 等待應用程式物件建立
       shell: juju status -m {{ test_model }} --format json | jq -r '.applications | keys[]'
       register: app_list
       until: '"k8s-master" in app_list.stdout and "k8s-worker" in app_list.stdout'
       retries: 20
-      delay: 3
+      delay: 5
 
     # 3. 建立關聯 (Clustering)
     - name: 3.1 建立 Master 與 Worker 的叢集關係
@@ -65,14 +67,14 @@
         juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
 
     # 4. 部署後驗收
-    - name: 4.1 等待機器分配與部署 (這一步會比較久)
+    - name: 4.1 等待機器分配與部署 (這一步會比較久，因為要下載 image)
       shell: |
-        # 檢查是否所有 Unit 都已脫離 "allocating" 或 "pending" 狀態
+        # 檢查是否所有 Unit 都已進入 "started" 或 "active" 狀態
+        # 注意：MicroK8s 有時會顯示 "active" 有時是 "started"
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
       register: machine_ready
-      # 我們期待至少 2 台機器 ready
       until: machine_ready.stdout | int >= 2
-      retries: 100  # 約 16 分鐘 (10s * 100)
+      retries: 100  # 約 16 分鐘
       delay: 10
       ignore_errors: yes 
 
@@ -83,4 +85,4 @@
 
     - name: ✅ 部署指令完成
       debug:
-        msg: "基礎建設部署請求已完成。請登入 maasjuju 使用 'juju status -m {{ test_model }} --watch 1s' 查看即時進度。"
+        msg: "基礎建設部署請求已完成 (v1.28)。請登入 maasjuju 使用 'juju status -m {{ test_model }} --watch 1s' 查看即時進度。"
