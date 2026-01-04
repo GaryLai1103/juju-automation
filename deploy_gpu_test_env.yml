@@ -135,8 +135,8 @@
         EOF
         "
 
-    # 3.3 部署 SLURM 排程測試腳本 (新增的部分)
-    - name: 3.3 部署 Job_queue.py (30秒排程測試 + SLURM 整合)
+    # 3.3 部署 SLURM 排程測試腳本 (使用您驗證過可行的版本)
+    - name: 3.3 部署 Job_queue.py (30秒排程測試 - 用戶驗證版)
       shell: |
         juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
         cat << 'EOF' > Job_queue.py
@@ -168,7 +168,7 @@
         y = torch.randn(N, N, device=device)
 
         # --- 設定 30 秒 ---
-        duration = 30
+        duration = 30 
         print(f'    - 🔥 Status: BURNING GPU for {duration} seconds with Live Monitor...')
         print('-' * 80)
 
@@ -199,17 +199,17 @@
                 # C. 顯示資訊
                 elapsed = time.time() - start_time
                 remain = max(0, duration - elapsed)
-
+                
                 msg = f'\r⏳ {remain:4.1f}s | 🌡️  Temp: {temp:>3}°C | 🌪️ Fan: {fan:>3}% | 📊 Load: {util:>3}% | ⚡ Power: {power:>6}W '
                 sys.stdout.write(msg)
                 sys.stdout.flush()
-
+                
                 time.sleep(0.5)
 
         except KeyboardInterrupt:
             pass
 
-        sys.stdout.write('\n')
+        sys.stdout.write('\n') 
         print('-' * 80)
         print(f'[{time.strftime(\"%H:%M:%S\")}] ✅ Job {job_id} finished. GPU cooldown initiated.')
         EOF
