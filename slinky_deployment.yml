@@ -1,10 +1,10 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.5 (Enhanced Cleanup)
+# SKU: Infra-Test-MicroK8s-v0.6 (Final Polish)
 # 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
 # 修正：
-#   1. 使用更嚴謹的 destroy-model 錯誤判斷 (User Contribution)
-#   2. 修正 MicroK8s 1.28 部署時不可使用 config 的問題
+#   1. 整合增強版 Cleanup 與 Metadata 等待邏輯
+#   2. 修正 Task 4 的 Juju Action 名稱 (microk8s-enable -> enable)
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -12,32 +12,31 @@
   vars:
     test_model: "slinky-cluster"
     target_os: "ubuntu@22.04"
-    k8s_channel: "1.28/stable" # 維持 1.28 以確保穩定性
+    k8s_channel: "1.28/stable"
     master_tag: "virtual"
     worker_tag: "slurm-node"
 
   tasks:
     # -------------------------------------------------------
-    # 1. 環境清理 (採用您提供的增強版邏輯)
+    # 1. 環境清理
     # -------------------------------------------------------
     - name: 1.0 強制清理舊的測試模型 (若存在)
-      # 這行指令會強制刪除模型，並釋放 MAAS 機器回到 Ready 狀態
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
       failed_when: 
         - destroy_result.rc != 0 
-        - '"not found" not in destroy_result.stderr' # 如果模型本來就不在，不算失敗
+        - '"not found" not in destroy_result.stderr'
       ignore_errors: yes
 
     - name: 1.1 等待模型完全釋放
       pause:
-        seconds: 10 # 緩衝時間，確保 MaaS 狀態同步
+        seconds: 15
 
     - name: 1.2 建立全新 Juju Model
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 請求機器 (Clean Deploy - 無 Config)
+    # 2. 請求機器 (無 Config 部署)
     # -------------------------------------------------------
     - name: 2.1 請求 Control Plane (k8s-master)
       shell: |
@@ -56,15 +55,12 @@
           --base {{ target_os }}
 
     # -------------------------------------------------------
-    # 2.3 修正後的等待邏輯：等待 Charm Metadata 載入
-    # 說明：我們檢查 Juju 是否已經知道這個 App 支援 "microk8s" 關聯
+    # 2.3 關鍵修正：等待 Charm Metadata 載入
     # -------------------------------------------------------
     - name: 2.3 等待 Charm 定義檔載入 (防止 Relation 報錯)
       shell: |
-        # 查詢應用的詳細資訊，如果 metadata 沒載入，這行通常會失敗或內容不全
         juju show-application k8s-master -m {{ test_model }}
       register: app_info
-      # 我們等待直到輸出內容包含 "microk8s" 這個字眼 (代表關聯定義已載入)
       until: '"microk8s" in app_info.stdout'
       retries: 60
       delay: 5
@@ -76,13 +72,12 @@
     - name: 3.1 建立 Master 與 Worker 的叢集關係
       shell: |
         juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
-        
+
     # -------------------------------------------------------
-    # 4. 部署後驗收與功能啟用 (Day 2 Ops)
+    # 4. 部署後驗收與功能啟用
     # -------------------------------------------------------
-    - name: 4.1 等待機器分配與部署 (這一步會比較久)
+    - name: 4.1 等待機器分配與部署 (這一步會最久)
       shell: |
-        # 等待直到至少有 2 台機器進入 started 狀態
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
       register: machine_ready
       until: machine_ready.stdout | int >= 2
@@ -90,17 +85,17 @@
       delay: 10
       ignore_errors: yes 
 
-    - name: 4.2 啟用基礎設施插件 (DNS, RBAC, Storage)
+    - name: 4.2 啟用基礎設施插件 (修正 Action 名稱)
       shell: |
-        # 這些是 Slinky 運作的必要條件
-        juju run k8s-master/0 microk8s-enable addon=dns --model {{ test_model }}
-        juju run k8s-master/0 microk8s-enable addon=rbac --model {{ test_model }}
-        juju run k8s-master/0 microk8s-enable addon=hostpath-storage --model {{ test_model }}
+        # 修正：MicroK8s Charm 的動作名稱是 "enable"
+        juju run k8s-master/0 enable addon=dns --model {{ test_model }}
+        juju run k8s-master/0 enable addon=rbac --model {{ test_model }}
+        juju run k8s-master/0 enable addon=hostpath-storage --model {{ test_model }}
       ignore_errors: yes
 
     - name: 4.3 在 Worker 啟用 GPU
       shell: |
-        juju run k8s-worker/0 microk8s-enable addon=gpu --model {{ test_model }}
+        juju run k8s-worker/0 enable addon=gpu --model {{ test_model }}
       ignore_errors: yes
 
     - name: ✅ 部署指令完成
