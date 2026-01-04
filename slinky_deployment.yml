@@ -8,7 +8,7 @@
   gather_facts: no
   vars:
     # 測試用的 Model 名稱，測試完可隨時刪除
-    test_model: "infra-test"
+    test_model: "slinky-cluster"
     target_os: "ubuntu@22.04"
     # Channel: 使用 1.28 或 1.29 較為穩定，或者直接測 1.32
     k8s_channel: "1.32/stable"
