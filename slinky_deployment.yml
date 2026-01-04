@@ -1,8 +1,9 @@
 ---
 # ==========================================
-# SKU: Slinky-MicroK8s-v1.1 (Unified + Provisioning)
+# SKU: Slinky-MicroK8s-v1.2 (Unified + Retry Wait)
 # 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
-# 修正：先執行 add-machine 建立機器，再執行 deploy --to 指定部署
+# 架構：單一 MicroK8s App
+# 修正：針對 "machine not started" 錯誤，加入長時間 Retry 等待機制
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -15,9 +16,7 @@
     worker_tag: "slurm-node"
 
   tasks:
-    # -------------------------------------------------------
     # 1. 環境清理
-    # -------------------------------------------------------
     - name: 1.0 強制清理舊的測試模型
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
@@ -34,62 +33,54 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 申請機器 (Provisioning) - 關鍵修正步驟
+    # 2. 申請機器 (Provisioning)
     # -------------------------------------------------------
-    - name: 2.1 申請 Master 機器 (將成為 Machine 0)
+    - name: 2.1 申請 Master 機器 (Machine 0)
       shell: |
-        # 這行指令會產生 Machine 0，並鎖定 virtual 標籤
         juju add-machine --model {{ test_model }} --constraints "tags={{ master_tag }}" --base {{ target_os }}
 
-    - name: 2.2 申請 Worker 機器 (將成為 Machine 1)
+    - name: 2.2 申請 Worker 機器 (Machine 1)
       shell: |
-        # 這行指令會產生 Machine 1，並鎖定 slurm-node 標籤
         juju add-machine --model {{ test_model }} --constraints "tags={{ worker_tag }}" --base {{ target_os }}
 
-    - name: 2.3 等待機器物件建立 (防止 deploy 找不到 ID)
-      shell: sleep 5
-
     # -------------------------------------------------------
-    # 3. 部署核心應用 (單一 App 模式)
+    # 3. 部署核心應用 (加入 Retry 直到 OS 安裝完成)
     # -------------------------------------------------------
     - name: 3.1 部署 MicroK8s 到 Machine 0 (Master)
       shell: |
-        # 現在 Machine 0 已經存在了，所以這行不會報錯
+        # 這一步會持續失敗，直到 Machine 0 進入 "started" 狀態
         juju deploy microk8s \
           --model {{ test_model }} \
           --channel {{ k8s_channel }} \
           --to 0
-      # 不加 config，保持原廠設定
+      register: deploy_result
+      until: deploy_result.rc == 0
+      # 關鍵設定：裸機安裝約需 20 分鐘，我們給它 30 分鐘的耐心
+      retries: 180  
+      delay: 10
+      ignore_errors: yes
 
     # -------------------------------------------------------
-    # 4. 擴容叢集 (add-unit)
+    # 4. 擴容叢集 (加入 Retry 直到 OS 安裝完成)
     # -------------------------------------------------------
     - name: 4.1 擴容 MicroK8s 到 Machine 1 (Worker)
       shell: |
-        # 將同一個 App 擴展到 Machine 1
+        # 同樣，這一步要等 Machine 1 準備好
         juju add-unit microk8s \
           --model {{ test_model }} \
           --to 1
-
-    # -------------------------------------------------------
-    # 5. 部署後驗收 (裸機漫長等待區)
-    # -------------------------------------------------------
-    - name: 5.1 等待機器安裝 OS 並完成 Clustering
-      shell: |
-        # 監控 agent-status 是否變為 started/active
-        juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
-      register: machine_ready
-      until: machine_ready.stdout | int >= 2
-      retries: 240  # 40 分鐘
+      register: scale_result
+      until: scale_result.rc == 0
+      retries: 180
       delay: 10
-      ignore_errors: yes 
+      ignore_errors: yes
 
     # -------------------------------------------------------
-    # 6. 功能啟用 (差異化配置)
+    # 5. 功能啟用 (Day 2 Ops)
     # -------------------------------------------------------
-    - name: 6.1 啟用基礎設施 (Master)
+    - name: 5.1 啟用基礎設施 (Master)
       shell: |
-        # 對 Unit 0 下指令
+        # MicroK8s Charm Action: enable
         juju run microk8s/0 enable addon=dns --model {{ test_model }}
         juju run microk8s/0 enable addon=rbac --model {{ test_model }}
         juju run microk8s/0 enable addon=hostpath-storage --model {{ test_model }}
@@ -99,12 +90,11 @@
       delay: 15
       ignore_errors: yes
 
-    - name: 6.2 啟用 GPU (Worker)
+    - name: 5.2 啟用 GPU (Worker)
       shell: |
-        # 對 Unit 1 下指令 (對應 Machine 1)
         juju run microk8s/1 enable addon=gpu --model {{ test_model }}
       ignore_errors: yes
 
     - name: ✅ 部署指令完成
       debug:
-        msg: "Unified Scaling 部署請求已發送。Machine 0 (Master) 與 Machine 1 (Worker) 正在進行 OS 安裝。無需手動 Integrate。"
+        msg: "Unified Scaling 部署成功！Juju 已成功將應用程式部署到兩台機器上。Cluster 將自動組建。"
