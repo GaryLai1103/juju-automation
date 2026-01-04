@@ -139,7 +139,7 @@
     - name: 3.3 部署 Job_quene.py (30秒排程測試 - 用戶驗證版)
       shell: |
         juju ssh -m {{ slurm_model }} {{ worker_id_result.stdout }} "
-        cat << 'EOF' > Job_queue.py
+        cat << 'EOF' > Job_quene.py
         import torch
         import time
         import os
