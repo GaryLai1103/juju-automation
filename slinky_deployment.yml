@@ -1,8 +1,10 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.4 (Fix Unknown Option)
+# SKU: Infra-Test-MicroK8s-v0.5 (Enhanced Cleanup)
 # 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
-# 修正：移除 deploy 階段無效的 config，改為 Post-Deploy Action 啟用
+# 修正：
+#   1. 使用更嚴謹的 destroy-model 錯誤判斷 (User Contribution)
+#   2. 修正 MicroK8s 1.28 部署時不可使用 config 的問題
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -10,30 +12,33 @@
   vars:
     test_model: "slinky-cluster"
     target_os: "ubuntu@22.04"
-    k8s_channel: "1.28/stable" # 維持 1.28
+    k8s_channel: "1.28/stable" # 維持 1.28 以確保穩定性
     master_tag: "virtual"
     worker_tag: "slurm-node"
 
   tasks:
-    # 1. 環境清理
+    # -------------------------------------------------------
+    # 1. 環境清理 (採用您提供的增強版邏輯)
+    # -------------------------------------------------------
     - name: 1.0 強制清理舊的測試模型 (若存在)
       # 這行指令會強制刪除模型，並釋放 MAAS 機器回到 Ready 狀態
-      command: "juju destroy-model {{ k8s_model }} --no-prompt --force --destroy-storage"
+      command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
       failed_when: 
         - destroy_result.rc != 0 
         - '"not found" not in destroy_result.stderr' # 如果模型本來就不在，不算失敗
       ignore_errors: yes
 
-    - name: 1.1 等待模型釋放
+    - name: 1.1 等待模型完全釋放
       pause:
-        seconds: 15
+        seconds: 10 # 緩衝時間，確保 MaaS 狀態同步
 
     - name: 1.2 建立全新 Juju Model
       shell: juju add-model {{ test_model }}
 
-    # 2. 請求機器 (Clean Deploy)
-    # 說明：移除所有 --config 選項，先讓機器跑起來再說
+    # -------------------------------------------------------
+    # 2. 請求機器 (Clean Deploy - 無 Config)
+    # -------------------------------------------------------
     - name: 2.1 請求 Control Plane (k8s-master)
       shell: |
         juju deploy microk8s k8s-master \
@@ -50,7 +55,9 @@
           --constraints "tags={{ worker_tag }}" \
           --base {{ target_os }}
 
-    # 2.3 安全檢查
+    # -------------------------------------------------------
+    # 2.3 安全檢查 (防止 Race Condition)
+    # -------------------------------------------------------
     - name: 2.3 等待應用程式物件建立
       shell: juju status -m {{ test_model }} --format json | jq -r '.applications | keys[]'
       register: app_list
@@ -58,13 +65,17 @@
       retries: 20
       delay: 5
 
+    # -------------------------------------------------------
     # 3. 建立關聯 (Clustering)
+    # -------------------------------------------------------
     - name: 3.1 建立 Master 與 Worker 的叢集關係
       shell: |
         juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
 
+    # -------------------------------------------------------
     # 4. 部署後驗收與功能啟用 (Day 2 Ops)
-    - name: 4.1 等待機器分配與部署
+    # -------------------------------------------------------
+    - name: 4.1 等待機器分配與部署 (這一步會比較久)
       shell: |
         # 等待直到至少有 2 台機器進入 started 狀態
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
@@ -74,13 +85,9 @@
       delay: 10
       ignore_errors: yes 
 
-    # -------------------------------------------------------
-    # 關鍵修正：透過 Action 啟用 DNS, RBAC, Storage, GPU
-    # -------------------------------------------------------
     - name: 4.2 啟用基礎設施插件 (DNS, RBAC, Storage)
       shell: |
-        # 在 Master 節點啟用通用服務
-        # 注意：MicroK8s 的 addon 啟用通常會自動同步到整個 cluster
+        # 這些是 Slinky 運作的必要條件
         juju run k8s-master/0 microk8s-enable addon=dns --model {{ test_model }}
         juju run k8s-master/0 microk8s-enable addon=rbac --model {{ test_model }}
         juju run k8s-master/0 microk8s-enable addon=hostpath-storage --model {{ test_model }}
@@ -88,7 +95,6 @@
 
     - name: 4.3 在 Worker 啟用 GPU
       shell: |
-        # GPU 必須針對有顯卡的節點啟用
         juju run k8s-worker/0 microk8s-enable addon=gpu --model {{ test_model }}
       ignore_errors: yes
 
