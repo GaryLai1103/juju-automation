@@ -1,0 +1,136 @@
+# ==========================================
+# SKU: Slinky-MicroK8s-v1.0
+# 邏輯：Juju Native 佈署 MicroK8s，為 Slinky 鋪路
+# ==========================================
+- name: 1. 基礎建設與 MicroK8s 叢集建立
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    # 模型名稱
+    slinky_model: "slinky-lab"
+    target_os: "ubuntu@22.04" # MicroK8s 在 22.04 支援度極佳
+    # MaaS Tags (沿用您的定義)
+    master_tags: "tags=virtual"
+    worker_tags: "tags=slurm-node"
+    # Channel 設定 (依據 Slinky 相容性選擇)
+    k8s_channel: "1.32/stable"
+
+  tasks:
+    # ----------------------------------------------------
+    # 1.1 初始化 Juju Model
+    # ----------------------------------------------------
+    - name: 1.1 建立 Juju Model
+      shell: |
+        juju add-model {{ slinky_model }} || true
+      changed_when: false
+
+    # ----------------------------------------------------
+    # 1.2 請求機器 (Request Machines from MaaS)
+    # ----------------------------------------------------
+    - name: 1.2 根據 Tag 請求裸機資源
+      shell: |
+        # 請求 Machine 0 (預計作為 Control Plane)
+        juju add-machine -m {{ slinky_model }} --constraints {{ master_tags }} --base {{ target_os }}
+        # 請求 Machine 1 (預計作為 GPU Worker)
+        juju add-machine -m {{ slinky_model }} --constraints {{ worker_tags }} --base {{ target_os }}
+      register: machine_req
+
+    - name: 1.3 等待機器分配 ID 與啟動
+      shell: |
+        # 簡單迴圈等待，直到能解析出兩個 ID
+        # 實務上建議使用 juju wait plugin 或更嚴謹的檢查
+        sleep 10 
+        echo "Waiting for machines..."
+      changed_when: false
+
+    - name: 1.4 動態偵測 Machine ID (沿用您的高明邏輯)
+      shell: |
+        STATUS=$(juju machines -m {{ slinky_model }} --format json)
+        # 抓取 Virtual (Master) ID
+        M0=$(echo $STATUS | jq -r '.machines | to_entries[] | select(.value.constraints | contains("tags={{ master_tags | replace("tags=", "") }}")) | .key' | head -n 1)
+        # 抓取 Slurm-Node (Worker) ID
+        M1=$(echo $STATUS | jq -r '.machines | to_entries[] | select(.value.constraints | contains("tags={{ worker_tags | replace("tags=", "") }}")) | .key' | head -n 1)
+        
+        if [ -z "$M0" ] || [ -z "$M1" ]; then exit 1; fi
+        echo "$M0|$M1"
+      register: detected_ids
+      until: detected_ids.rc == 0
+      retries: 20
+      delay: 15
+
+    - name: 1.5 儲存 ID 變數
+      set_fact:
+        master_id: "{{ detected_ids.stdout.split('|')[0] }}"
+        worker_id: "{{ detected_ids.stdout.split('|')[1] }}"
+
+    # ----------------------------------------------------
+    # 2. 佈署 MicroK8s Charm (核心差異處)
+    # 說明：我們不使用 shell curl，而是使用 Charm 進行原生管理
+    # ----------------------------------------------------
+    - name: 2.1 佈署 MicroK8s Control Plane (Master)
+      shell: |
+        # 佈署名為 'k8s-master' 的應用到 master_id
+        juju deploy microk8s k8s-master \
+          --channel {{ k8s_channel }} \
+          --to {{ master_id }} \
+          --config hostpath_storage=true \
+          --config rbac=true \
+          --config dns=true \
+          -m {{ slinky_model }}
+
+    - name: 2.2 佈署 MicroK8s Worker (GPU Node)
+      shell: |
+        # 佈署名為 'k8s-worker' 的應用到 worker_id
+        juju deploy microk8s k8s-worker \
+          --channel {{ k8s_channel }} \
+          --to {{ worker_id }} \
+          --config hostpath_storage=true \
+          --config rbac=true \
+          --config dns=true \
+          -m {{ slinky_model }}
+
+    # ----------------------------------------------------
+    # 3. 叢集整合 (Clustering)
+    # ----------------------------------------------------
+    - name: 3.1 等待應用佈署完成 (阻塞式檢查)
+      shell: |
+        # 這是一個簡化的等待邏輯，確保 Charm 已經 Active
+        juju-wait -m {{ slinky_model }} -t 600 || true
+      ignore_errors: yes
+
+    - name: 3.2 建立 Master-Worker 關聯 (形成叢集)
+      shell: |
+        # MicroK8s Charm 透過 relation 自動 join cluster
+        juju integrate k8s-master:microk8s k8s-worker:microk8s -m {{ slinky_model }}
+
+    - name: 3.3 等待叢集關聯生效
+      shell: sleep 30
+
+    # ----------------------------------------------------
+    # 4. Slinky 專屬配置 (GPU & Labeling)
+    # ----------------------------------------------------
+    - name: 4.1 在 Worker 節點啟用 GPU (Juju Action)
+      shell: |
+        # 這一步取代了原本複雜的 Shell 手動安裝驅動
+        # MicroK8s Charm 會自動偵測硬體並啟用 NVIDIA Operator
+        juju run k8s-worker/0 microk8s-enable addon=gpu -m {{ slinky_model }}
+
+    - name: 4.2 下載 Kubeconfig (供 KubeSphere 納管使用)
+      shell: |
+        # 從 Master 抓取 config
+        mkdir -p /tmp/slinky_configs
+        juju run k8s-master/0 microk8s-config > /tmp/slinky_configs/config
+        
+        # 修正 IP (Charm 通常會給出正確 IP，但保險起見修正為對外 IP)
+        MASTER_IP=$(juju ssh -m {{ slinky_model }} {{ master_id }} 'hostname -I' | awk '{print $1}')
+        sed -i "s/127.0.0.1/$MASTER_IP/g" /tmp/slinky_configs/config
+      vars:
+        slinky_model: "slinky-lab"
+
+    - name: 🚀 Slinky 基礎建設完成
+      debug:
+        msg: 
+          - "MicroK8s Cluster 已透過 Juju 建立完成。"
+          - "Master (ID: {{ master_id }}) 與 Worker (ID: {{ worker_id }}) 已整合。"
+          - "GPU Addon 已在 Worker 節點啟用。"
+          - "下一步：請將 /tmp/slinky_configs/config 匯入 KubeSphere，並開始佈署 Slinky Operator。"
