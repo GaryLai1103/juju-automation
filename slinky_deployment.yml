@@ -1,13 +1,8 @@
 ---
 # ==========================================
-# SKU: Slinky-MicroK8s-v3.0 (Scalable Architecture)
+# SKU: Slinky-MicroK8s-v3.1 (Syntax Fix)
 # 目標：建立一個具備高度擴充性的生產級架構
-# 架構：
-#   - k8s-master (VM): 負責控制平面
-#   - k8s-worker (Bare Metal GPU): 負責 Slinky 運算
-# 優勢：
-#   1. 未來擴充 GPU 節點只需 add-unit k8s-worker，會自動繼承配置
-#   2. 使用 Bundle 部署，解決 "Relation not found" 的時間差問題
+# 修正：移除 Shell 模組內的中文註解與引號，避免 Jinja2 解析錯誤
 # ==========================================
 - name: Infrastructure Test - Scalable MicroK8s Deployment
   hosts: maasjuju
@@ -15,8 +10,6 @@
   vars:
     test_model: "slinky-cluster"
     k8s_channel: "1.28/stable"
-    # 定義標籤約束 (Constraints)
-    # 這確保未來擴充時，Juju 知道要去抓哪種機器
     constraint_master: "tags=virtual"
     constraint_worker: "tags=slurm-node"
     bundle_path: "/tmp/slinky-scalable-bundle.yaml"
@@ -42,47 +35,37 @@
 
     # -------------------------------------------------------
     # 2. 定義可擴充架構 (Bundle)
-    # 說明：這裡我們定義兩個 Application，但使用同一個 Charm (microk8s)
     # -------------------------------------------------------
-    - name: 2.1 產生 Scalable Bundle 文件
+    - name: 2.1 產生 Scalable Bundle YAML 文件
       copy:
         dest: "{{ bundle_path }}"
         content: |
           description: Slinky Scalable Cluster
           series: jammy
           applications:
-            # --- 控制平面群組 ---
             k8s-master:
               charm: microk8s
               channel: {{ k8s_channel }}
               num_units: 1
               constraints: {{ constraint_master }}
-              # Master 不需要 GPU，可以預先關閉不需要的 addon
               options:
                 hostpath_storage: "true"
                 dns: "true"
                 rbac: "true"
-
-            # --- 運算平面群組 (未來擴充重點) ---
             k8s-worker:
               charm: microk8s
               channel: {{ k8s_channel }}
               num_units: 1
               constraints: {{ constraint_worker }}
-              # Worker 未來擴充時，會自動繼承這些設定
               options:
                 hostpath_storage: "true"
                 dns: "true"
                 rbac: "true"
-          
-          # --- 自動連接邏輯 ---
           relations:
-            # 將 Worker 連接到 Master，形成叢集
             - ["k8s-master:microk8s", "k8s-worker:microk8s"]
 
     # -------------------------------------------------------
     # 3. 執行部署 (Fire and Forget)
-    # 說明：Juju 會解析 Bundle，自動處理下載 Charm、申請機器、建立關聯的順序
     # -------------------------------------------------------
     - name: 3.1 部署 Scalable Bundle
       shell: |
@@ -93,11 +76,10 @@
     # -------------------------------------------------------
     - name: 4.1 等待 Master 與 Worker 就緒
       shell: |
-        # 我們等待至少 2 台機器進入 started 狀態
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
       register: machine_ready
       until: machine_ready.stdout | int >= 2
-      retries: 240  # 40 分鐘 (容許裸機 PXE 安裝時間)
+      retries: 240  # 40 分鐘
       delay: 10
       ignore_errors: yes 
 
@@ -106,5 +88,9 @@
     # -------------------------------------------------------
     - name: 5.1 在 Worker 群組啟用 GPU
       shell: |
-        # 這裡是對 "Application" 下指令，而不是單一 Unit
-        # 這意味著：目前這台 Worker，以及"未來擴
+        juju run k8s-worker/0 enable addon=gpu --model {{ test_model }}
+      ignore_errors: yes
+
+    - name: ✅ 架構部署完成
+      debug:
+        msg: "可擴充架構 (Bundle) 部署請求已完成。請持續監控 Juju Status 直到 OS 安裝完畢。"
