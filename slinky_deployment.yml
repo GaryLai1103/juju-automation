@@ -1,9 +1,11 @@
 ---
 # ==========================================
-# SKU: Infra-Test-MicroK8s-v0.7.1 (Syntax Fix)
-# 修正：
-#   1. 修復 YAML 語法錯誤 (Task 4.2 名稱中的冒號問題)
-#   2. 包含 Retry 機制與正確的 Action 名稱
+# SKU: Slinky-MicroK8s-v1.0 (Unified Scaling)
+# 目標：驗證 Juju 對接 MaaS 部署 MicroK8s 的能力
+# 架構：單一 MicroK8s App + add-unit 擴容
+# 優勢：
+#   1. 不需要 juju integrate (自動 Peer)
+#   2. 邏輯更接近傳統 Cluster 安裝
 # ==========================================
 - name: Infrastructure Test - Deploy MicroK8s via Juju
   hosts: maasjuju
@@ -12,14 +14,16 @@
     test_model: "slinky-cluster"
     target_os: "ubuntu@22.04"
     k8s_channel: "1.28/stable"
-    master_tag: "virtual"
-    worker_tag: "slurm-node"
+    # 這裡我們需要精確指定機器，以確保 GPU Node 拿到正確的角色
+    # 假設您之前已經知道:
+    # Machine 0 = Virtual (Master)
+    # Machine 1 = Slurm Node (Worker with GPU)
+    master_machine_id: "0" 
+    worker_machine_id: "1"
 
   tasks:
-    # -------------------------------------------------------
     # 1. 環境清理
-    # -------------------------------------------------------
-    - name: 1.0 強制清理舊的測試模型 (若存在)
+    - name: 1.0 強制清理舊的測試模型
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
       failed_when: 
@@ -27,7 +31,7 @@
         - '"not found" not in destroy_result.stderr'
       ignore_errors: yes
 
-    - name: 1.1 等待模型完全釋放
+    - name: 1.1 等待模型釋放
       pause:
         seconds: 15
 
@@ -35,65 +39,67 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 請求機器 (無 Config 部署)
+    # 2. 部署核心應用 (第一台機器 / Master)
     # -------------------------------------------------------
-    - name: 2.1 請求 Control Plane (k8s-master)
+    - name: 2.1 部署 MicroK8s 到 Master 節點
       shell: |
-        juju deploy microk8s k8s-master \
+        # 直接部署到指定機器 (Machine 0)
+        juju deploy microk8s \
           --model {{ test_model }} \
           --channel {{ k8s_channel }} \
-          --constraints "tags={{ master_tag }}" \
-          --base {{ target_os }}
+          --base {{ target_os }} \
+          --to {{ master_machine_id }}
+      # 這裡不需要 config，保持預設即可
 
-    - name: 2.2 請求 GPU Worker (k8s-worker)
+    # -------------------------------------------------------
+    # 3. 擴容叢集 (第二台機器 / Worker)
+    # 說明：這就是您要的 add-unit 模式！
+    # -------------------------------------------------------
+    - name: 3.1 新增 Unit 到 GPU 節點
       shell: |
-        juju deploy microk8s k8s-worker \
+        # 將同一個 App 擴容到 Machine 1
+        juju add-unit microk8s \
           --model {{ test_model }} \
-          --channel {{ k8s_channel }} \
-          --constraints "tags={{ worker_tag }}" \
-          --base {{ target_os }}
+          --to {{ worker_machine_id }}
 
     # -------------------------------------------------------
-    # 3. 建立關聯 (整合 Retry 機制)
+    # 4. 部署後驗收 (等待自動 Clustering)
+    # 說明：因為是同一個 App，Juju 會自動處理 join，我們只要等機器好
     # -------------------------------------------------------
-    - name: 3.1 建立 Master 與 Worker 的叢集關係
+    - name: 4.1 等待機器安裝 OS 並完成 Clustering
       shell: |
-        juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
-      register: integrate_result
-      until: integrate_result.rc == 0
-      retries: 20       # 最多重試 20 次
-      delay: 10         # 每次間隔 10 秒
-
-    # -------------------------------------------------------
-    # 4. 部署後驗收與功能啟用
-    # -------------------------------------------------------
-    - name: 4.1 等待機器分配與部署 (這一步會最久)
-      shell: |
+        # 檢查條件：
+        # 1. 有 2 個 Unit 進入 "started" 或 "active"
+        # 2. 或是直接看 machines 狀態
         juju status --model {{ test_model }} --format json | jq -r '.machines[]."agent-status".current' | grep -E "started" | wc -l
       register: machine_ready
       until: machine_ready.stdout | int >= 2
-      retries: 100  # 約 16 分鐘
+      retries: 240  # 40 分鐘 (裸機安裝時間)
       delay: 10
       ignore_errors: yes 
 
-    - name: "4.2 啟用基礎設施插件 (Action: enable)" # <--- 這裡加了引號
+    # -------------------------------------------------------
+    # 5. 功能啟用 (差異化配置)
+    # 說明：雖然是同一個 App，但我們可以針對特定 Unit 下指令
+    # -------------------------------------------------------
+    - name: 5.1 啟用基礎設施 (對任意節點下指令皆可，會同步)
       shell: |
-        # 修正：MicroK8s Charm 的動作名稱是 "enable"
-        # 我們也加上 Retry，防止機器剛開機還沒準備好接 Action
-        juju run k8s-master/0 enable addon=dns --model {{ test_model }}
-        juju run k8s-master/0 enable addon=rbac --model {{ test_model }}
-        juju run k8s-master/0 enable addon=hostpath-storage --model {{ test_model }}
+        # 只要對 microk8s/0 (Master) 下指令，整個叢集都會啟用
+        juju run microk8s/0 enable addon=dns --model {{ test_model }}
+        juju run microk8s/0 enable addon=rbac --model {{ test_model }}
+        juju run microk8s/0 enable addon=hostpath-storage --model {{ test_model }}
       register: action_result
       until: action_result.rc == 0
-      retries: 5
-      delay: 10
+      retries: 20
+      delay: 15
       ignore_errors: yes
 
-    - name: 4.3 在 Worker 啟用 GPU
+    - name: 5.2 [關鍵] 只在 Worker 節點啟用 GPU
       shell: |
-        juju run k8s-worker/0 enable addon=gpu --model {{ test_model }}
+        # 這裡我們指定 microk8s/1 (因為它被部署在 Machine 1)
+        juju run microk8s/1 enable addon=gpu --model {{ test_model }}
       ignore_errors: yes
 
     - name: ✅ 部署指令完成
       debug:
-        msg: "基礎建設部署請求已完成。請登入 maasjuju 使用 'juju status -m {{ test_model }} --watch 1s' 查看即時進度。"
+        msg: "MicroK8s 統一叢集模式部署中。無需手動 Integrate，節點啟動後將自動組建 Cluster。"
