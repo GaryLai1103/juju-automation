@@ -17,7 +17,12 @@
   tasks:
     # 1. 環境清理
     - name: 1.0 強制清理舊的測試模型 (若存在)
-      shell: juju destroy-model {{ test_model }} --force --no-wait --destroy-storage
+      # 這行指令會強制刪除模型，並釋放 MAAS 機器回到 Ready 狀態
+      command: "juju destroy-model {{ k8s_model }} --no-prompt --force --destroy-storage"
+      register: destroy_result
+      failed_when: 
+        - destroy_result.rc != 0 
+        - '"not found" not in destroy_result.stderr' # 如果模型本來就不在，不算失敗
       ignore_errors: yes
 
     - name: 1.1 等待模型釋放
