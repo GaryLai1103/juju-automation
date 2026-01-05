@@ -1,10 +1,10 @@
 ---
 # ==========================================
-# SKU: Slinky-K8s-v1.5-Final-APT
-# 修正：
-#   1. 將 etcd channel 改為 latest/stable
-#   2. 改用 APT 安裝 Python 依賴庫 (避開 pip error)
-#   3. 移除重複的 Task 區塊
+# SKU: Slinky-K8s-v1.6-Remote-Exec
+# 特點：
+#   1. 完全不動 maasjuju (不裝 Python 庫，不改 Kubeconfig)
+#   2. 透過 juju ssh 在 Master 節點內部執行 kubectl
+#   3. 確保 Local Path 裝在正確的新叢集上
 # ==========================================
 - name: Infrastructure Test - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
@@ -32,7 +32,7 @@
       shell: juju add-model {{ test_model }}
 
     # 2. 製作藍圖
-    - name: 2.0 清除舊的 Bundle 檔案 (避免權限衝突)
+    - name: 2.0 清除舊的 Bundle 檔案
       become: yes
       file:
         path: "{{ bundle_path }}"
@@ -110,26 +110,20 @@
       delay: 10
 
     # -----------------------------------------------------------
-    # 4. 監控與驗收 (無限等待版)
+    # 4. 監控 (無限等待版)
     # -----------------------------------------------------------
-    - name: 4.1 等待 K8s 狀態變為 Active (直到成功為止)
+    - name: 4.1 等待 K8s 狀態變為 Active
       shell: |
         echo "⏳ 進入無限監測模式... (請手動監控 juju status)"
         
         while true; do
-          # 1. 獲取 Worker 狀態
           STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-worker"]["application-status"].current')
-          
-          # 2. 獲取 Control Plane 狀態
           CP_STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-control-plane"]["application-status"].current')
 
-          # 3. 成功判斷：兩者皆為 active 才離開
           if [ "$STATUS" == "active" ] && [ "$CP_STATUS" == "active" ]; then
-            echo "✅ Kubernetes Cluster is Ready! (Worker: $STATUS, Control-Plane: $CP_STATUS)"
+            echo "✅ Kubernetes Cluster is Ready!"
             exit 0
           fi
-          
-          # 4. 休息 10 秒再問
           sleep 10
         done
       args:
@@ -138,39 +132,28 @@
       changed_when: false 
 
     # -----------------------------------------------------------
-    # 補救措施：解決 "kubernetes module" 依賴問題 (改用 APT)
+    # 5. Local Path Provisioner (遠端執行 - 不動 maasjuju)
     # -----------------------------------------------------------
+    # [修正重點]
+    # 1. 移除了所有 pip/apt 安裝步驟 (Task 4.2 已刪除)
+    # 2. 改用 juju ssh 到 Machine 0 內部執行 kubectl
+    # 3. 這樣 maasjuju 不需要任何 K8s 設定，也不會裝錯到舊叢集
     
-    # 🟢 [修改] 改用 APT 安裝 Ansible K8s 模組所需的依賴
-    # 這比 pip 更穩定，且不會有 PEP 668 錯誤
-    - name: 4.2 安裝系統級 K8s Python 依賴庫 (APT模式)
-      become: yes
-      ansible.builtin.apt:
-        name: 
-          - python3-kubernetes  # 對應 pip 的 kubernetes
-          - python3-yaml        # 對應 pip 的 PyYAML
-          - python3-pip         # 順便裝上 pip 以備不時之需
-        state: present
-        update_cache: yes
-      register: apt_result
-      until: apt_result is success
-      retries: 3
-      delay: 5
-
-    # -----------------------------------------------------------
-    # 5. Local Path Provisioner
-    # -----------------------------------------------------------
-    - name: 5.1 安裝 Local Path Provisioner
-      kubernetes.core.k8s:
-        state: present
-        src: https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
-      environment:
-        KUBECONFIG: "/home/gary/.kube/config"
-
-    - name: 5.2 設定為預設 StorageClass
+    - name: 5.1 安裝 Local Path Provisioner (Remote Exec)
       shell: |
-        kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
+      register: install_sc
+      # 為了讓 Ansible 顯示 changed 狀態，我們簡單判斷輸出
+      changed_when: "'created' in install_sc.stdout or 'configured' in install_sc.stdout"
+
+    - name: 5.2 設定為預設 StorageClass (Remote Exec)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
+      register: patch_sc
+      changed_when: "'patched' in patch_sc.stdout"
 
     - name: ✅ 部署完成
       debug:
-        msg: "Charmed Kubernetes 已成功部署，並使用 APT 完成 Python 依賴安裝。"
+        msg: "Charmed Kubernetes 已成功部署。StorageClass 已透過 Machine 0 內部指令完成配置，未更動 maasjuju 環境。"
