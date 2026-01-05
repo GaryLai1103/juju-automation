@@ -1,9 +1,10 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v1.3-NoGit
+# SKU: Slinky-App-Standalone-v1.4-NonInteractive
 # 修正：
-#   1. 完全放棄 git clone (因 MTU 問題導致大封包卡死)
-#   2. 改用 wget 下載 ZIP (走純 HTTP 流量，保證暢通)
+#   1. 強制設定 DEBIAN_FRONTEND=noninteractive (解決卡死)
+#   2. 移除 needrestart 干擾
+#   3. 維持 Wget 下載 (保證網路暢通)
 # ========================================================
 - name: Application Layer - Deploy Slinky (Slurm)
   hosts: maasjuju
@@ -12,7 +13,6 @@
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    # 直接指定 GitHub 的 ZIP 下載點 (Master 分支)
     zip_url: "https://github.com/schedmd/slurm-helm-charts/archive/refs/heads/master.zip"
 
   tasks:
@@ -30,22 +30,19 @@
       when: machine_check.rc != 0
 
     # -----------------------------------------------------------
-    # 2. 準備部署工具 (Helm + Wget/Unzip)
+    # 2. 準備部署工具 (Anti-Hang Mode)
     # -----------------------------------------------------------
-    - name: 2.1 在 Machine 0 安裝 Helm 與解壓工具
-      # [修正] 改裝 unzip，不需要 git 了
+    - name: 2.1 [防卡死修正] 在 Machine 0 安裝 Helm 與工具
+      # 加入環境變數，禁止 apt 跳出問答視窗
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "sudo snap install helm --classic && sudo apt-get update && sudo apt-get install -y wget unzip"
+        "sudo snap install helm --classic && \
+         sudo apt-get update && \
+         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wget unzip"
       register: tools_install
       changed_when: "'installed' in tools_install.stdout"
 
-    - name: 2.2 [終極修正] 使用 Wget 下載原始碼 ZIP (避開 Git 協定)
-      # 邏輯：
-      # 1. 清理舊環境
-      # 2. 下載 master.zip
-      # 3. 解壓縮 (會產生 slurm-helm-charts-master 資料夾)
-      # 4. 重新命名為 slurm-helm-charts 以符合後續路徑
+    - name: 2.2 使用 Wget 下載原始碼 ZIP
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "rm -rf slurm-helm-charts master.zip && \
@@ -56,7 +53,6 @@
       changed_when: true
 
     - name: 2.3 下載 Chart 依賴套件 (MariaDB)
-      # 路徑依然有效，因為我們剛剛 mv 重新命名了
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "cd slurm-helm-charts/charts/slurm-cluster && helm dependency update"
@@ -151,7 +147,7 @@
     - name: ✅ Slinky 部署完成
       debug:
         msg: 
-          - "🎉 Slurm on K8s (Wget Mode) 部署成功！"
+          - "🎉 Slurm on K8s (Final Fix) 部署成功！"
           - "資料庫 (MariaDB) 已自動建立。"
           - "請嘗試 SSH 連線登入節點："
           - "ssh root@{{ master_ip.stdout }} -p 30022"
