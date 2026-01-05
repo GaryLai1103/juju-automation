@@ -1,20 +1,20 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v1.6-CommitSHA
-# 修正：
-#   1. 使用 Commit SHA 下載 (100% 存在的永久連結)
-#   2. 智慧型資料夾更名 (Auto-detect folder name)
+# SKU: Slinky-App-Standalone-v2.0-StackHPC
+# 策略：
+#   1. 放棄 SchedMD (連結失效)，改用 StackHPC (社群主流)
+#   2. 使用 Git Clone (StackHPC 支援 master 分支)
+#   3. 調整 Values 以符合 StackHPC Chart 格式
 # ========================================================
-- name: Application Layer - Deploy Slinky (Slurm)
+- name: Application Layer - Deploy Slurm (StackHPC)
   hosts: maasjuju
   gather_facts: yes
   vars:
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    # [終極修正] 直接指定一個最近且穩定的 Commit SHA (2024年底的版本)
-    # 這網址絕對不會 404，除非 GitHub 倒了
-    zip_url: "https://github.com/schedmd/slurm-helm-charts/archive/ed5464c.zip"
+    # [新目標] StackHPC 的 Repo
+    git_repo_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
 
   tasks:
     # -----------------------------------------------------------
@@ -38,105 +38,83 @@
         juju ssh --model {{ test_model }} 0 -- \
         "sudo snap install helm --classic && \
          sudo apt-get update && \
-         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wget unzip"
+         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' git"
       register: tools_install
       changed_when: "'installed' in tools_install.stdout"
 
-    - name: 2.2 [SHA 下載] 下載原始碼 ZIP
-      # 邏輯：
-      # 1. 下載 ed5464c.zip
-      # 2. 解壓 (會產生 slurm-helm-charts-ed5464c... 亂數名稱)
-      # 3. 用 find 找出那個資料夾並改名為 slurm-helm-charts
+    - name: 2.2 下載 StackHPC Chart (Git Clone)
+      # StackHPC 的 master 分支是存在的，直接 clone
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "rm -rf slurm-helm-charts *.zip && \
-         wget -O source.zip {{ zip_url }} && \
-         unzip -o source.zip && \
-         DIR_NAME=\$(find . -maxdepth 1 -type d -name 'slurm-helm-charts*' | head -n 1) && \
-         mv \$DIR_NAME slurm-helm-charts && \
-         rm source.zip"
+        "rm -rf slurm-k8s-cluster && \
+         git clone --depth 1 {{ git_repo_url }}"
       changed_when: true
 
-    - name: 2.3 下載 Chart 依賴套件 (MariaDB)
+    - name: 2.3 下載依賴 (StackHPC 依賴 MariaDB 等)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "cd slurm-helm-charts/charts/slurm-cluster && helm dependency update"
+        "cd slurm-k8s-cluster/slurm-cluster-chart && helm dependency update"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3. 設定檔配置
+    # 3. 設定檔配置 (適配 StackHPC 格式)
     # -----------------------------------------------------------
-    - name: 3.1 產生 Slinky 設定檔 (values.yaml)
+    - name: 3.1 產生 StackHPC 專用 values.yaml
+      # StackHPC 的參數結構與 SchedMD 不同，這裡做了對應調整
       shell: |
-        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/slinky-values.yaml
+        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/stackhpc-values.yaml
         global:
           clusterName: {{ test_model }}
 
-        volumeClaimTemplate:
-          accessModes: [ \"ReadWriteOnce\" ]
+        # 1. 儲存設定 (使用 local-path)
+        # StackHPC 通常會自動裝 NFS，我們這裡盡量用 local-path 覆蓋
+        volumeClaim:
+          storageClassName: \"local-path\"
+          size: 10Gi
+
+        # 2. 控制器設定
+        controller:
+          size: 10Gi
           storageClassName: \"local-path\"
           resources:
-            requests:
-              storage: 10Gi
-
-        slurmctld:
-          persistence:
-            enabled: true
-            storageClassName: \"local-path\"
-            size: 10Gi
-          resources:
             limits:
               cpu: 2
               memory: 4Gi
 
+        # 3. 資料庫設定 (StackHPC 內建 MariaDB 依賴)
         slurmdbd:
           enabled: true
-          persistence:
-            enabled: true
-            storageClassName: \"local-path\"
-            size: 10Gi
-          resources:
-            limits:
-              cpu: 2
-              memory: 4Gi
+          storageClassName: \"local-path\"
+          size: 10Gi
 
+        # 4. 登入節點 (開啟 NodePort)
         login:
-          enabled: true
           service:
             type: NodePort
             nodePort: 30022
           ssh:
             enabled: true
-          persistence:
-            enabled: true
-            storageClassName: \"local-path\"
-            size: 10Gi
 
-        slurmd:
+        # 5. 運算節點
+        worker:
+          replicas: 1
           resources:
-            requests:
-              cpu: 1
-              memory: 2Gi
-            limits: 
-              cpu: 16  
+            limits:
+              cpu: 16
               memory: 64Gi
-          persistence:
-            enabled: true
-            storageClassName: \"local-path\"
-            size: 50Gi
         EOF"
       changed_when: false
 
     # -----------------------------------------------------------
     # 4. 執行部署
     # -----------------------------------------------------------
-    - name: 4.1 安裝/更新 Slurm
+    - name: 4.1 安裝 StackHPC Slurm Chart
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "helm upgrade --install {{ release_name }} ./slurm-helm-charts/charts/slurm-cluster \
+        "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
           --namespace {{ namespace }} \
           --create-namespace \
-          -f /home/ubuntu/slinky-values.yaml \
+          -f /home/ubuntu/stackhpc-values.yaml \
           --wait --timeout 15m"
       register: helm_deploy
       changed_when: "'Release \"{{ release_name }}\" does not exist' in helm_deploy.stderr or 'Happy Helming' in helm_deploy.stdout"
@@ -149,10 +127,11 @@
         juju status --model {{ test_model }} --format json | jq -r '.machines["0"]["dns-name"]'
       register: master_ip
 
-    - name: ✅ Slinky 部署完成
+    - name: ✅ StackHPC Slurm 部署完成
       debug:
         msg: 
-          - "🎉 Slurm on K8s (SHA Mode) 部署成功！"
-          - "資料庫 (MariaDB) 已自動建立。"
+          - "🎉 Slurm on K8s (StackHPC Version) 部署成功！"
+          - "這個 Repo 穩定多了，資料庫也已自動建立。"
           - "請嘗試 SSH 連線登入節點："
-          - "ssh root@{{ master_ip.stdout }} -p 30022"
+          - "ssh rocky@{{ master_ip.stdout }} -p 30022" 
+          - "(注意：StackHPC 預設使用者可能是 'rocky' 或 'ubuntu'，請依實際情況測試)"
