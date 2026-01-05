@@ -14,7 +14,7 @@
   hosts: maasjuju
   gather_facts: no
   vars:
-    test_model: "slinky-slurm"
+    test_model: "slinky-cluster"
     # 使用 Charmed Kubernetes 的標準 Channel
     k8s_channel: "1.28/stable"
     bundle_path: "/tmp/charmed-k8s-bundle.yaml"
