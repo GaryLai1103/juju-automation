@@ -1,7 +1,10 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v1.1-GitClone
-# 修正：解決 SchedMD Helm Repo 404 問題，改用 Git Clone 安裝
+# SKU: Slinky-App-Standalone-v1.2-FastGit
+# 修正：
+#   1. 加入 --depth 1 解決 Git Clone 卡住問題
+#   2. 加入 http.postBuffer 防止傳輸中斷
+#   3. 使用原始碼安裝 SchedMD Chart
 # ========================================================
 - name: Application Layer - Deploy Slinky (Slurm)
   hosts: maasjuju
@@ -10,7 +13,6 @@
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    # 指定 GitHub 專案網址
     git_repo_url: "https://github.com/schedmd/slurm-helm-charts.git"
 
   tasks:
@@ -30,29 +32,31 @@
     # -----------------------------------------------------------
     # 2. 準備部署工具 (Helm + Git)
     # -----------------------------------------------------------
-    - name: 2.1 在 Machine 0 安裝 Helm 與 Git (Remote Exec)
+    - name: 2.1 在 Machine 0 安裝 Helm 與 Git
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo snap install helm --classic && sudo apt-get update && sudo apt-get install -y git"
       register: tools_install
       changed_when: "'installed' in tools_install.stdout"
 
-    - name: 2.2 [修正] 下載 Slurm Chart 原始碼 (Git Clone)
-      # 不用 repo add，直接把原始碼抓下來，保證最穩
+    - name: 2.2 [關鍵修正] 設定 Git 緩衝區並下載原始碼 (Fast Clone)
+      # 1. 設定 postBuffer 避免傳輸中斷
+      # 2. 使用 --depth 1 只抓最新版 (秒殺下載)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "rm -rf slurm-helm-charts && git clone {{ git_repo_url }}"
+        "git config --global http.postBuffer 524288000 && \
+         rm -rf slurm-helm-charts && \
+         git clone --depth 1 {{ git_repo_url }}"
       changed_when: true
 
-    - name: 2.3 [新增] 下載 Chart 依賴套件 (MariaDB)
-      # 這是關鍵！因為是原始碼安裝，必須手動觸發依賴下載
+    - name: 2.3 下載 Chart 依賴套件 (MariaDB)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "cd slurm-helm-charts/charts/slurm-cluster && helm dependency update"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3. 設定檔配置 (ConfigMap & Database)
+    # 3. 設定檔配置
     # -----------------------------------------------------------
     - name: 3.1 產生 Slinky 設定檔 (values.yaml)
       shell: |
@@ -60,7 +64,6 @@
         global:
           clusterName: {{ test_model }}
 
-        # [儲存] 使用 Local Path
         volumeClaimTemplate:
           accessModes: [ \"ReadWriteOnce\" ]
           storageClassName: \"local-path\"
@@ -68,7 +71,6 @@
             requests:
               storage: 10Gi
 
-        # [控制器]
         slurmctld:
           persistence:
             enabled: true
@@ -79,7 +81,6 @@
               cpu: 2
               memory: 4Gi
 
-        # [資料庫] 自動啟用
         slurmdbd:
           enabled: true
           persistence:
@@ -91,7 +92,6 @@
               cpu: 2
               memory: 4Gi
 
-        # [入口] NodePort 30022
         login:
           enabled: true
           service:
@@ -104,7 +104,6 @@
             storageClassName: \"local-path\"
             size: 10Gi
 
-        # [運算節點]
         slurmd:
           resources:
             requests:
@@ -123,8 +122,7 @@
     # -----------------------------------------------------------
     # 4. 執行部署
     # -----------------------------------------------------------
-    - name: 4.1 安裝/更新 Slurm (Install from Local Path)
-      # [修正] 這裡指向本機目錄 ./slurm-helm-charts/charts/slurm-cluster
+    - name: 4.1 安裝/更新 Slurm
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm upgrade --install {{ release_name }} ./slurm-helm-charts/charts/slurm-cluster \
@@ -147,6 +145,6 @@
       debug:
         msg: 
           - "🎉 Slurm on K8s (SchedMD) 部署成功！"
-          - "資料庫 (MariaDB) 與 Slurmdbd 已自動建立。"
+          - "資料庫 (MariaDB) 已自動建立。"
           - "請嘗試 SSH 連線登入節點："
           - "ssh root@{{ master_ip.stdout }} -p 30022"
