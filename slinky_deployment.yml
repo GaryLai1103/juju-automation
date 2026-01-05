@@ -114,6 +114,18 @@
       retries: 500 
       delay: 60
 
+    # 5. Local Path Provisioner
+    - name: 5.1 安裝 Local Path Provisioner
+      kubernetes.core.k8s:
+        state: present
+        src: https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
+      environment:
+        KUBECONFIG: "/home/gary/.kube/config"
+
+    - name: 5.2 設定為預設 StorageClass
+      shell: |
+        kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
     - name: ✅ 部署完成
       debug:
         msg: "Charmed Kubernetes 已成功開始部署。etcd 已修正為 latest/stable 以支援 Ubuntu 22.04。"
