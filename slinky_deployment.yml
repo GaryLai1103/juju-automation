@@ -1,21 +1,16 @@
 ---
 # ==========================================
-# SKU: Slinky-CharmedK8s-v1.0 (The Real Deal)
-# 目標：放棄 MicroK8s，改用正規 Charmed Kubernetes
-# 架構：
-#   - Machine 0 (VM): Control Plane + Etcd + PKI
-#   - Machine 1 (GPU): Worker Node
-# 優勢：
-#   1. 原生支援 Master/Worker 分離架構
-#   2. 完美支援 juju integrate，不再有 "no relation" 錯誤
-#   3. 生產級架構，適合 HPC/Slinky
+# SKU: Slinky-CharmedK8s-v1.1 (File Generation Fix)
+# 目標：部署正規 Charmed Kubernetes (Master/Worker 分離)
+# 修正：
+#   1. 加入 "產生 Bundle 檔案" 的步驟
+#   2. 確保 Juju 能讀取到本地定義的機器分配 (VM vs GPU)
 # ==========================================
 - name: Infrastructure Test - Deploy Charmed Kubernetes
   hosts: maasjuju
   gather_facts: no
   vars:
-    test_model: "slinky-cluster"
-    # 使用 Charmed Kubernetes 的標準 Channel
+    test_model: "slinky-k8s"
     k8s_channel: "1.28/stable"
     bundle_path: "/tmp/charmed-k8s-bundle.yaml"
 
@@ -39,32 +34,27 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 定義正規 K8s Bundle
-    # 說明：這裡我們把 K8s 拆解成獨立組件，並定義它們的去向
+    # 2. 製作藍圖 (這就是您缺少的步驟！)
     # -------------------------------------------------------
-    - name: 2.1 產生 Charmed K8s Bundle
+    - name: 2.1 產生本地 Bundle 檔案
       copy:
         dest: "{{ bundle_path }}"
         content: |
           description: Slinky Standard K8s Cluster
           series: jammy
           
-          # --- 機器定義 ---
           machines:
             "0":
               constraints: tags=virtual
             "1":
               constraints: tags=slurm-node
 
-          # --- 應用程式定義 ---
           applications:
-            # 1. 憑證中心 (放在 VM)
             easyrsa:
               charm: easyrsa
               num_units: 1
               to: ["0"]
             
-            # 2. 資料庫 (放在 VM)
             etcd:
               charm: etcd
               num_units: 1
@@ -72,17 +62,14 @@
               options:
                 channel: 3.4/stable
 
-            # 3. 控制平面 Master (放在 VM)
             kubernetes-control-plane:
               charm: kubernetes-control-plane
               channel: {{ k8s_channel }}
               num_units: 1
               to: ["0"]
               options:
-                # 允許特權模式 (對某些 HPC 應用重要)
                 allow-privileged: "true"
 
-            # 4. 運算節點 Worker (放在 GPU 裸機)
             kubernetes-worker:
               charm: kubernetes-worker
               channel: {{ k8s_channel }}
@@ -90,15 +77,12 @@
               to: ["1"]
               expose: true
 
-            # 5. 網路插件 (Calico 是標準)
             calico:
               charm: calico
               
-            # 6. 容器運行時
             containerd:
               charm: containerd
 
-          # --- 關聯定義 (這就是 Juju 的魔法) ---
           relations:
             - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
             - ["kubernetes-control-plane:certificates", "easyrsa:client"]
@@ -112,28 +96,28 @@
             - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
 
     # -------------------------------------------------------
-    # 3. 部署 Bundle
+    # 3. 執行部署
     # -------------------------------------------------------
-    - name: 3.1 執行部署 (Fire and Forget)
+    - name: 3.1 部署 Bundle (現在檔案存在了，不會報錯)
       shell: |
         juju deploy {{ bundle_path }} --model {{ test_model }} --trust
 
     # -------------------------------------------------------
-    # 4. 監控與收尾
+    # 4. 監控進度
     # -------------------------------------------------------
     - name: 4.1 等待部署完成 (Smart Wait)
       shell: |
-        # 檢查 Worker 是否已經 active 且 idle
+        # 檢查 Worker 是否已經 active
         juju status --model {{ test_model }} --format json | jq -r '
           .applications["kubernetes-worker"]["application-status"].current == "active"
         '
       register: k8s_ready
       until: k8s_ready.stdout | trim == "true"
-      # 正規 K8s 組件較多，安裝時間會比 MicroK8s 稍長
-      retries: 240 # 40 分鐘
+      # 正規 K8s 安裝比較久，給它 45 分鐘
+      retries: 270 
       delay: 10
       ignore_errors: no
 
     - name: ✅ 部署完成
       debug:
-        msg: "正規 Charmed Kubernetes 部署完成！這是一個標準的 Master/Worker 分離架構。"
+        msg: "正規 Charmed Kubernetes 部署完成！Master 在 VM，Worker 在 GPU 裸機，且已自動連線。"
