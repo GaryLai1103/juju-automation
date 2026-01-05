@@ -114,6 +114,16 @@
       retries: 500 
       delay: 60
 
+    # 新增這一段：確保 maasjuju 本機有執行 k8s 模組所需的 Python 庫
+    - name: 4.2 安裝 Ansible K8s 模組所需的 Python 依賴庫
+      become: yes  # 需要 sudo 權限來安裝系統層級的 Python 庫
+      ansible.builtin.pip:
+        name: 
+          - kubernetes
+          - PyYAML
+        state: present
+        executable: pip3
+
     # 5. Local Path Provisioner
     - name: 5.1 安裝 Local Path Provisioner
       kubernetes.core.k8s:
