@@ -109,13 +109,11 @@
       delay: 10
 
     # -----------------------------------------------------------
-    # 4. 監控與驗收 (改用 Shell Loop 讓 Log 變乾淨)
+    # 4. 監控與驗收 (無限等待版)
     # -----------------------------------------------------------
-    - name: 4.1 等待 K8s 狀態變為 Active (Clean Log)
+    - name: 4.1 等待 K8s 狀態變為 Active (直到成功為止)
       shell: |
-        echo "⏳ 開始監測 Kubernetes 狀態..."
-        START_TIME=$(date +%s)
-        TIMEOUT=1200  # 設定超時 20 分鐘
+        echo "⏳ 進入無限監測模式... (請手動監控 juju status)"
         
         while true; do
           # 1. 獲取 Worker 狀態
@@ -124,29 +122,24 @@
           # 2. 獲取 Control Plane 狀態
           CP_STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-control-plane"]["application-status"].current')
 
-          # 3. 判斷是否兩者皆為 active
+          # 3. 成功判斷：兩者皆為 active 才離開
           if [ "$STATUS" == "active" ] && [ "$CP_STATUS" == "active" ]; then
             echo "✅ Kubernetes Cluster is Ready! (Worker: $STATUS, Control-Plane: $CP_STATUS)"
             exit 0
           fi
 
-          # 4. 檢查超時
-          CURRENT_TIME=$(date +%s)
-          ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
-          if [ $ELAPSED_TIME -ge $TIMEOUT ]; then
-            echo "❌ Timeout waiting for Kubernetes to become active."
-            exit 1
-          fi
-
-          # 5. 等待並重試 (每 10 秒檢查一次)
+          # ❌ 移除了超時檢查 (Timeout Check Removed)
+          # 只要沒成功，就永遠在這裡繞圈圈
+          
+          # 4. 休息 10 秒再問
           sleep 10
         done
       args:
         executable: /bin/bash
       register: k8s_wait_result
       changed_when: false 
-      #async      
-      #poll    
+      # 注意：這個任務會一直跑，直到 K8s 準備好。
+      # 如果 Juju 卡在 Error，您需要手動在 AWX 按 Cancel 停止它。
 
     # -----------------------------------------------------------
     # 補救措施：解決 "Unable to find pip3" 與 "kubernetes module" 錯誤
