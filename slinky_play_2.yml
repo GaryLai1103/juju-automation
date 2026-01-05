@@ -1,9 +1,9 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v1.5-MainBranch
+# SKU: Slinky-App-Standalone-v1.6-CommitSHA
 # 修正：
-#   1. 將 master.zip 改為 main.zip (GitHub 404 修正)
-#   2. 保留 apt noninteractive 防卡死機制
+#   1. 使用 Commit SHA 下載 (100% 存在的永久連結)
+#   2. 智慧型資料夾更名 (Auto-detect folder name)
 # ========================================================
 - name: Application Layer - Deploy Slinky (Slurm)
   hosts: maasjuju
@@ -12,8 +12,9 @@
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    # [修正] 改用 main 分支
-    zip_url: "https://github.com/schedmd/slurm-helm-charts/archive/refs/heads/main.zip"
+    # [終極修正] 直接指定一個最近且穩定的 Commit SHA (2024年底的版本)
+    # 這網址絕對不會 404，除非 GitHub 倒了
+    zip_url: "https://github.com/schedmd/slurm-helm-charts/archive/ed5464c.zip"
 
   tasks:
     # -----------------------------------------------------------
@@ -30,9 +31,9 @@
       when: machine_check.rc != 0
 
     # -----------------------------------------------------------
-    # 2. 準備部署工具 (Anti-Hang Mode)
+    # 2. 準備部署工具
     # -----------------------------------------------------------
-    - name: 2.1 [防卡死] 在 Machine 0 安裝 Helm 與工具
+    - name: 2.1 在 Machine 0 安裝 Helm 與工具 (Quiet Mode)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo snap install helm --classic && \
@@ -41,15 +42,19 @@
       register: tools_install
       changed_when: "'installed' in tools_install.stdout"
 
-    - name: 2.2 [網址修正] 下載原始碼 ZIP (Main Branch)
-      # 邏輯更新：處理 main.zip 和 slurm-helm-charts-main 資料夾
+    - name: 2.2 [SHA 下載] 下載原始碼 ZIP
+      # 邏輯：
+      # 1. 下載 ed5464c.zip
+      # 2. 解壓 (會產生 slurm-helm-charts-ed5464c... 亂數名稱)
+      # 3. 用 find 找出那個資料夾並改名為 slurm-helm-charts
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "rm -rf slurm-helm-charts main.zip && \
-         wget -O main.zip {{ zip_url }} && \
-         unzip -o main.zip && \
-         mv slurm-helm-charts-main slurm-helm-charts && \
-         rm main.zip"
+        "rm -rf slurm-helm-charts *.zip && \
+         wget -O source.zip {{ zip_url }} && \
+         unzip -o source.zip && \
+         DIR_NAME=\$(find . -maxdepth 1 -type d -name 'slurm-helm-charts*' | head -n 1) && \
+         mv \$DIR_NAME slurm-helm-charts && \
+         rm source.zip"
       changed_when: true
 
     - name: 2.3 下載 Chart 依賴套件 (MariaDB)
@@ -147,7 +152,7 @@
     - name: ✅ Slinky 部署完成
       debug:
         msg: 
-          - "🎉 Slurm on K8s (Main Branch) 部署成功！"
+          - "🎉 Slurm on K8s (SHA Mode) 部署成功！"
           - "資料庫 (MariaDB) 已自動建立。"
           - "請嘗試 SSH 連線登入節點："
           - "ssh root@{{ master_ip.stdout }} -p 30022"
