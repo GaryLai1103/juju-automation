@@ -111,8 +111,8 @@
         '
       register: k8s_ready
       until: k8s_ready.stdout | trim == "true"
-      retries: 300 
-      delay: 15
+      retries: 500 
+      delay: 60
 
     - name: ✅ 部署完成
       debug:
