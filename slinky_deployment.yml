@@ -31,6 +31,11 @@
       shell: juju add-model {{ test_model }}
 
     # 2. 製作藍圖
+    - name: 2.0 清除舊的 Bundle 檔案 (避免權限衝突)
+      become: yes
+      file:
+        path: "{{ bundle_path }}"
+        state: absent
     - name: 2.1 產生本地 Bundle 檔案
       copy:
         dest: "{{ bundle_path }}"
