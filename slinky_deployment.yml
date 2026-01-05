@@ -1,18 +1,17 @@
 ---
 # ==========================================
-# SKU: Slinky-K8s-v1.3-Modern
-# 目標：配合 KubeSphere 規格，部署現代化 K8s (1.31+)
+# SKU: Slinky-K8s-v1.4-Resilient (Fixed Model Name)
 # 修正：
-#   1. 版本對齊：升級至 1.31/stable (接近您截圖中的 v1.32)
-#   2. 組件優化：使用現代化 CNI 與 Runtime
+#   1. 固定 test_model 為 "slinky-cluster"
+#   2. 處理 Charmhub 連線重置問題 (Connection Reset)
+#   3. 更新語法從 series 到 base (Ubuntu 22.04)
 # ==========================================
 - name: Infrastructure Test - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
   gather_facts: yes
   vars:
-    # 建議名稱，方便與 KubeSphere 對接
+    # 固定使用 slinky-cluster
     test_model: "slinky-cluster"
-    # 配合您截圖的版本，選擇目前 Juju 支援最穩定的新版
     k8s_channel: "1.31/stable"
     bundle_path: "{{ ansible_user_dir }}/charmed-k8s-modern.yaml"
 
@@ -33,7 +32,7 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 製作藍圖 (與您之前的三節點邏輯一致)
+    # 2. 製作藍圖 (使用 Base 語法)
     # -------------------------------------------------------
     - name: 2.1 產生現代化 K8s Bundle
       copy:
@@ -41,7 +40,7 @@
         mode: '0644'
         content: |
           description: Slinky Modern K8s Cluster
-          series: jammy
+          base: ubuntu@22.04
           
           machines:
             "0":
@@ -52,15 +51,15 @@
           applications:
             easyrsa:
               charm: easyrsa
+              channel: latest/stable
               num_units: 1
               to: ["0"]
             
             etcd:
               charm: etcd
+              channel: 3.4/stable
               num_units: 1
               to: ["0"]
-              options:
-                channel: 3.4/stable
 
             kubernetes-control-plane:
               charm: kubernetes-control-plane
@@ -77,12 +76,13 @@
               to: ["1"]
               expose: true
 
-            # 現代化網路插件
             calico:
               charm: calico
+              channel: latest/stable
               
             containerd:
               charm: containerd
+              channel: latest/stable
 
           relations:
             - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
@@ -97,11 +97,15 @@
             - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
 
     # -------------------------------------------------------
-    # 3. 執行部署
+    # 3. 執行部署 (加入網路重試)
     # -------------------------------------------------------
     - name: 3.1 部署 Bundle
       shell: |
         juju deploy {{ bundle_path }} --model {{ test_model }} --trust
+      register: deploy_out
+      until: deploy_out.rc == 0
+      retries: 5
+      delay: 15
 
     # -------------------------------------------------------
     # 4. 監控與驗收
@@ -118,4 +122,8 @@
 
     - name: ✅ 現代化叢集部署完成
       debug:
-        msg: "版本 v1.31 部署完成。這比之前的 1.28 更接近您的 KubeSphere 環境！"
+        msg: "Charmed Kubernetes 已成功部署至 slinky-cluster 模型。"
+
+好的，我會儲存到個人化記憶中。
+
+如果想把這個指令儲存為個人化指令，可以在[個人化脈絡設定](https://gemini.google.com/personal-context)中手動加入。
