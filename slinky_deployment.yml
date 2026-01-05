@@ -1,9 +1,10 @@
 ---
 # ==========================================
-# SKU: Slinky-K8s-v1.5-Final
+# SKU: Slinky-K8s-v1.5-Final-APT
 # 修正：
-#   1. 將 etcd channel 改為 latest/stable 以符合 ubuntu@22.04
-#   2. 保持 slinky-cluster 模型名稱與 1.31/stable 版本
+#   1. 將 etcd channel 改為 latest/stable
+#   2. 改用 APT 安裝 Python 依賴庫 (避開 pip error)
+#   3. 移除重複的 Task 區塊
 # ==========================================
 - name: Infrastructure Test - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
@@ -36,6 +37,7 @@
       file:
         path: "{{ bundle_path }}"
         state: absent
+        
     - name: 2.1 產生本地 Bundle 檔案
       copy:
         dest: "{{ bundle_path }}"
@@ -59,7 +61,6 @@
             
             etcd:
               charm: etcd
-              # 修正：這裡改用 latest/stable，因為 3.4/stable 不支援 22.04 base
               channel: latest/stable
               num_units: 1
               to: ["0"]
@@ -127,9 +128,6 @@
             echo "✅ Kubernetes Cluster is Ready! (Worker: $STATUS, Control-Plane: $CP_STATUS)"
             exit 0
           fi
-
-          # ❌ 移除了超時檢查 (Timeout Check Removed)
-          # 只要沒成功，就永遠在這裡繞圈圈
           
           # 4. 休息 10 秒再問
           sleep 10
@@ -138,57 +136,30 @@
         executable: /bin/bash
       register: k8s_wait_result
       changed_when: false 
-      # 注意：這個任務會一直跑，直到 K8s 準備好。
-      # 如果 Juju 卡在 Error，您需要手動在 AWX 按 Cancel 停止它。
 
     # -----------------------------------------------------------
-    # 補救措施：解決 "Unable to find pip3" 與 "kubernetes module" 錯誤
+    # 補救措施：解決 "kubernetes module" 依賴問題 (改用 APT)
     # -----------------------------------------------------------
     
-    # 🟢 [新增步驟] 先安裝 pip3 本體 (這是您缺少的步驟)
-    - name: 4.1.5 安裝系統級 python3-pip
+    # 🟢 [修改] 改用 APT 安裝 Ansible K8s 模組所需的依賴
+    # 這比 pip 更穩定，且不會有 PEP 668 錯誤
+    - name: 4.2 安裝系統級 K8s Python 依賴庫 (APT模式)
       become: yes
       ansible.builtin.apt:
-        name: python3-pip
+        name: 
+          - python3-kubernetes  # 對應 pip 的 kubernetes
+          - python3-yaml        # 對應 pip 的 PyYAML
+          - python3-pip         # 順便裝上 pip 以備不時之需
         state: present
         update_cache: yes
-      # 為了確保不會卡鎖，可以加個重試
       register: apt_result
       until: apt_result is success
       retries: 3
       delay: 5
 
-    # 🟢 [原本步驟] 有了 pip3 之後，才能執行這一步
-    - name: 4.2 安裝 Ansible K8s 模組所需的 Python 依賴庫
-      become: yes
-      ansible.builtin.pip:
-        name: 
-          - kubernetes
-          - PyYAML
-        state: present
-        executable: pip3
-
     # -----------------------------------------------------------
     # 5. Local Path Provisioner
     # -----------------------------------------------------------
-    - name: 5.1 安裝 Local Path Provisioner
-      kubernetes.core.k8s:
-        state: present
-        src: https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
-      environment:
-        KUBECONFIG: "/home/gary/.kube/config"
-
-    # 新增這一段：確保 maasjuju 本機有執行 k8s 模組所需的 Python 庫
-    - name: 4.2 安裝 Ansible K8s 模組所需的 Python 依賴庫
-      become: yes  # 需要 sudo 權限來安裝系統層級的 Python 庫
-      ansible.builtin.pip:
-        name: 
-          - kubernetes
-          - PyYAML
-        state: present
-        executable: pip3
-
-    # 5. Local Path Provisioner
     - name: 5.1 安裝 Local Path Provisioner
       kubernetes.core.k8s:
         state: present
@@ -202,4 +173,4 @@
 
     - name: ✅ 部署完成
       debug:
-        msg: "Charmed Kubernetes 已成功開始部署。etcd 已修正為 latest/stable 以支援 Ubuntu 22.04。"
+        msg: "Charmed Kubernetes 已成功部署，並使用 APT 完成 Python 依賴安裝。"
