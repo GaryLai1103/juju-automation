@@ -1,26 +1,29 @@
 ---
 # ==========================================
-# SKU: Slinky-MicroK8s-v7.0 (Smart Wait)
-# 目標：智慧監控 Juju 狀態，機器一好立刻執行後續動作，不浪費時間
-# 流程：
-#   1. 極速部署 (Deploy & Integrate)
-#   2. 智慧等待 (Smart Wait) -> 直到狀態變更為 Active/Idle
-#   3. 執行 Action (Enable Addons)
+# SKU: Slinky-CharmedK8s-v1.0 (The Real Deal)
+# 目標：放棄 MicroK8s，改用正規 Charmed Kubernetes
+# 架構：
+#   - Machine 0 (VM): Control Plane + Etcd + PKI
+#   - Machine 1 (GPU): Worker Node
+# 優勢：
+#   1. 原生支援 Master/Worker 分離架構
+#   2. 完美支援 juju integrate，不再有 "no relation" 錯誤
+#   3. 生產級架構，適合 HPC/Slinky
 # ==========================================
-- name: Infrastructure Test - Scalable MicroK8s Deployment
+- name: Infrastructure Test - Deploy Charmed Kubernetes
   hosts: maasjuju
   gather_facts: no
   vars:
-    test_model: "slinky-cluster"
+    test_model: "slinky-k8s"
+    # 使用 Charmed Kubernetes 的標準 Channel
     k8s_channel: "1.28/stable"
-    constraint_master: "tags=virtual"
-    constraint_worker: "tags=slurm-node"
+    bundle_path: "/tmp/charmed-k8s-bundle.yaml"
 
   tasks:
     # -------------------------------------------------------
-    # 1. 環境清理 (保持不變)
+    # 1. 環境清理
     # -------------------------------------------------------
-    - name: 1.0 強制清理舊的測試模型
+    - name: 1.0 強制清理舊模型
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
       failed_when: 
@@ -36,72 +39,101 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 極速部署 (保持不變)
+    # 2. 定義正規 K8s Bundle
+    # 說明：這裡我們把 K8s 拆解成獨立組件，並定義它們的去向
     # -------------------------------------------------------
-    - name: 2.1 部署 k8s-master
-      shell: |
-        juju deploy microk8s k8s-master \
-          --model {{ test_model }} \
-          --channel {{ k8s_channel }} \
-          --constraints "{{ constraint_master }}"
+    - name: 2.1 產生 Charmed K8s Bundle
+      copy:
+        dest: "{{ bundle_path }}"
+        content: |
+          description: Slinky Standard K8s Cluster
+          series: jammy
+          
+          # --- 機器定義 ---
+          machines:
+            "0":
+              constraints: tags=virtual
+            "1":
+              constraints: tags=slurm-node
 
-    - name: 2.2 部署 k8s-worker
-      shell: |
-        juju deploy microk8s k8s-worker \
-          --model {{ test_model }} \
-          --channel {{ k8s_channel }} \
-          --constraints "{{ constraint_worker }}"
+          # --- 應用程式定義 ---
+          applications:
+            # 1. 憑證中心 (放在 VM)
+            easyrsa:
+              charm: easyrsa
+              num_units: 1
+              to: ["0"]
+            
+            # 2. 資料庫 (放在 VM)
+            etcd:
+              charm: etcd
+              num_units: 1
+              to: ["0"]
+              options:
+                channel: 3.4/stable
 
-    - name: 3.1 預先建立叢集關聯
-      shell: |
-        juju integrate k8s-master:microk8s k8s-worker:microk8s --model {{ test_model }}
-      register: integrate_result
-      until: integrate_result.rc == 0
-      retries: 20 
-      delay: 5
+            # 3. 控制平面 Master (放在 VM)
+            kubernetes-control-plane:
+              charm: kubernetes-control-plane
+              channel: {{ k8s_channel }}
+              num_units: 1
+              to: ["0"]
+              options:
+                # 允許特權模式 (對某些 HPC 應用重要)
+                allow-privileged: "true"
+
+            # 4. 運算節點 Worker (放在 GPU 裸機)
+            kubernetes-worker:
+              charm: kubernetes-worker
+              channel: {{ k8s_channel }}
+              num_units: 1
+              to: ["1"]
+              expose: true
+
+            # 5. 網路插件 (Calico 是標準)
+            calico:
+              charm: calico
+              
+            # 6. 容器運行時
+            containerd:
+              charm: containerd
+
+          # --- 關聯定義 (這就是 Juju 的魔法) ---
+          relations:
+            - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
+            - ["kubernetes-control-plane:certificates", "easyrsa:client"]
+            - ["etcd:certificates", "easyrsa:client"]
+            - ["kubernetes-control-plane:etcd", "etcd:db"]
+            - ["kubernetes-worker:certificates", "easyrsa:client"]
+            - ["calico:etcd", "etcd:db"]
+            - ["calico:cni", "kubernetes-control-plane:cni"]
+            - ["calico:cni", "kubernetes-worker:cni"]
+            - ["containerd:containerd", "kubernetes-worker:container-runtime"]
+            - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
 
     # -------------------------------------------------------
-    # 4. 智慧等待 (Smart Wait) - 核心修改
-    # 說明：每 30 秒檢查一次 Juju 狀態，直到 Master 和 Worker 都準備好
+    # 3. 部署 Bundle
     # -------------------------------------------------------
-    - name: 4.1 動態監控機器狀態 (等待 Agent 就緒)
+    - name: 3.1 執行部署 (Fire and Forget)
       shell: |
-        # 抓取狀態為 json
-        # 檢查 k8s-master/0 和 k8s-worker/0 的 workload-status 是否為 'active'
-        # 或者是檢查 machines 的 agent-status 是否為 'started'
-        
+        juju deploy {{ bundle_path }} --model {{ test_model }} --trust
+
+    # -------------------------------------------------------
+    # 4. 監控與收尾
+    # -------------------------------------------------------
+    - name: 4.1 等待部署完成 (Smart Wait)
+      shell: |
+        # 檢查 Worker 是否已經 active 且 idle
         juju status --model {{ test_model }} --format json | jq -r '
-          .machines["0"]["agent-status"].current == "started" and 
-          .machines["1"]["agent-status"].current == "started"
+          .applications["kubernetes-worker"]["application-status"].current == "active"
         '
-      register: deployment_check
-      # 條件：當 jq 回傳 "true" 時停止等待
-      until: deployment_check.stdout | trim == "true"
-      # 設定最大等待時間：30秒 * 120次 = 60分鐘 (足夠裸機安裝)
-      retries: 120
-      delay: 30
-      ignore_errors: no # 這裡不能忽略錯誤，必須確保機器真的好了
+      register: k8s_ready
+      until: k8s_ready.stdout | trim == "true"
+      # 正規 K8s 組件較多，安裝時間會比 MicroK8s 稍長
+      retries: 240 # 40 分鐘
+      delay: 10
+      ignore_errors: no
 
-    # 額外緩衝：Agent 剛起來可能還沒準備好接 Action，多等 30 秒保險
-    - name: 4.2 服務暖機緩衝
-      pause:
-        seconds: 30
-
-    # -------------------------------------------------------
-    # 5. 功能啟用 (現在執行絕對安全)
-    # -------------------------------------------------------
-    - name: 5.1 啟用基礎設施 (Master)
-      shell: |
-        juju run k8s-master/0 enable addon=dns --model {{ test_model }}
-        juju run k8s-master/0 enable addon=rbac --model {{ test_model }}
-        juju run k8s-master/0 enable addon=hostpath-storage --model {{ test_model }}
-      ignore_errors: yes
-
-    - name: 5.2 啟用 GPU (Worker)
-      shell: |
-        juju run k8s-worker/0 enable addon=gpu --model {{ test_model }}
-      ignore_errors: yes
-
-    - name: ✅ 部署指令全數完成
+    - name: ✅ 部署完成
       debug:
-        msg: "檢測到所有節點已上線 (Active)，並且插件啟用指令已發送。"
+        msg: "正規 Charmed Kubernetes 部署完成！這是一個標準的 Master/Worker 分離架構。"
