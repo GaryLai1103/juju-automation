@@ -1,10 +1,9 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v1.4-NonInteractive
+# SKU: Slinky-App-Standalone-v1.5-MainBranch
 # 修正：
-#   1. 強制設定 DEBIAN_FRONTEND=noninteractive (解決卡死)
-#   2. 移除 needrestart 干擾
-#   3. 維持 Wget 下載 (保證網路暢通)
+#   1. 將 master.zip 改為 main.zip (GitHub 404 修正)
+#   2. 保留 apt noninteractive 防卡死機制
 # ========================================================
 - name: Application Layer - Deploy Slinky (Slurm)
   hosts: maasjuju
@@ -13,7 +12,8 @@
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    zip_url: "https://github.com/schedmd/slurm-helm-charts/archive/refs/heads/master.zip"
+    # [修正] 改用 main 分支
+    zip_url: "https://github.com/schedmd/slurm-helm-charts/archive/refs/heads/main.zip"
 
   tasks:
     # -----------------------------------------------------------
@@ -32,8 +32,7 @@
     # -----------------------------------------------------------
     # 2. 準備部署工具 (Anti-Hang Mode)
     # -----------------------------------------------------------
-    - name: 2.1 [防卡死修正] 在 Machine 0 安裝 Helm 與工具
-      # 加入環境變數，禁止 apt 跳出問答視窗
+    - name: 2.1 [防卡死] 在 Machine 0 安裝 Helm 與工具
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo snap install helm --classic && \
@@ -42,14 +41,15 @@
       register: tools_install
       changed_when: "'installed' in tools_install.stdout"
 
-    - name: 2.2 使用 Wget 下載原始碼 ZIP
+    - name: 2.2 [網址修正] 下載原始碼 ZIP (Main Branch)
+      # 邏輯更新：處理 main.zip 和 slurm-helm-charts-main 資料夾
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "rm -rf slurm-helm-charts master.zip && \
-         wget -O master.zip {{ zip_url }} && \
-         unzip -o master.zip && \
-         mv slurm-helm-charts-master slurm-helm-charts && \
-         rm master.zip"
+        "rm -rf slurm-helm-charts main.zip && \
+         wget -O main.zip {{ zip_url }} && \
+         unzip -o main.zip && \
+         mv slurm-helm-charts-main slurm-helm-charts && \
+         rm main.zip"
       changed_when: true
 
     - name: 2.3 下載 Chart 依賴套件 (MariaDB)
@@ -147,7 +147,7 @@
     - name: ✅ Slinky 部署完成
       debug:
         msg: 
-          - "🎉 Slurm on K8s (Final Fix) 部署成功！"
+          - "🎉 Slurm on K8s (Main Branch) 部署成功！"
           - "資料庫 (MariaDB) 已自動建立。"
           - "請嘗試 SSH 連線登入節點："
           - "ssh root@{{ master_ip.stdout }} -p 30022"
