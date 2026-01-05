@@ -1,0 +1,152 @@
+---
+# ========================================================
+# SKU: Slinky-App-Standalone-v1.0
+# 前提：必須先執行過 Infrastructure Playbook，確保 K8s 活著
+# 功能：
+#   1. 安裝 Helm
+#   2. 配置 Slinky (含自動 DB + Local Path Storage)
+#   3. 部署 Slurm
+# ========================================================
+- name: Application Layer - Deploy Slinky (Slurm)
+  hosts: maasjuju
+  gather_facts: yes
+  vars:
+    # 這是您剛剛建立的模型名稱，必須一致
+    test_model: "slinky-cluster"
+    
+    # Slurm Helm Chart 設定
+    helm_repo_name: "schedmd"
+    helm_repo_url: "https://schedmd.github.io/slurm-helm-charts/"
+    release_name: "slinky"
+    namespace: "slurm-cluster"
+
+  tasks:
+    # -----------------------------------------------------------
+    # 1. 檢查環境 (防呆機制)
+    # -----------------------------------------------------------
+    - name: 1.1 確認 Machine 0 是否存活
+      shell: juju ssh --model {{ test_model }} 0 -- "echo 'alive'"
+      register: machine_check
+      ignore_errors: yes
+
+    - name: 1.2 終止檢查 (若環境不存在)
+      fail:
+        msg: "❌ 找不到 Machine 0！請先執行 Infrastructure Playbook 建立 K8s 叢集。"
+      when: machine_check.rc != 0
+
+    # -----------------------------------------------------------
+    # 2. 準備部署工具 (Helm)
+    # -----------------------------------------------------------
+    - name: 2.1 在 Machine 0 安裝 Helm (Remote Exec)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "sudo snap install helm --classic"
+      register: helm_install
+      changed_when: "'installed' in helm_install.stdout"
+
+    - name: 2.2 加入 Slurm Helm Repo
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "helm repo add {{ helm_repo_name }} {{ helm_repo_url }} && helm repo update"
+      changed_when: false
+
+    # -----------------------------------------------------------
+    # 3. 設定檔配置 (ConfigMap & Database)
+    # -----------------------------------------------------------
+    - name: 3.1 產生 Slinky 設定檔 (values.yaml)
+      # 這裡整合了您最關心的：資料庫自動啟用 + 使用 local-path 儲存
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/slinky-values.yaml
+        global:
+          clusterName: {{ test_model }}
+
+        # [儲存] 讓所有 PVC 都使用我們剛裝好的 local-path
+        volumeClaimTemplate:
+          accessModes: [ \"ReadWriteOnce\" ]
+          storageClassName: \"local-path\"
+          resources:
+            requests:
+              storage: 10Gi
+
+        # [控制器]
+        slurmctld:
+          persistence:
+            enabled: true
+            storageClassName: \"local-path\"
+            size: 10Gi
+          resources:
+            limits:
+              cpu: 2
+              memory: 4Gi
+
+        # [資料庫] 這裡 enabled: true 會自動建立 MariaDB Pod
+        slurmdbd:
+          enabled: true
+          persistence:
+            enabled: true
+            storageClassName: \"local-path\"
+            size: 10Gi
+          resources:
+            limits:
+              cpu: 2
+              memory: 4Gi
+
+        # [入口] 開啟 NodePort 30022 供 SSH 登入
+        login:
+          enabled: true
+          service:
+            type: NodePort
+            nodePort: 30022
+          ssh:
+            enabled: true
+          persistence:
+            enabled: true
+            storageClassName: \"local-path\"
+            size: 10Gi
+
+        # [運算節點]
+        slurmd:
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits: 
+              cpu: 16  
+              memory: 64Gi
+          persistence:
+            enabled: true
+            storageClassName: \"local-path\"
+            size: 50Gi
+        EOF"
+      changed_when: false
+
+    # -----------------------------------------------------------
+    # 4. 執行部署
+    # -----------------------------------------------------------
+    - name: 4.1 安裝/更新 Slurm (Helm Install)
+      # 加上 --wait 代表會等到 Pod 變成 Running 才回報成功 (最多等 10分鐘)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "helm upgrade --install {{ release_name }} {{ helm_repo_name }}/slurm-cluster \
+          --namespace {{ namespace }} \
+          --create-namespace \
+          -f /home/ubuntu/slinky-values.yaml \
+          --wait --timeout 10m"
+      register: helm_deploy
+      changed_when: "'Release \"{{ release_name }}\" does not exist' in helm_deploy.stderr or 'Happy Helming' in helm_deploy.stdout"
+
+    # -----------------------------------------------------------
+    # 5. 資訊顯示
+    # -----------------------------------------------------------
+    - name: 5.1 獲取 Machine 0 IP
+      shell: |
+        juju status --model {{ test_model }} --format json | jq -r '.machines["0"]["dns-name"]'
+      register: master_ip
+
+    - name: ✅ Slinky 部署完成
+      debug:
+        msg: 
+          - "🎉 Slurm on K8s 部署成功！"
+          - "資料庫 (MariaDB) 與 Slurmdbd 已自動建立。"
+          - "請嘗試 SSH 連線登入節點："
+          - "ssh root@{{ master_ip.stdout }} -p 30022"
