@@ -1,93 +1,136 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v2.0-StackHPC
-# 策略：
-#   1. 放棄 SchedMD (連結失效)，改用 StackHPC (社群主流)
-#   2. 使用 Git Clone (StackHPC 支援 master 分支)
-#   3. 調整 Values 以符合 StackHPC Chart 格式
+# SKU: Slinky-App-Standalone-v3.0-NFS
+# 架構：
+#   1. [Host] 在 Machine 0 安裝 NFS Server
+#   2. [K8s]  安裝 NFS Subdir Provisioner (連接 Host NFS)
+#   3. [App]  部署 StackHPC Slurm (開啟 ReadWriteMany)
 # ========================================================
-- name: Application Layer - Deploy Slurm (StackHPC)
+- name: Application Layer - Deploy NFS & Slurm
   hosts: maasjuju
   gather_facts: yes
   vars:
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    # [新目標] StackHPC 的 Repo
-    git_repo_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
+    # Slurm Chart Repo
+    slurm_git_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
+    # NFS 設定
+    nfs_path: "/srv/nfs/kubedata"
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 檢查環境
+    # 1. 準備工作 & 獲取 IP
     # -----------------------------------------------------------
-    - name: 1.1 確認 Machine 0 是否存活
+    - name: 1.1 確認 Machine 0 存活
       shell: juju ssh --model {{ test_model }} 0 -- "echo 'alive'"
       register: machine_check
       ignore_errors: yes
 
-    - name: 1.2 終止檢查
-      fail:
-        msg: "❌ 找不到 Machine 0！請先執行 Infrastructure Playbook。"
-      when: machine_check.rc != 0
+    - name: 1.2 獲取 Machine 0 內網 IP (NFS Server IP)
+      # 這是關鍵！我們要抓出 Machine 0 在內網的 IP
+      shell: |
+        juju status --model {{ test_model }} --format json | jq -r '.machines["0"]["dns-name"]'
+      register: nfs_server_ip
+
+    - name: 顯示 NFS Server IP
+      debug:
+        msg: "NFS Server 將架設於: {{ nfs_server_ip.stdout }}"
 
     # -----------------------------------------------------------
-    # 2. 準備部署工具
+    # 2. [系統層] 架設 NFS Server (在 Machine 0 實體機上)
     # -----------------------------------------------------------
-    - name: 2.1 在 Machine 0 安裝 Helm 與工具 (Quiet Mode)
+    - name: 2.1 安裝 NFS Kernel Server
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "sudo snap install helm --classic && \
-         sudo apt-get update && \
-         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' git"
-      register: tools_install
-      changed_when: "'installed' in tools_install.stdout"
-
-    - name: 2.2 下載 StackHPC Chart (Git Clone)
-      # StackHPC 的 master 分支是存在的，直接 clone
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "rm -rf slurm-k8s-cluster && \
-         git clone --depth 1 {{ git_repo_url }}"
+        "sudo apt-get update && \
+         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server"
       changed_when: true
 
-    - name: 2.3 下載依賴 (StackHPC 依賴 MariaDB 等)
+    - name: 2.2 建立共享目錄
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "sudo mkdir -p {{ nfs_path }} && \
+         sudo chown nobody:nogroup {{ nfs_path }} && \
+         sudo chmod 777 {{ nfs_path }}"
+      changed_when: true
+
+    - name: 2.3 設定 Exports 並啟動服務
+      # 允許內網所有機器掛載 (insecure, no_root_squash 是為了方便 K8s 操作)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "echo '{{ nfs_path }} *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports && \
+         sudo exportfs -a && \
+         sudo systemctl restart nfs-kernel-server"
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 3. [K8s 層] 安裝 NFS Provisioner (StorageClass)
+    # -----------------------------------------------------------
+    - name: 3.1 加入 NFS Provisioner Helm Repo
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ && \
+         helm repo update"
+      changed_when: false
+
+    - name: 3.2 安裝 NFS Provisioner
+      # 這會建立一個名為 'nfs-client' 的 StorageClass
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "helm upgrade --install nfs-client nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+          --set nfs.server={{ nfs_server_ip.stdout }} \
+          --set nfs.path={{ nfs_path }} \
+          --set storageClass.name=nfs-client \
+          --set storageClass.defaultClass=true"
+      register: nfs_deploy
+      changed_when: "'Happy Helming' in nfs_deploy.stdout"
+
+    # -----------------------------------------------------------
+    # 4. [應用層] 部署 Slurm (使用 NFS RWX)
+    # -----------------------------------------------------------
+    - name: 4.1 下載 Slurm Chart (StackHPC)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "sudo apt-get install -y git && \
+         rm -rf slurm-k8s-cluster && \
+         git clone --depth 1 {{ slurm_git_url }}"
+      changed_when: true
+
+    - name: 4.2 下載依賴
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "cd slurm-k8s-cluster/slurm-cluster-chart && helm dependency update"
       changed_when: true
 
-    # -----------------------------------------------------------
-    # 3. 設定檔配置 (適配 StackHPC 格式)
-    # -----------------------------------------------------------
-    - name: 3.1 產生 StackHPC 專用 values.yaml
-      # StackHPC 的參數結構與 SchedMD 不同，這裡做了對應調整
+    - name: 4.3 產生 Values (開啟 RWX 模式！)
+      # [重點] 這裡 storageClassName 改成 'nfs-client'
+      # [重點] accessModes 改回 'ReadWriteMany' (因為 NFS 支援！)
       shell: |
-        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/stackhpc-values.yaml
+        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/slurm-nfs-values.yaml
         global:
           clusterName: {{ test_model }}
 
-        # 1. 儲存設定 (使用 local-path)
-        # StackHPC 通常會自動裝 NFS，我們這裡盡量用 local-path 覆蓋
+        # [儲存設定]
+        # 使用剛剛建立的 NFS StorageClass
         volumeClaim:
-          storageClassName: \"local-path\"
-          size: 10Gi
+          storageClassName: \"nfs-client\"
+          accessModes: [ \"ReadWriteMany\" ]
+          size: 20Gi
 
-        # 2. 控制器設定
         controller:
           size: 10Gi
-          storageClassName: \"local-path\"
+          storageClassName: \"nfs-client\"
           resources:
             limits:
               cpu: 2
               memory: 4Gi
 
-        # 3. 資料庫設定 (StackHPC 內建 MariaDB 依賴)
         slurmdbd:
           enabled: true
-          storageClassName: \"local-path\"
+          storageClassName: \"nfs-client\"
           size: 10Gi
 
-        # 4. 登入節點 (開啟 NodePort)
         login:
           service:
             type: NodePort
@@ -95,43 +138,31 @@
           ssh:
             enabled: true
 
-        # 5. 運算節點
         worker:
           replicas: 1
           resources:
             limits:
-              cpu: 16
-              memory: 64Gi
+              cpu: 8
+              memory: 16Gi
         EOF"
       changed_when: false
 
-    # -----------------------------------------------------------
-    # 4. 執行部署
-    # -----------------------------------------------------------
-    - name: 4.1 安裝 StackHPC Slurm Chart
+    - name: 4.4 部署/更新 Slurm
+      # 先砍掉舊 PVC (如果有的話)，確保乾淨重建
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
+        "kubectl delete pvc --all -n {{ namespace }} --wait=false || true && \
+         helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
           --namespace {{ namespace }} \
           --create-namespace \
-          -f /home/ubuntu/stackhpc-values.yaml \
+          -f /home/ubuntu/slurm-nfs-values.yaml \
           --wait --timeout 15m"
-      register: helm_deploy
-      changed_when: "'Release \"{{ release_name }}\" does not exist' in helm_deploy.stderr or 'Happy Helming' in helm_deploy.stdout"
+      register: slurm_deploy
 
-    # -----------------------------------------------------------
-    # 5. 資訊顯示
-    # -----------------------------------------------------------
-    - name: 5.1 獲取 Machine 0 IP
-      shell: |
-        juju status --model {{ test_model }} --format json | jq -r '.machines["0"]["dns-name"]'
-      register: master_ip
-
-    - name: ✅ StackHPC Slurm 部署完成
+    - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 Slurm on K8s (StackHPC Version) 部署成功！"
-          - "這個 Repo 穩定多了，資料庫也已自動建立。"
-          - "請嘗試 SSH 連線登入節點："
-          - "ssh rocky@{{ master_ip.stdout }} -p 30022" 
-          - "(注意：StackHPC 預設使用者可能是 'rocky' 或 'ubuntu'，請依實際情況測試)"
+          - "🎉 Slurm + NFS 架構部署成功！"
+          - "NFS Server IP: {{ nfs_server_ip.stdout }}"
+          - "StorageClass: nfs-client (ReadWriteMany 支援)"
+          - "現在多個 Worker 節點可以同時讀寫 /home 目錄了。"
