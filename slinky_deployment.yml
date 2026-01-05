@@ -145,8 +145,8 @@
         executable: /bin/bash
       register: k8s_wait_result
       changed_when: false 
-      async: 1500
-      poll: 10
+      #async      
+      #poll    
 
     # -----------------------------------------------------------
     # 補救措施：解決 "Unable to find pip3" 與 "kubernetes module" 錯誤
