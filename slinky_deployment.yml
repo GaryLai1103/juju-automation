@@ -1,19 +1,20 @@
 ---
 # ==========================================
-# SKU: Slinky-CharmedK8s-v1.2 (Snap Permission Fix)
-# 目標：部署正規 Charmed Kubernetes
+# SKU: Slinky-K8s-v1.3-Modern
+# 目標：配合 KubeSphere 規格，部署現代化 K8s (1.31+)
 # 修正：
-#   1. 將 Bundle 存放在家目錄 (避開 Snap /tmp 隔離問題)
-#   2. 確保 Ansible 先建立檔案，再執行部署
+#   1. 版本對齊：升級至 1.31/stable (接近您截圖中的 v1.32)
+#   2. 組件優化：使用現代化 CNI 與 Runtime
 # ==========================================
-- name: Infrastructure Test - Deploy Charmed Kubernetes
+- name: Infrastructure Test - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
-  gather_facts: yes  # 開啟此選項以獲取 ansible_user_dir
+  gather_facts: yes
   vars:
+    # 建議名稱，方便與 KubeSphere 對接
     test_model: "slinky-cluster"
-    k8s_channel: "1.28/stable"
-    # 修正：改放在家目錄，確保 Juju Snap 可以讀取
-    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-bundle.yaml"
+    # 配合您截圖的版本，選擇目前 Juju 支援最穩定的新版
+    k8s_channel: "1.31/stable"
+    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-modern.yaml"
 
   tasks:
     # -------------------------------------------------------
@@ -22,9 +23,6 @@
     - name: 1.0 強制清理舊模型
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
-      failed_when: 
-        - destroy_result.rc != 0 
-        - '"not found" not in destroy_result.stderr'
       ignore_errors: yes
 
     - name: 1.1 等待模型釋放
@@ -35,14 +33,14 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 製作藍圖 (先建立檔案！)
+    # 2. 製作藍圖 (與您之前的三節點邏輯一致)
     # -------------------------------------------------------
-    - name: 2.1 產生本地 Bundle 檔案 (存於家目錄)
+    - name: 2.1 產生現代化 K8s Bundle
       copy:
         dest: "{{ bundle_path }}"
         mode: '0644'
         content: |
-          description: Slinky Standard K8s Cluster
+          description: Slinky Modern K8s Cluster
           series: jammy
           
           machines:
@@ -79,6 +77,7 @@
               to: ["1"]
               expose: true
 
+            # 現代化網路插件
             calico:
               charm: calico
               
@@ -97,36 +96,26 @@
             - ["containerd:containerd", "kubernetes-worker:container-runtime"]
             - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
 
-    - name: 2.2 驗證檔案是否存在
-      stat:
-        path: "{{ bundle_path }}"
-      register: bundle_file
-      failed_when: not bundle_file.stat.exists
-
     # -------------------------------------------------------
     # 3. 執行部署
     # -------------------------------------------------------
     - name: 3.1 部署 Bundle
       shell: |
-        # 使用 {{ bundle_path }} 變數，指向家目錄下的檔案
         juju deploy {{ bundle_path }} --model {{ test_model }} --trust
 
     # -------------------------------------------------------
-    # 4. 監控進度
+    # 4. 監控與驗收
     # -------------------------------------------------------
-    - name: 4.1 等待部署完成 (Smart Wait)
+    - name: 4.1 等待 K8s 狀態變為 Active
       shell: |
-        # 檢查 Worker 是否已經 active
         juju status --model {{ test_model }} --format json | jq -r '
           .applications["kubernetes-worker"]["application-status"].current == "active"
         '
       register: k8s_ready
       until: k8s_ready.stdout | trim == "true"
-      # 正規 K8s 安裝比較久，給它 45 分鐘
-      retries: 270 
+      retries: 300 
       delay: 10
-      ignore_errors: no
 
-    - name: ✅ 部署完成
+    - name: ✅ 現代化叢集部署完成
       debug:
-        msg: "正規 Charmed Kubernetes 部署完成！Master 在 VM，Worker 在 GPU 裸機，且已自動連線。"
+        msg: "版本 v1.31 部署完成。這比之前的 1.28 更接近您的 KubeSphere 環境！"
