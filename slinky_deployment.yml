@@ -1,16 +1,16 @@
 ---
 # ==========================================
-# SKU: Slinky-K8s-v1.4-Resilient (Fixed Model Name)
+# SKU: Slinky-K8s-v1.4-Clean
 # 修正：
-#   1. 固定 test_model 為 "slinky-cluster"
-#   2. 處理 Charmhub 連線重置問題 (Connection Reset)
-#   3. 更新語法從 series 到 base (Ubuntu 22.04)
+#   1. 移除所有非 YAML 語法的中文干擾
+#   2. 固定使用 slinky-cluster 模型
+#   3. 使用 Base: ubuntu@22.04 語法
 # ==========================================
 - name: Infrastructure Test - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
   gather_facts: yes
   vars:
-    # 固定使用 slinky-cluster
+    # 固定模型名稱，不再更換
     test_model: "slinky-cluster"
     k8s_channel: "1.31/stable"
     bundle_path: "{{ ansible_user_dir }}/charmed-k8s-modern.yaml"
@@ -22,6 +22,9 @@
     - name: 1.0 強制清理舊模型
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
+      failed_when: 
+        - destroy_result.rc != 0 
+        - '"not found" not in destroy_result.stderr'
       ignore_errors: yes
 
     - name: 1.1 等待模型釋放
@@ -32,9 +35,9 @@
       shell: juju add-model {{ test_model }}
 
     # -------------------------------------------------------
-    # 2. 製作藍圖 (使用 Base 語法)
+    # 2. 製作藍圖
     # -------------------------------------------------------
-    - name: 2.1 產生現代化 K8s Bundle
+    - name: 2.1 產生本地 Bundle 檔案
       copy:
         dest: "{{ bundle_path }}"
         mode: '0644'
@@ -118,12 +121,8 @@
       register: k8s_ready
       until: k8s_ready.stdout | trim == "true"
       retries: 300 
-      delay: 10
+      delay: 15
 
-    - name: ✅ 現代化叢集部署完成
+    - name: ✅ 部署完成指令
       debug:
-        msg: "Charmed Kubernetes 已成功部署至 slinky-cluster 模型。"
-
-好的，我會儲存到個人化記憶中。
-
-如果想把這個指令儲存為個人化指令，可以在[個人化脈絡設定](https://gemini.google.com/personal-context)中手動加入。
+        msg: "Charmed Kubernetes 已成功部署至 slinky-cluster 模型。請監看 juju status 以獲取進度。"
