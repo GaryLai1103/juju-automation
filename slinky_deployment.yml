@@ -109,15 +109,45 @@
       delay: 10
 
     # 4. 監控與驗收
-    - name: 4.1 等待 K8s 狀態變為 Active
+    - name: 4.1 等待 K8s 狀態變為 Active (Clean Log)
       shell: |
-        juju status --model {{ test_model }} --format json | jq -r '
-          .applications["kubernetes-worker"]["application-status"].current == "active"
-        '
-      register: k8s_ready
-      until: k8s_ready.stdout | trim == "true"
-      retries: 500 
-      delay: 60
+        echo "⏳ 開始監測 Kubernetes 狀態..."
+        START_TIME=$(date +%s)
+        TIMEOUT=1200  # 設定超時時間 (秒)，例如 20 分鐘
+        
+        while true; do
+          # 1. 獲取 Worker 狀態
+          STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-worker"]["application-status"].current')
+          
+          # 2. 獲取 Control Plane 狀態 (選用，確保大腦也好了)
+          CP_STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-control-plane"]["application-status"].current')
+
+          # 3. 判斷是否兩者皆為 active
+          if [ "$STATUS" == "active" ] && [ "$CP_STATUS" == "active" ]; then
+            echo "✅ Kubernetes Cluster is Ready! (Worker: $STATUS, Control-Plane: $CP_STATUS)"
+            exit 0
+          fi
+
+          # 4. 檢查超時
+          CURRENT_TIME=$(date +%s)
+          ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+          if [ $ELAPSED_TIME -ge $TIMEOUT ]; then
+            echo "❌ Timeout waiting for Kubernetes to become active."
+            exit 1
+          fi
+
+          # 5. 等待並重試 (每 10 秒檢查一次，不洗版)
+          # echo "   ... Current status: Worker=$STATUS, CP=$CP_STATUS (Elapsed: ${ELAPSED_TIME}s)" 
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      register: k8s_wait_result
+      # 設定 changed_when: false 讓成功時顯示綠色 ok，而不是黃色 changed (看個人喜好)
+      changed_when: false 
+      # 這裡的 timeout 是 Ansible task 層級的保險，建議比腳本內的 TIMEOUT 稍長
+      async: 1500
+      poll: 10
 
     # 新增這一段：確保 maasjuju 本機有執行 k8s 模組所需的 Python 庫
     - name: 4.2 安裝 Ansible K8s 模組所需的 Python 依賴庫
