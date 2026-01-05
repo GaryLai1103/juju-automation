@@ -10,7 +10,7 @@
   hosts: maasjuju
   gather_facts: yes  # 開啟此選項以獲取 ansible_user_dir
   vars:
-    test_model: "slinky-k8s"
+    test_model: "slinky-cluster"
     k8s_channel: "1.28/stable"
     # 修正：改放在家目錄，確保 Juju Snap 可以讀取
     bundle_path: "{{ ansible_user_dir }}/charmed-k8s-bundle.yaml"
