@@ -1,182 +1,62 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v4.7-TheSwap
-# 策略：
-#   1. [Helm] 讓 Helm 建立錯誤的 PVC (避開所有權衝突)
-#   2. [Ansible] 使用 --wait=false 不等待 Helm 完成
-#   3. [Swap] 刪除 Helm 建的壞 PVC -> 換成我們的好 PVC
+# SKU: Slinky-App-Standalone-v4.8-FixCgroup
+# 修正：
+#   1. [Fix Crash] 修改 slurm.conf，將 ProctrackType 改為 linuxproc
+#   2. [Fix Crash] 禁用 TaskPlugin 的 cgroup 功能
+#   3. [Restart] 重啟 slurmd 讓設定生效
 # ========================================================
-- name: Application Layer - Deploy Slurm (The Swap Strategy)
+- name: Application Layer - Deploy Slurm (Fix Cgroup Crash)
   hosts: maasjuju
   gather_facts: yes
   vars:
     test_model: "slinky-cluster"
-    release_name: "slinky"
     namespace: "slurm-cluster"
-    slurm_git_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
-    nfs_path: "/srv/nfs/kubedata"
-    nfs_server_ip: "192.168.1.96"
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 徹底歸零 (確保沒有殘留衝突)
+    # 1. 修改 Slurm 設定檔 (ConfigMap)
     # -----------------------------------------------------------
-    - name: 1.1 移除舊的 Helm Release
+    - name: 1.1 從 K8s 抓取目前的 slurm.conf
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "helm uninstall {{ release_name }} -n {{ namespace }} --wait=false 2>/dev/null || true"
-      changed_when: true
-
-    - name: 1.2 刪除舊的 PVC
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false 2>/dev/null || true"
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 2. 準備好正確的 PV (Server Side)
-    # -----------------------------------------------------------
-    - name: 2.1 建立 PV (Base64)
-      vars:
-        pv_yaml_content: |
-          apiVersion: v1
-          kind: PersistentVolume
-          metadata:
-            name: slurm-nfs-pv
-            labels:
-              type: nfs-static
-          spec:
-            capacity:
-              storage: 20Gi
-            accessModes:
-              - ReadWriteMany
-            persistentVolumeReclaimPolicy: Retain
-            storageClassName: ""
-            nfs:
-              path: {{ nfs_path }}
-              server: {{ nfs_server_ip }}
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "echo '{{ pv_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pv.yaml && \
-         kubectl delete pv slurm-nfs-pv --wait=false 2>/dev/null || true && \
-         kubectl apply -f /home/ubuntu/slurm-pv.yaml"
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 3. 執行 Helm (讓它建立錯誤的 PVC)
-    # -----------------------------------------------------------
-    - name: 3.1 產生 Values
-      # 這裡我們讓 Helm 覺得一切正常，rook 關掉，PVC 自己建
-      vars:
-        values_content: |
-          global:
-            clusterName: {{ test_model }}
-          rook-nfs:
-            enabled: false
-          volumeClaim:
-            create: true  # <--- 讓 Helm 建立 PVC (即使它會設錯 StorageClass)
-            name: slurm-shared-storage
-            accessModes:
-              - ReadWriteMany
-            size: 20Gi
-          controller:
-            size: 10Gi
-            storageClassName: "local-path"
-            resources:
-              limits:
-                cpu: 2
-                memory: 4Gi
-          slurmdbd:
-            enabled: true
-            storageClassName: "local-path"
-            size: 10Gi
-          login:
-            service:
-              type: NodePort
-              nodePort: 30022
-            ssh:
-              enabled: true
-          worker:
-            replicas: 1
-            resources:
-              limits:
-                cpu: 8
-                memory: 16Gi
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "echo '{{ values_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-static-values.yaml"
+        "kubectl get cm slurm-conf-configmap -n {{ namespace }} -o jsonpath='{.data.slurm\.conf}' > /home/ubuntu/slurm.conf.current"
       changed_when: false
 
-    - name: 3.2 部署 Slurm (不等待)
-      # 關鍵：加上 --wait=false，因為我們知道它一開始會失敗(Pending)，不要讓 Ansible 卡住
+    - name: 1.2 修改設定 (Cgroup -> LinuxProc)
+      # 我們用 sed 直接替換設定檔中的關鍵行
+      # 1. ProctrackType=proctrack/cgroup -> ProctrackType=proctrack/linuxproc
+      # 2. TaskPlugin=task/cgroup -> TaskPlugin=task/none (或註解掉)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
-          --namespace {{ namespace }} \
-          --create-namespace \
-          -f /home/ubuntu/slurm-static-values.yaml \
-          --wait=false" 
-      register: helm_deploy
-
-    # -----------------------------------------------------------
-    # 4. 手術調包 (Swap the PVC)
-    # -----------------------------------------------------------
-    - name: 4.1 等待 Helm 建立那個錯誤的 PVC
-      shell: juju ssh --model {{ test_model }} 0 -- "kubectl get pvc slurm-shared-storage -n {{ namespace }}"
-      register: pvc_check
-      until: pvc_check.rc == 0
-      retries: 30
-      delay: 2
-      ignore_errors: yes
-
-    - name: 4.2 刪除 Helm 建立的錯誤 PVC
-      # 刪除那個 StorageClass=slurm-rook-nfs 的 PVC
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false"
+        "sed -i 's/ProctrackType=proctrack\/cgroup/ProctrackType=proctrack\/linuxproc/g' /home/ubuntu/slurm.conf.current && \
+         sed -i 's/TaskPlugin=task\/cgroup/TaskPlugin=task\/none/g' /home/ubuntu/slurm.conf.current && \
+         sed -i 's/TaskPlugin=task\/affinity,task\/cgroup/TaskPlugin=task\/affinity/g' /home/ubuntu/slurm.conf.current"
       changed_when: true
 
-    - name: 4.3 塞入正確的 PVC (偷天換日)
-      # 名字一樣，但是 StorageClass 是空字串，且綁定 PV
-      vars:
-        pvc_yaml_content: |
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: slurm-shared-storage
-            namespace: {{ namespace }}
-            labels:
-              app.kubernetes.io/managed-by: Helm  # 加上標籤讓 Helm 以為還活著
-            annotations:
-              meta.helm.sh/release-name: {{ release_name }}
-              meta.helm.sh/release-namespace: {{ namespace }}
-          spec:
-            accessModes:
-              - ReadWriteMany
-            resources:
-              requests:
-                storage: 20Gi
-            volumeName: slurm-nfs-pv  # <--- 強制綁定
-            storageClassName: ""      # <--- 修正 StorageClass
+    - name: 1.3 將修改後的設定寫回 K8s ConfigMap
+      # 這招很實用：用 --from-file 直接更新 ConfigMap 中的特定鍵值
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc-correct.yaml && \
-         kubectl apply -f /home/ubuntu/slurm-pvc-correct.yaml"
+        "kubectl create configmap slurm-conf-configmap \
+          --from-file=slurm.conf=/home/ubuntu/slurm.conf.current \
+          -n {{ namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5. 重啟 Pod (讓它們讀到新的 PVC)
+    # 2. 重啟 Worker 節點
     # -----------------------------------------------------------
-    - name: 5.1 刪除 Pod 以觸發重新掛載
+    - name: 2.1 刪除崩潰的運算節點 (讓它重啟讀取新設定)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "kubectl delete pod --all -n {{ namespace }} --wait=false"
+        "kubectl delete pod -l app.kubernetes.io/component=slurmd -n {{ namespace }} --wait=false"
       changed_when: true
 
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 V4.7 (調包計) 執行成功！"
-          - "我們替換了 PVC，避開了 Helm 的錯誤設定。"
-          - "Pod 正在重啟並掛載正確的 NFS。"
-          - "請等待幾秒後檢查: kubectl get pods -n slurm-cluster"
+          - "🎉 V4.8 (Cgroup Fix) 執行成功！"
+          - "已將 Slurm 進程追蹤模式改為 linuxproc。"
+          - "運算節點正在重啟中..."
+          - "請等待 30 秒後檢查: kubectl get pods -n slurm-cluster"
