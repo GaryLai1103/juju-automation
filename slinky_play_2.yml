@@ -1,12 +1,12 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v4.5-TakeControl
+# SKU: Slinky-App-Standalone-v4.6-LabelSpoofing
 # 修正：
-#   1. [Root Cause] 解決 Helm 強制使用 slurm-rook-nfs 的問題
-#   2. [Strategy] 改回 "手動建立 PVC"，並設定 Helm create: false
-#   3. [Binding] 透過手動 PVC 強制綁定靜態 PV
+#   1. [Conflict] 手動建立 PVC 時，加上 Helm 的 Metadata (Labels/Annotations)
+#   2. [Adoption] 欺騙 Helm 讓它 "認養" 這個現有的 PVC
+#   3. [Storage] 確保 StorageClass 正確綁定到靜態 PV
 # ========================================================
-- name: Application Layer - Deploy Slurm (Manual PVC Override)
+- name: Application Layer - Deploy Slurm (Trojan Horse PVC)
   hosts: maasjuju
   gather_facts: yes
   vars:
@@ -19,22 +19,22 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 清理舊的 Helm 與 PVC (確保乾淨重來)
+    # 1. 徹底清理衝突現場
     # -----------------------------------------------------------
-    - name: 1.1 移除舊的 Helm Release
+    - name: 1.1 移除 Helm Release
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm uninstall {{ release_name }} -n {{ namespace }} --wait=false 2>/dev/null || true"
       changed_when: true
 
-    - name: 1.2 刪除卡住的 PVC (必須刪除才能重建正確的)
+    - name: 1.2 刪除舊的 PVC (必須刪除才能重建帶標籤的)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false 2>/dev/null || true"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 2. 手動建立 PV (Server Side)
+    # 2. 建立 PV (維持不變)
     # -----------------------------------------------------------
     - name: 2.1 建立 PV (Base64)
       vars:
@@ -63,11 +63,11 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3. 手動建立 PVC (Client Side - 奪權關鍵)
+    # 3. 建立 "偽裝" PVC (關鍵步驟！)
     # -----------------------------------------------------------
-    - name: 3.1 建立 PVC (強制綁定 PV，不讓 Helm 插手)
-      # [重點] storageClassName: "" 是空字串
-      # [重點] volumeName: slurm-nfs-pv 直接指定 PV
+    - name: 3.1 建立帶有 Helm 標籤的 PVC
+      # 這裡我們加上了 labels 和 annotations
+      # Helm 看到這些就會認為這個資源是它管理的，從而停止報錯並直接使用
       vars:
         pvc_yaml_content: |
           apiVersion: v1
@@ -75,6 +75,11 @@
           metadata:
             name: slurm-shared-storage
             namespace: {{ namespace }}
+            labels:
+              app.kubernetes.io/managed-by: Helm
+            annotations:
+              meta.helm.sh/release-name: {{ release_name }}
+              meta.helm.sh/release-namespace: {{ namespace }}
           spec:
             accessModes:
               - ReadWriteMany
@@ -93,20 +98,26 @@
     # -----------------------------------------------------------
     # 4. 部署 Slurm
     # -----------------------------------------------------------
-    - name: 4.1 產生 Values (禁用 PVC 建立)
-      # [重點] volumeClaim.create: false -> 告訴 Helm 用我們剛建好的 PVC
-      # [重點] rook-nfs.enabled: false -> 依然要關掉，避免其他干擾
+    - name: 4.1 產生 Values (配合偽裝)
+      # 雖然我們手動建了 PVC，但為了配合 Chart 邏輯，
+      # 我們還是把 storageClassName 設為空，並再次強調禁用 rook
       vars:
         values_content: |
           global:
             clusterName: {{ test_model }}
           
+          # 依然禁用 Rook
           rook-nfs:
             enabled: false
           
           volumeClaim:
-            create: false
+            create: true  # 這裡設為 true 也沒關係了，因為 Helm 會發現 PVC 已存在且有標籤
             name: slurm-shared-storage
+            storageClassName: ""
+            volumeName: slurm-nfs-pv
+            accessModes:
+              - ReadWriteMany
+            size: 20Gi
             
           controller:
             size: 10Gi
@@ -149,7 +160,7 @@
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 V4.5 (奪權版) 部署成功！"
-          - "PVC 已手動建立，強制綁定 NFS PV。"
-          - "Helm 已被禁止建立 PVC，避免了 StorageClass 錯誤。"
+          - "🎉 V4.6 (標籤偽裝版) 部署成功！"
+          - "PVC 已偽造 Helm 標籤，成功騙過 Helm 進行認養。"
+          - "StorageClass 錯誤應已解決。"
           - "請檢查: kubectl get pvc -n slurm-cluster"
