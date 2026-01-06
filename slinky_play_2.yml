@@ -1,21 +1,19 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v3.0-NFS
-# 架構：
-#   1. [Host] 在 Machine 0 安裝 NFS Server
-#   2. [K8s]  安裝 NFS Subdir Provisioner (連接 Host NFS)
-#   3. [App]  部署 StackHPC Slurm (開啟 ReadWriteMany)
+# SKU: Slinky-App-Standalone-v3.1-StaticNFS
+# 策略：
+#   1. [System] 確保 Machine 0 有 NFS Server
+#   2. [K8s] 手動建立 PV (對應 NFS IP) 與 PVC
+#   3. [Helm] 強制使用現有 PVC，禁止 Helm 亂裝 Rook
 # ========================================================
-- name: Application Layer - Deploy NFS & Slurm
+- name: Application Layer - Deploy Slurm (Static NFS)
   hosts: maasjuju
   gather_facts: yes
   vars:
     test_model: "slinky-cluster"
     release_name: "slinky"
     namespace: "slurm-cluster"
-    # Slurm Chart Repo
     slurm_git_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
-    # NFS 設定
     nfs_path: "/srv/nfs/kubedata"
 
   tasks:
@@ -28,68 +26,76 @@
       ignore_errors: yes
 
     - name: 1.2 獲取 Machine 0 內網 IP (NFS Server IP)
-      # 這是關鍵！我們要抓出 Machine 0 在內網的 IP
       shell: |
         juju status --model {{ test_model }} --format json | jq -r '.machines["0"]["dns-name"]'
       register: nfs_server_ip
 
-    - name: 顯示 NFS Server IP
-      debug:
-        msg: "NFS Server 將架設於: {{ nfs_server_ip.stdout }}"
-
     # -----------------------------------------------------------
-    # 2. [系統層] 架設 NFS Server (在 Machine 0 實體機上)
+    # 2. 確保 NFS Server 運作中 (Host 端)
     # -----------------------------------------------------------
-    - name: 2.1 安裝 NFS Kernel Server
+    - name: 2.1 安裝並設定 NFS Server
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get update && \
-         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server"
-      changed_when: true
-
-    - name: 2.2 建立共享目錄
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "sudo mkdir -p {{ nfs_path }} && \
+         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server && \
+         sudo mkdir -p {{ nfs_path }} && \
          sudo chown nobody:nogroup {{ nfs_path }} && \
-         sudo chmod 777 {{ nfs_path }}"
-      changed_when: true
-
-    - name: 2.3 設定 Exports 並啟動服務
-      # 允許內網所有機器掛載 (insecure, no_root_squash 是為了方便 K8s 操作)
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "echo '{{ nfs_path }} *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports && \
+         sudo chmod 777 {{ nfs_path }} && \
+         echo '{{ nfs_path }} *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports && \
          sudo exportfs -a && \
          sudo systemctl restart nfs-kernel-server"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3. [K8s 層] 安裝 NFS Provisioner (StorageClass)
+    # 3. [關鍵] 手動建立 Static PV 和 PVC
     # -----------------------------------------------------------
-    - name: 3.1 加入 NFS Provisioner Helm Repo
+    - name: 3.1 建立 PV/PVC 定義檔
+      # 這裡我們直接寫死 IP，把 K8s 的儲存對接到 Machine 0
       shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ && \
-         helm repo update"
+        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/static-nfs.yaml
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: slurm-nfs-pv
+        spec:
+          capacity:
+            storage: 20Gi
+          accessModes:
+            - ReadWriteMany
+          persistentVolumeReclaimPolicy: Retain
+          nfs:
+            path: {{ nfs_path }}
+            server: {{ nfs_server_ip.stdout }}
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: slurm-shared-storage
+          namespace: {{ namespace }}
+        spec:
+          accessModes:
+            - ReadWriteMany
+          resources:
+            requests:
+              storage: 20Gi
+          volumeName: slurm-nfs-pv
+          storageClassName: \"\"  # 留空代表靜態綁定，不使用 StorageClass
+        EOF"
       changed_when: false
 
-    - name: 3.2 安裝 NFS Provisioner
-      # 這會建立一個名為 'nfs-client' 的 StorageClass
+    - name: 3.2 應用 PV/PVC
+      # 先建立 Namespace，再建立 PVC
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "helm upgrade --install nfs-client nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-          --set nfs.server={{ nfs_server_ip.stdout }} \
-          --set nfs.path={{ nfs_path }} \
-          --set storageClass.name=nfs-client \
-          --set storageClass.defaultClass=true"
-      register: nfs_deploy
-      changed_when: "'Happy Helming' in nfs_deploy.stdout"
+        "kubectl create ns {{ namespace }} || true && \
+         kubectl apply -f /home/ubuntu/static-nfs.yaml"
+      changed_when: true
 
     # -----------------------------------------------------------
-    # 4. [應用層] 部署 Slurm (使用 NFS RWX)
+    # 4. 部署 Slurm (使用現成 PVC)
     # -----------------------------------------------------------
-    - name: 4.1 下載 Slurm Chart (StackHPC)
+    - name: 4.1 下載 StackHPC Chart
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get install -y git && \
@@ -103,24 +109,22 @@
         "cd slurm-k8s-cluster/slurm-cluster-chart && helm dependency update"
       changed_when: true
 
-    - name: 4.3 產生 Values (開啟 RWX 模式！)
-      # [重點] 這裡 storageClassName 改成 'nfs-client'
-      # [重點] accessModes 改回 'ReadWriteMany' (因為 NFS 支援！)
+    - name: 4.3 產生 Values (Disable Creation)
+      # [重點] create: false -> 告訴 Helm 不要自己建 PVC
+      # [重點] name: slurm-shared-storage -> 告訴 Helm 用我們剛剛建好的那個
       shell: |
-        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/slurm-nfs-values.yaml
+        juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/slurm-static-values.yaml
         global:
           clusterName: {{ test_model }}
 
-        # [儲存設定]
-        # 使用剛剛建立的 NFS StorageClass
+        # [儲存設定 - 靜態綁定模式]
         volumeClaim:
-          storageClassName: \"nfs-client\"
-          accessModes: [ \"ReadWriteMany\" ]
-          size: 20Gi
+          create: false             # 禁止 Helm 建立 PVC
+          name: slurm-shared-storage # 指定使用我們手動建的 PVC
 
         controller:
           size: 10Gi
-          storageClassName: \"nfs-client\"
+          storageClassName: \"local-path\" # Controller 自己的 DB 用 local-path 沒關係
           resources:
             limits:
               cpu: 2
@@ -128,7 +132,7 @@
 
         slurmdbd:
           enabled: true
-          storageClassName: \"nfs-client\"
+          storageClassName: \"local-path\"
           size: 10Gi
 
         login:
@@ -147,22 +151,19 @@
         EOF"
       changed_when: false
 
-    - name: 4.4 部署/更新 Slurm
-      # 先砍掉舊 PVC (如果有的話)，確保乾淨重建
+    - name: 4.4 部署 Slurm
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "kubectl delete pvc --all -n {{ namespace }} --wait=false || true && \
-         helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
+        "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
           --namespace {{ namespace }} \
           --create-namespace \
-          -f /home/ubuntu/slurm-nfs-values.yaml \
+          -f /home/ubuntu/slurm-static-values.yaml \
           --wait --timeout 15m"
-      register: slurm_deploy
+      register: helm_deploy
 
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 Slurm + NFS 架構部署成功！"
-          - "NFS Server IP: {{ nfs_server_ip.stdout }}"
-          - "StorageClass: nfs-client (ReadWriteMany 支援)"
-          - "現在多個 Worker 節點可以同時讀寫 /home 目錄了。"
+          - "🎉 Slurm + Static NFS 部署成功！"
+          - "我們繞過了 Helm 的自動配置，直接手動綁定 PV/PVC。"
+          - "請檢查：kubectl get pvc -n slurm-cluster"
