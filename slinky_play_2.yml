@@ -168,7 +168,22 @@
           {% endif %}
           echo \"---\"; cat \$f
         '"
-
+    
+    # -----------------------------------------------------------
+    # 7.5) 安裝 Helm (如果尚未安裝)
+    # -----------------------------------------------------------
+    - name: 7.5 在 Machine 0 安裝 Helm
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- bash -c "
+          if ! command -v helm &> /dev/null; then
+            echo 'Installing Helm...'
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          else
+            echo 'Helm already installed'
+          fi
+        "
+      changed_when: false
+      
     # -----------------------------------------------------------
     # 8.0) Helm dependency update（rooknfs enabled 時）
     # -----------------------------------------------------------
