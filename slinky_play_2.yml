@@ -30,32 +30,24 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 1.0) Runtime Discovery - machine0/machine1 IP
+    # 1.0) Runtime Discovery - Machine IPs (修正版)
     # -----------------------------------------------------------
-    - name: 1.1 Discover Machine0 IP from Kubernetes nodes
-      shell: >
-        juju ssh --model {{ test_model }} 0 -- bash -lc
-        "kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type==\"InternalIP\")].address}'"
-      register: m0_ip
+    - name: 1.1 從 Juju Controller 獲取所有機器的狀態
+      shell: "juju status --model {{ test_model }} --format json"
+      register: juju_status_raw
       changed_when: false
 
-    - name: 1.2 Discover Machine1 IP from Kubernetes nodes
-      shell: >
-        juju ssh --model {{ test_model }} 1 -- bash -lc
-        "hostname -I | awk '{print \$1}'"
-      register: m1_ip
-      changed_when: false
-
-    - name: 1.3 Set discovered IP vars
+    - name: 1.2 解析並提取 Machine 0 與 Machine 1 的 IPv4
       set_fact:
-        machine0_ip: "{{ m0_ip.stdout | trim }}"
-        machine1_ip: "{{ m1_ip.stdout | trim }}"
+        # 直接從 JSON 結構中抓取 IP，並排除可能的 IPv6 (只取第一個 IPv4)
+        machine0_ip: "{{ (juju_status_raw.stdout | from_json).machines['0']['ip-addresses'] | select('match', '^[0-9.]+$') | first }}"
+        machine1_ip: "{{ (juju_status_raw.stdout | from_json).machines['1']['ip-addresses'] | select('match', '^[0-9.]+$') | first }}"
 
-    - name: 1.4 Show discovered IPs
+    - name: 1.3 顯示偵測到的 IP (驗證用)
       debug:
         msg:
-          - "Machine0 IP: {{ machine0_ip }}"
-          - "Machine1 IP: {{ machine1_ip }}"
+          - "Machine0 (Control Plane) IP: {{ machine0_ip }}"
+          - "Machine1 (Worker Node) IP: {{ machine1_ip }}"
 
     # -----------------------------------------------------------
     # 2.0) Namespace reset
