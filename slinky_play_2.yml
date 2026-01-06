@@ -15,7 +15,34 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 修改 Slurm 設定檔 (ConfigMap)
+    # 0. 環境清理與建立 (確保 100% 乾淨)
+    # -----------------------------------------------------------
+    - name: 0.1 檢查並強制刪除舊的 Namespace (如果存在)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl delete namespace {{ namespace }} --ignore-not-found=true --wait=true --timeout=60s"
+      register: delete_ns_result
+      changed_when: "'deleted' in delete_ns_result.stdout"
+
+    - name: 0.2 確保 Namespace 存在 (全新建立)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl create namespace {{ namespace }}"
+      register: create_ns_result
+      changed_when: "'created' in create_ns_result.stdout"
+
+    # -----------------------------------------------------------
+    # 0.3 初次部署 Slurm (這裡必須先有 ConfigMap 才能讓後面的 sed 執行)
+    # -----------------------------------------------------------
+    - name: 0.3 產生初始 Slurm ConfigMap
+      # 注意：這裡先建立一個空的或基礎的 ConfigMap，後續 Task 1 才會去修改它
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl create configmap slurm-conf-configmap -n {{ namespace }} --from-literal=slurm.conf='ProctrackType=proctrack/cgroup\nTaskPlugin=task/cgroup,task/affinity'"
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 1. 修改 Slurm 設定檔 (原本的邏輯現在可以安全執行了)
     # -----------------------------------------------------------
     - name: 1.1 從 K8s 抓取目前的 slurm.conf
       shell: |
