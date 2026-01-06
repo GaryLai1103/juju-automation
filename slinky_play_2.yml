@@ -63,22 +63,29 @@
         "kubectl create namespace {{ namespace }} || true"
 
     # -----------------------------------------------------------
-    # 3.0) Clone repo（含 slurm-cluster-chart / rooknfs / scripts）
-    # ✅ 修正：clone 到「上一層」，因為 repo 內會再生一層 slurm-k8s-cluster
+    # 3.0) Clone repo (簡化路徑版)
     # -----------------------------------------------------------
     - name: 3.1 Clone or update stackhpc/slurm-k8s-cluster
       shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "set -e
-         BASE=/home/ubuntu/slurm-k8s-cluster
-         mkdir -p $BASE
-         if [ -d $BASE/slurm-k8s-cluster/.git ]; then
-           cd $BASE/slurm-k8s-cluster && git fetch --all && git reset --hard origin/main
-         else
-           rm -rf $BASE/slurm-k8s-cluster
-           git clone {{ repo_url }} $BASE/slurm-k8s-cluster
-         fi
-         echo '[REPO ROOT]'; cd {{ repo_dir }}; pwd; ls -la"
+        juju ssh --model {{ test_model }} 0 -- bash -c "
+          set -e;
+          TARGET=/home/ubuntu/slurm-k8s-cluster;
+          if [ -d \"\$TARGET/.git\" ]; then
+            echo 'Updating existing repo...';
+            cd \"\$TARGET\" && git fetch --all && git reset --hard origin/main;
+          else
+            echo 'Cloning new repo...';
+            rm -rf \"\$TARGET\";
+            git clone {{ repo_url }} \"\$TARGET\";
+          fi;
+          ls -la \"\$TARGET/slurm-cluster-chart\"
+        "
+      register: clone_out
+
+    # 同步修正變數，確保後面 Task 抓得到正確目錄
+    - name: 3.2 Update repo_dir variable
+      set_fact:
+        repo_dir: "/home/ubuntu/slurm-k8s-cluster"
 
     # -----------------------------------------------------------
     # 4.0) Patch slurm.conf（在 chart 的 files 內）
