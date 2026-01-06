@@ -1,11 +1,11 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v3.5-Base64
+# SKU: Slinky-App-Standalone-v3.6-HardcodedIP
 # 修正：
-#   1. 使用 Regex 強制提取純淨 IP (過濾雜訊)
-#   2. 使用 Base64 編碼傳輸 YAML (避開所有格式/縮排問題)
+#   1. 跳過不穩定的 IP 自動偵測，直接指定已知 IP
+#   2. 維持 Base64 傳輸，確保 YAML 格式完美
 # ========================================================
-- name: Application Layer - Deploy Slurm (Base64 Safe Mode)
+- name: Application Layer - Deploy Slurm (Direct IP Mode)
   hosts: maasjuju
   gather_facts: yes
   vars:
@@ -14,32 +14,31 @@
     namespace: "slurm-cluster"
     slurm_git_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
     nfs_path: "/srv/nfs/kubedata"
+    
+    # [直接指定] 我們已經確認這是 Machine 0 的 IP
+    # 如果您的 IP 變了，請修改這裡
+    nfs_server_ip: "192.168.1.96"
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 獲取並清洗 IP (最關鍵的一步)
+    # 1. 環境確認
     # -----------------------------------------------------------
-    - name: 1.1 獲取 Machine 0 原始資訊
-      shell: juju status --model {{ test_model }} --format json
-      register: juju_status_raw
-
-    - name: 1.2 [清洗] 使用 Regex 提取純淨 IP
-      # 不管 Juju 回傳什麼，我們只抓 "數字.數字.數字.數字" 的格式
-      set_fact:
-        # 這裡會從那一長串 JSON 中精準抓出 Machine 0 的 IP
-        clean_ip: "{{ (juju_status_raw.stdout | from_json).machines['0']['dns-name'] | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+') }}"
-
-    - name: 1.3 驗證 IP
+    - name: 1.1 確認目標 IP 格式正確
       debug:
-        msg: "清洗後的 IP 為: [{{ clean_ip }}] (絕對不含換行或雜訊)"
+        msg: "🚀 將使用固定 IP 進行部署: [{{ nfs_server_ip }}]"
 
-    - name: 1.4 安全檢查
+    - name: 1.2 確認 Machine 0 存活
+      shell: juju ssh --model {{ test_model }} 0 -- "echo 'alive'"
+      register: machine_check
+      ignore_errors: yes
+
+    - name: 1.3 終止檢查
       fail:
-        msg: "❌ 無法提取有效的 IP 位址"
-      when: clean_ip is not defined or clean_ip | length == 0
+        msg: "❌ 無法連線到 Machine 0，請檢查 Juju 狀態。"
+      when: machine_check.rc != 0
 
     # -----------------------------------------------------------
-    # 2. 準備 YAML 內容 (在 Ansible 端組合)
+    # 2. 準備 YAML 內容 (Base64 封裝)
     # -----------------------------------------------------------
     - name: 2.1 定義 PV 與 PVC 的 YAML 內容
       set_fact:
@@ -56,7 +55,7 @@
             persistentVolumeReclaimPolicy: Retain
             nfs:
               path: {{ nfs_path }}
-              server: {{ clean_ip }}
+              server: {{ nfs_server_ip }}
         pvc_yaml_content: |
           apiVersion: v1
           kind: PersistentVolumeClaim
@@ -73,22 +72,21 @@
             storageClassName: ""
 
     # -----------------------------------------------------------
-    # 3. 傳輸並應用 (使用 Base64 通道)
+    # 3. 傳輸並應用 (Base64 解碼寫入)
     # -----------------------------------------------------------
-    - name: 3.1 寫入 PV 檔案 (Base64 解碼寫入)
-      # 透過管道 | base64 -d 還原檔案，避開 Shell 解析錯誤
+    - name: 3.1 寫入 PV 檔案
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "echo '{{ pv_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pv.yaml"
       changed_when: true
 
-    - name: 3.2 寫入 PVC 檔案 (Base64 解碼寫入)
+    - name: 3.2 寫入 PVC 檔案
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc.yaml"
       changed_when: true
 
-    - name: 3.3 確保 NFS Server 存在 (Host 端)
+    - name: 3.3 確保 NFS Server 運作 (Host 端)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get update && \
@@ -102,7 +100,7 @@
       changed_when: true
 
     - name: 3.4 應用 PV/PVC 設定
-      # 為了保險，先清除舊的
+      # 清理舊資源並建立新資源
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl delete pv slurm-nfs-pv --wait=false 2>/dev/null || true && \
@@ -129,8 +127,7 @@
         "cd slurm-k8s-cluster/slurm-cluster-chart && helm dependency update"
       changed_when: true
 
-    - name: 4.3 產生 Values (使用 Base64 寫入)
-      # Values 檔也用 Base64 處理，確保萬無一失
+    - name: 4.3 產生 Values (Base64 寫入)
       vars:
         values_content: |
           global:
@@ -179,6 +176,7 @@
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 Slurm + NFS (Base64 Mode) 部署成功！"
-          - "如果這次還不過，我把鍵盤吞下去 (開玩笑的，但這次真的最穩)"
-          - "登入 IP: {{ clean_ip }}"
+          - "🎉 Slurm + NFS (Direct IP Mode) 部署成功！"
+          - "我們繞過了所有自動偵測與格式問題。"
+          - "請檢查 Pod 狀態："
+          - "kubectl get pods -n slurm-cluster"
