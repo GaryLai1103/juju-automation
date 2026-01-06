@@ -117,18 +117,22 @@
     # -----------------------------------------------------------
     # 5) Helm values override（依 README：可設定 storageClass、rooknfs.enabled、storage.capacity）:contentReference[oaicite:7]{index=7}
     # -----------------------------------------------------------
-    - name: 5.1 Write helm override values.yaml
+    - name: 5.1 Write helm override values.yaml (safe, no heredoc)
       shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "cat > /home/ubuntu/slurm-values.override.yaml <<'EOF'
-rooknfs:
-  enabled: {{ rooknfs_enabled | bool | lower }}
-storage:
-  capacity: {{ storage_capacity | quote }}
-{% if storage_class | trim != "" %}
-storageClass: {{ storage_class | quote }}
-{% endif %}
-EOF"
+        juju ssh --model {{ test_model }} 0 -- "bash -lc '
+          set -e
+          f=/home/ubuntu/slurm-values.override.yaml
+          : > \$f
+          echo \"rooknfs:\"                     >> \$f
+          echo \"  enabled: {{ rooknfs_enabled | bool | lower }}\" >> \$f
+          echo \"storage:\"                     >> \$f
+          echo \"  capacity: {{ storage_capacity }}\" >> \$f
+          {% if storage_class | trim != "" %}
+          echo \"storageClass: {{ storage_class }}\" >> \$f
+          {% endif %}
+          echo \"---\"; cat \$f
+        '"
+
 
     # README：若用 rooknfs dependency，需先 helm dependency update :contentReference[oaicite:8]{index=8}
     - name: 5.2 Helm dependency update (only when rooknfs enabled)
