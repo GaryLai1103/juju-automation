@@ -1,10 +1,9 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v3.1-StaticNFS
-# 策略：
-#   1. [System] 確保 Machine 0 有 NFS Server
-#   2. [K8s] 手動建立 PV (對應 NFS IP) 與 PVC
-#   3. [Helm] 強制使用現有 PVC，禁止 Helm 亂裝 Rook
+# SKU: Slinky-App-Standalone-v3.2-YamlFix
+# 修正：
+#   1. 修正 static-nfs.yaml 縮排問題 (移除前導空白)
+#   2. 忽略 Namespace 已存在的錯誤訊息
 # ========================================================
 - name: Application Layer - Deploy Slurm (Static NFS)
   hosts: maasjuju
@@ -47,13 +46,12 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3. [關鍵] 手動建立 Static PV 和 PVC
+    # 3. [關鍵修正] 手動建立 Static PV 和 PVC
     # -----------------------------------------------------------
-    - name: 3.1 建立 PV/PVC 定義檔
-      # 這裡我們直接寫死 IP，把 K8s 的儲存對接到 Machine 0
+    - name: 3.1 建立 PV/PVC 定義檔 (靠左對齊修正)
+      # 使用 <<-EOF 可以忽略前導 Tab，但為了保險，我們直接靠左寫
       shell: |
         juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/static-nfs.yaml
-        ---
         apiVersion: v1
         kind: PersistentVolume
         metadata:
@@ -80,15 +78,15 @@
             requests:
               storage: 20Gi
           volumeName: slurm-nfs-pv
-          storageClassName: \"\"  # 留空代表靜態綁定，不使用 StorageClass
+          storageClassName: \"\"
         EOF"
       changed_when: false
 
     - name: 3.2 應用 PV/PVC
-      # 先建立 Namespace，再建立 PVC
+      # 忽略 Namespace 已經存在的錯誤
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "kubectl create ns {{ namespace }} || true && \
+        "kubectl create ns {{ namespace }} 2>/dev/null || true && \
          kubectl apply -f /home/ubuntu/static-nfs.yaml"
       changed_when: true
 
@@ -110,8 +108,7 @@
       changed_when: true
 
     - name: 4.3 產生 Values (Disable Creation)
-      # [重點] create: false -> 告訴 Helm 不要自己建 PVC
-      # [重點] name: slurm-shared-storage -> 告訴 Helm 用我們剛剛建好的那個
+      # 告訴 Helm 不要自己建 PVC (create: false)
       shell: |
         juju ssh --model {{ test_model }} 0 -- "cat <<EOF > /home/ubuntu/slurm-static-values.yaml
         global:
@@ -119,12 +116,12 @@
 
         # [儲存設定 - 靜態綁定模式]
         volumeClaim:
-          create: false             # 禁止 Helm 建立 PVC
-          name: slurm-shared-storage # 指定使用我們手動建的 PVC
+          create: false
+          name: slurm-shared-storage
 
         controller:
           size: 10Gi
-          storageClassName: \"local-path\" # Controller 自己的 DB 用 local-path 沒關係
+          storageClassName: \"local-path\"
           resources:
             limits:
               cpu: 2
@@ -152,6 +149,7 @@
       changed_when: false
 
     - name: 4.4 部署 Slurm
+      # 加上 --wait，耐心等待所有 Pod 跑起來
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
@@ -164,6 +162,6 @@
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 Slurm + Static NFS 部署成功！"
-          - "我們繞過了 Helm 的自動配置，直接手動綁定 PV/PVC。"
-          - "請檢查：kubectl get pvc -n slurm-cluster"
+          - "🎉 Slurm + Static NFS (V3.2) 部署成功！"
+          - "PVC 狀態檢查："
+          - "kubectl get pvc -n slurm-cluster"
