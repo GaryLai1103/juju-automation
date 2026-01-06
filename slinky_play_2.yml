@@ -1,12 +1,12 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v4.6-LabelSpoofing
-# 修正：
-#   1. [Conflict] 手動建立 PVC 時，加上 Helm 的 Metadata (Labels/Annotations)
-#   2. [Adoption] 欺騙 Helm 讓它 "認養" 這個現有的 PVC
-#   3. [Storage] 確保 StorageClass 正確綁定到靜態 PV
+# SKU: Slinky-App-Standalone-v4.7-TheSwap
+# 策略：
+#   1. [Helm] 讓 Helm 建立錯誤的 PVC (避開所有權衝突)
+#   2. [Ansible] 使用 --wait=false 不等待 Helm 完成
+#   3. [Swap] 刪除 Helm 建的壞 PVC -> 換成我們的好 PVC
 # ========================================================
-- name: Application Layer - Deploy Slurm (Trojan Horse PVC)
+- name: Application Layer - Deploy Slurm (The Swap Strategy)
   hosts: maasjuju
   gather_facts: yes
   vars:
@@ -19,22 +19,22 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 徹底清理衝突現場
+    # 1. 徹底歸零 (確保沒有殘留衝突)
     # -----------------------------------------------------------
-    - name: 1.1 移除 Helm Release
+    - name: 1.1 移除舊的 Helm Release
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm uninstall {{ release_name }} -n {{ namespace }} --wait=false 2>/dev/null || true"
       changed_when: true
 
-    - name: 1.2 刪除舊的 PVC (必須刪除才能重建帶標籤的)
+    - name: 1.2 刪除舊的 PVC
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false 2>/dev/null || true"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 2. 建立 PV (維持不變)
+    # 2. 準備好正確的 PV (Server Side)
     # -----------------------------------------------------------
     - name: 2.1 建立 PV (Base64)
       vars:
@@ -63,62 +63,22 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3. 建立 "偽裝" PVC (關鍵步驟！)
+    # 3. 執行 Helm (讓它建立錯誤的 PVC)
     # -----------------------------------------------------------
-    - name: 3.1 建立帶有 Helm 標籤的 PVC
-      # 這裡我們加上了 labels 和 annotations
-      # Helm 看到這些就會認為這個資源是它管理的，從而停止報錯並直接使用
-      vars:
-        pvc_yaml_content: |
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: slurm-shared-storage
-            namespace: {{ namespace }}
-            labels:
-              app.kubernetes.io/managed-by: Helm
-            annotations:
-              meta.helm.sh/release-name: {{ release_name }}
-              meta.helm.sh/release-namespace: {{ namespace }}
-          spec:
-            accessModes:
-              - ReadWriteMany
-            resources:
-              requests:
-                storage: 20Gi
-            volumeName: slurm-nfs-pv
-            storageClassName: ""
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl create ns {{ namespace }} 2>/dev/null || true && \
-         echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc.yaml && \
-         kubectl apply -f /home/ubuntu/slurm-pvc.yaml"
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 4. 部署 Slurm
-    # -----------------------------------------------------------
-    - name: 4.1 產生 Values (配合偽裝)
-      # 雖然我們手動建了 PVC，但為了配合 Chart 邏輯，
-      # 我們還是把 storageClassName 設為空，並再次強調禁用 rook
+    - name: 3.1 產生 Values
+      # 這裡我們讓 Helm 覺得一切正常，rook 關掉，PVC 自己建
       vars:
         values_content: |
           global:
             clusterName: {{ test_model }}
-          
-          # 依然禁用 Rook
           rook-nfs:
             enabled: false
-          
           volumeClaim:
-            create: true  # 這裡設為 true 也沒關係了，因為 Helm 會發現 PVC 已存在且有標籤
+            create: true  # <--- 讓 Helm 建立 PVC (即使它會設錯 StorageClass)
             name: slurm-shared-storage
-            storageClassName: ""
-            volumeName: slurm-nfs-pv
             accessModes:
               - ReadWriteMany
             size: 20Gi
-            
           controller:
             size: 10Gi
             storageClassName: "local-path"
@@ -147,20 +107,76 @@
         "echo '{{ values_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-static-values.yaml"
       changed_when: false
 
-    - name: 4.2 部署 Slurm
+    - name: 3.2 部署 Slurm (不等待)
+      # 關鍵：加上 --wait=false，因為我們知道它一開始會失敗(Pending)，不要讓 Ansible 卡住
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
           --namespace {{ namespace }} \
           --create-namespace \
           -f /home/ubuntu/slurm-static-values.yaml \
-          --wait --timeout 15m"
+          --wait=false" 
       register: helm_deploy
+
+    # -----------------------------------------------------------
+    # 4. 手術調包 (Swap the PVC)
+    # -----------------------------------------------------------
+    - name: 4.1 等待 Helm 建立那個錯誤的 PVC
+      shell: juju ssh --model {{ test_model }} 0 -- "kubectl get pvc slurm-shared-storage -n {{ namespace }}"
+      register: pvc_check
+      until: pvc_check.rc == 0
+      retries: 30
+      delay: 2
+      ignore_errors: yes
+
+    - name: 4.2 刪除 Helm 建立的錯誤 PVC
+      # 刪除那個 StorageClass=slurm-rook-nfs 的 PVC
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false"
+      changed_when: true
+
+    - name: 4.3 塞入正確的 PVC (偷天換日)
+      # 名字一樣，但是 StorageClass 是空字串，且綁定 PV
+      vars:
+        pvc_yaml_content: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: slurm-shared-storage
+            namespace: {{ namespace }}
+            labels:
+              app.kubernetes.io/managed-by: Helm  # 加上標籤讓 Helm 以為還活著
+            annotations:
+              meta.helm.sh/release-name: {{ release_name }}
+              meta.helm.sh/release-namespace: {{ namespace }}
+          spec:
+            accessModes:
+              - ReadWriteMany
+            resources:
+              requests:
+                storage: 20Gi
+            volumeName: slurm-nfs-pv  # <--- 強制綁定
+            storageClassName: ""      # <--- 修正 StorageClass
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc-correct.yaml && \
+         kubectl apply -f /home/ubuntu/slurm-pvc-correct.yaml"
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 5. 重啟 Pod (讓它們讀到新的 PVC)
+    # -----------------------------------------------------------
+    - name: 5.1 刪除 Pod 以觸發重新掛載
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl delete pod --all -n {{ namespace }} --wait=false"
+      changed_when: true
 
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 V4.6 (標籤偽裝版) 部署成功！"
-          - "PVC 已偽造 Helm 標籤，成功騙過 Helm 進行認養。"
-          - "StorageClass 錯誤應已解決。"
-          - "請檢查: kubectl get pvc -n slurm-cluster"
+          - "🎉 V4.7 (調包計) 執行成功！"
+          - "我們替換了 PVC，避開了 Helm 的錯誤設定。"
+          - "Pod 正在重啟並掛載正確的 NFS。"
+          - "請等待幾秒後檢查: kubectl get pods -n slurm-cluster"
