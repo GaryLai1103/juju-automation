@@ -56,24 +56,26 @@
     # 2) 先修 slurm.conf（在 chart 的 files 內，讓它「一開始」就不碰 cgroup）
     #    README：slurm-cluster-chart/files/* 會掛載進容器做設定 :contentReference[oaicite:4]{index=4}
     # -----------------------------------------------------------
-    - name: 2.1 Patch slurm.conf (ProctrackType linuxproc, remove task/cgroup)
+    - name: 2.1 Patch slurm.conf (remote-safe quoting)
       shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "set -e
-         SLURM_CONF='{{ repo_dir }}/slurm-cluster-chart/files/slurm.conf'
-         test -f $SLURM_CONF
-
-         # ProctrackType: proctrack/cgroup -> proctrack/linuxproc
-         sed -i 's#^ProctrackType=proctrack/cgroup#ProctrackType=proctrack/linuxproc#g' $SLURM_CONF
-
-         # TaskPlugin: 移除 task/cgroup（保留 task/affinity；若只有 task/cgroup 則改 task/none）
-         sed -i 's#^TaskPlugin=task/affinity,task/cgroup#TaskPlugin=task/affinity#g' $SLURM_CONF
-         sed -i 's#^TaskPlugin=task/cgroup,task/affinity#TaskPlugin=task/affinity#g' $SLURM_CONF
-         sed -i 's#^TaskPlugin=task/cgroup$#TaskPlugin=task/none#g' $SLURM_CONF
-
-         echo '--- patched slurm.conf ---'
-         egrep '^(ProctrackType|TaskPlugin)=' $SLURM_CONF || true"
+        juju ssh --model {{ test_model }} 0 -- bash -lc '
+          set -e
+          SLURM_CONF="{{ repo_dir }}/slurm-cluster-chart/files/slurm.conf"
+          test -f "$SLURM_CONF"
+    
+          # ProctrackType: proctrack/cgroup -> proctrack/linuxproc
+          sed -i "s#^ProctrackType=proctrack/cgroup#ProctrackType=proctrack/linuxproc#g" "$SLURM_CONF"
+    
+          # TaskPlugin: remove task/cgroup
+          sed -i "s#^TaskPlugin=task/affinity,task/cgroup#TaskPlugin=task/affinity#g" "$SLURM_CONF"
+          sed -i "s#^TaskPlugin=task/cgroup,task/affinity#TaskPlugin=task/affinity#g" "$SLURM_CONF"
+          sed -i "s#^TaskPlugin=task/cgroup$#TaskPlugin=task/none#g" "$SLURM_CONF"
+    
+          echo "--- patched slurm.conf ---"
+          egrep "^(ProctrackType|TaskPlugin)=" "$SLURM_CONF" || true
+        '
       changed_when: true
+
 
     # -----------------------------------------------------------
     # 3) Initial-only：generate-secrets.sh（README 明確：On initial deployment ONLY）:contentReference[oaicite:5]{index=5}
