@@ -30,23 +30,51 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 0) Namespace reset
+    # 1.0) Runtime Discovery - machine0/machine1 IP
     # -----------------------------------------------------------
-    - name: 0.1 Delete namespace (force)
+    - name: 1.1 Discover Machine0 IP from Kubernetes nodes
+      shell: >
+        juju ssh --model {{ test_model }} 0 -- bash -lc
+        "kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type==\"InternalIP\")].address}'"
+      register: m0_ip
+      changed_when: false
+
+    - name: 1.2 Discover Machine1 IP from Kubernetes nodes
+      shell: >
+        juju ssh --model {{ test_model }} 1 -- bash -lc
+        "hostname -I | awk '{print \$1}'"
+      register: m1_ip
+      changed_when: false
+
+    - name: 1.3 Set discovered IP vars
+      set_fact:
+        machine0_ip: "{{ m0_ip.stdout | trim }}"
+        machine1_ip: "{{ m1_ip.stdout | trim }}"
+
+    - name: 1.4 Show discovered IPs
+      debug:
+        msg:
+          - "Machine0 IP: {{ machine0_ip }}"
+          - "Machine1 IP: {{ machine1_ip }}"
+
+    # -----------------------------------------------------------
+    # 2.0) Namespace reset
+    # -----------------------------------------------------------
+    - name: 2.1 Delete namespace (force)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl delete namespace {{ namespace }} --ignore-not-found=true --wait=true"
 
-    - name: 0.2 Create namespace
+    - name: 2.2 Create namespace
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl create namespace {{ namespace }} || true"
 
     # -----------------------------------------------------------
-    # 1) 取得 repo（含 slurm-cluster-chart / rooknfs / scripts）
-    #    ✅ 修正：clone 到「上一層」，因為 repo 內會再生一層 slurm-k8s-cluster
+    # 3.0) Clone repo（含 slurm-cluster-chart / rooknfs / scripts）
+    # ✅ 修正：clone 到「上一層」，因為 repo 內會再生一層 slurm-k8s-cluster
     # -----------------------------------------------------------
-    - name: 1.1 Clone or update stackhpc/slurm-k8s-cluster
+    - name: 3.1 Clone or update stackhpc/slurm-k8s-cluster
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "set -e
@@ -61,9 +89,9 @@
          echo '[REPO ROOT]'; cd {{ repo_dir }}; pwd; ls -la"
 
     # -----------------------------------------------------------
-    # 2) 先修 slurm.conf（在 chart 的 files 內）
+    # 4.0) Patch slurm.conf（在 chart 的 files 內）
     # -----------------------------------------------------------
-    - name: 2.1 Patch slurm.conf (single-line remote script, YAML-safe)
+    - name: 4.1 Patch slurm.conf (single-line remote script, YAML-safe)
       shell: >
         juju ssh --model {{ test_model }} 0 -- bash -lc
         "set -euo pipefail;
@@ -78,18 +106,16 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3) Initial-only：generate-secrets.sh
-    #    ✅ 修正：你目前 tree 內找不到 generate-secrets.sh
-    #    -> 改成先 find，找不到就顯示訊息並跳過（避免 rc=127 卡死）
+    # 5.0) Initial-only：generate-secrets.sh（auto-detect，找不到就跳過）
     # -----------------------------------------------------------
-    - name: 3.1 Check if secrets already exist
+    - name: 5.1 Check if secrets already exist
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl -n {{ namespace }} get secret slurm-secrets --ignore-not-found -o name || true"
       register: slurm_secrets_name
       changed_when: false
 
-    - name: 3.2 Generate cluster secrets (initial only, auto-detect script)
+    - name: 5.2 Generate cluster secrets (initial only, auto-detect script)
       shell: >
         juju ssh --model {{ test_model }} 0 -- bash -lc
         "set -euo pipefail;
@@ -106,17 +132,16 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 4) publish-keys.sh
-    #    ✅ 修正：script 在 {{ repo_dir }}/publish-keys.sh
+    # 6.0) publish-keys.sh
     # -----------------------------------------------------------
-    - name: 4.1 Check if ssh keys secret already exists
+    - name: 6.1 Check if ssh keys secret already exists
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl -n {{ namespace }} get secret slurm-ssh-public-keys --ignore-not-found -o name || true"
       register: slurm_keys_secret
       changed_when: false
 
-    - name: 4.2 Publish SSH public keys to k8s secret
+    - name: 6.2 Publish SSH public keys to k8s secret
       shell: >
         juju ssh --model {{ test_model }} 0 -- bash -lc
         "set -euo pipefail;
@@ -127,9 +152,9 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5) Helm values override（安全寫檔）
+    # 7.0) Helm values override（安全寫檔）
     # -----------------------------------------------------------
-    - name: 5.1 Write helm override values.yaml (safe, no heredoc)
+    - name: 7.1 Write helm override values.yaml (safe, no heredoc)
       shell: |
         juju ssh --model {{ test_model }} 0 -- "bash -lc '
           set -e
@@ -146,9 +171,9 @@
         '"
 
     # -----------------------------------------------------------
-    # 5.2 helm dependency update（rooknfs enabled 時）
+    # 8.0) Helm dependency update（rooknfs enabled 時）
     # -----------------------------------------------------------
-    - name: 5.2 Helm dependency update (only when rooknfs enabled)
+    - name: 8.1 Helm dependency update (only when rooknfs enabled)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "set -e
@@ -158,9 +183,9 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 6) Helm install/upgrade
+    # 9.0) Helm install/upgrade
     # -----------------------------------------------------------
-    - name: 6.1 Deploy Slurm cluster via Helm (upgrade --install)
+    - name: 9.1 Deploy Slurm cluster via Helm (upgrade --install)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "set -e
@@ -171,24 +196,24 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 7) rollout restart（deployment vs statefulset）
+    # 10.0) rollout restart（deployment vs statefulset）
     # -----------------------------------------------------------
-    - name: 7.1 Rollout restart deployments (login/slurmdbd/mysql)
+    - name: 10.1 Rollout restart deployments (login/slurmdbd/mysql)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl -n {{ namespace }} rollout restart deployment login slurmdbd mysql || true"
       changed_when: true
 
-    - name: 7.2 Rollout restart statefulsets (slurmd/slurmctld)
+    - name: 10.2 Rollout restart statefulsets (slurmd/slurmctld)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl -n {{ namespace }} rollout restart statefulset slurmd slurmctld || true"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 8) scontrol reconfigure
+    # 11.0) scontrol reconfigure
     # -----------------------------------------------------------
-    - name: 8.1 Run scontrol reconfigure in slurmctld pod
+    - name: 11.1 Run scontrol reconfigure in slurmctld pod
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "set -e
@@ -196,10 +221,11 @@
          kubectl -n {{ namespace }} exec $POD -- scontrol reconfigure || true"
       changed_when: true
 
-    - name: ✅ Done
+    - name: 12.0 Done
       debug:
         msg:
           - "🎉 StackHPC slurm-k8s-cluster 已用 Helm 部署完成"
+          - "Machine0 IP: {{ machine0_ip }} / Machine1 IP: {{ machine1_ip }}"
           - "已在 chart 的 slurm.conf 先修正 ProctrackType=linuxproc 並移除 task/cgroup"
           - "publish-keys 已執行（若 secrets 已存在則跳過）"
           - "generate-secrets 若 repo 內不存在會跳過並提示（避免卡住）"
