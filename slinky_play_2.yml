@@ -1,11 +1,11 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v3.4-Printf
+# SKU: Slinky-App-Standalone-v3.5-Base64
 # 修正：
-#   1. 放棄 cat/echo，改用 printf 生成 YAML (格式絕對精準)
-#   2. 強化 IP 變數清理，確保無隱藏換行符
+#   1. 使用 Regex 強制提取純淨 IP (過濾雜訊)
+#   2. 使用 Base64 編碼傳輸 YAML (避開所有格式/縮排問題)
 # ========================================================
-- name: Application Layer - Deploy Slurm (Static NFS Printf)
+- name: Application Layer - Deploy Slurm (Base64 Safe Mode)
   hosts: maasjuju
   gather_facts: yes
   vars:
@@ -17,32 +17,78 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 準備工作 & IP 獲取
+    # 1. 獲取並清洗 IP (最關鍵的一步)
     # -----------------------------------------------------------
-    - name: 1.1 確認 Machine 0 存活
-      shell: juju ssh --model {{ test_model }} 0 -- "echo 'alive'"
-      register: machine_check
-      ignore_errors: yes
+    - name: 1.1 獲取 Machine 0 原始資訊
+      shell: juju status --model {{ test_model }} --format json
+      register: juju_status_raw
 
-    - name: 1.2 獲取 Machine 0 內網 IP (強化清理)
-      # jq -r 輸出後，再用 tr -d 刪除任何可能存在的換行符號 (\n 或 \r)
-      shell: |
-        juju status --model {{ test_model }} --format json | jq -r '.machines["0"]["dns-name"]' | tr -d '\n\r'
-      register: nfs_server_ip
+    - name: 1.2 [清洗] 使用 Regex 提取純淨 IP
+      # 不管 Juju 回傳什麼，我們只抓 "數字.數字.數字.數字" 的格式
+      set_fact:
+        # 這裡會從那一長串 JSON 中精準抓出 Machine 0 的 IP
+        clean_ip: "{{ (juju_status_raw.stdout | from_json).machines['0']['dns-name'] | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+') }}"
 
-    - name: 1.3 檢查並顯示 IP
-      fail:
-        msg: "❌ 無法獲取 Machine 0 的 IP (為空值)"
-      when: nfs_server_ip.stdout | length == 0
-
-    - name: 顯示檢測到的 NFS IP
+    - name: 1.3 驗證 IP
       debug:
-        msg: "Target NFS Server IP: [{{ nfs_server_ip.stdout }}]"
+        msg: "清洗後的 IP 為: [{{ clean_ip }}] (絕對不含換行或雜訊)"
+
+    - name: 1.4 安全檢查
+      fail:
+        msg: "❌ 無法提取有效的 IP 位址"
+      when: clean_ip is not defined or clean_ip | length == 0
 
     # -----------------------------------------------------------
-    # 2. NFS Server 架設 (Host)
+    # 2. 準備 YAML 內容 (在 Ansible 端組合)
     # -----------------------------------------------------------
-    - name: 2.1 安裝 NFS Kernel Server
+    - name: 2.1 定義 PV 與 PVC 的 YAML 內容
+      set_fact:
+        pv_yaml_content: |
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: slurm-nfs-pv
+          spec:
+            capacity:
+              storage: 20Gi
+            accessModes:
+              - ReadWriteMany
+            persistentVolumeReclaimPolicy: Retain
+            nfs:
+              path: {{ nfs_path }}
+              server: {{ clean_ip }}
+        pvc_yaml_content: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: slurm-shared-storage
+            namespace: {{ namespace }}
+          spec:
+            accessModes:
+              - ReadWriteMany
+            resources:
+              requests:
+                storage: 20Gi
+            volumeName: slurm-nfs-pv
+            storageClassName: ""
+
+    # -----------------------------------------------------------
+    # 3. 傳輸並應用 (使用 Base64 通道)
+    # -----------------------------------------------------------
+    - name: 3.1 寫入 PV 檔案 (Base64 解碼寫入)
+      # 透過管道 | base64 -d 還原檔案，避開 Shell 解析錯誤
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "echo '{{ pv_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pv.yaml"
+      changed_when: true
+
+    - name: 3.2 寫入 PVC 檔案 (Base64 解碼寫入)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc.yaml"
+      changed_when: true
+
+    - name: 3.3 確保 NFS Server 存在 (Host 端)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get update && \
@@ -55,24 +101,8 @@
          sudo systemctl restart nfs-kernel-server"
       changed_when: true
 
-    # -----------------------------------------------------------
-    # 3. [終極修正] 使用 Printf 生成 PV/PVC
-    # -----------------------------------------------------------
-    - name: 3.1 生成 PV 定義檔 (使用 printf)
-      # %s 會被後面的變數替換，\n 代表換行，這種寫法不會有縮排錯誤
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "printf 'apiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: slurm-nfs-pv\nspec:\n  capacity:\n    storage: 20Gi\n  accessModes:\n    - ReadWriteMany\n  persistentVolumeReclaimPolicy: Retain\n  nfs:\n    path: %s\n    server: %s\n' '{{ nfs_path }}' '{{ nfs_server_ip.stdout }}' > /home/ubuntu/slurm-pv.yaml"
-      changed_when: true
-
-    - name: 3.2 生成 PVC 定義檔 (使用 printf)
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "printf 'apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: slurm-shared-storage\n  namespace: {{ namespace }}\nspec:\n  accessModes:\n    - ReadWriteMany\n  resources:\n    requests:\n      storage: 20Gi\n  volumeName: slurm-nfs-pv\n  storageClassName: \"\"\n' > /home/ubuntu/slurm-pvc.yaml"
-      changed_when: true
-
-    - name: 3.3 應用設定
-      # 先刪除舊的以免衝突，再建立新的
+    - name: 3.4 應用 PV/PVC 設定
+      # 為了保險，先清除舊的
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl delete pv slurm-nfs-pv --wait=false 2>/dev/null || true && \
@@ -99,11 +129,41 @@
         "cd slurm-k8s-cluster/slurm-cluster-chart && helm dependency update"
       changed_when: true
 
-    - name: 4.3 產生 Values (Printf 模式)
-      # 同樣使用 printf 生成 values.yaml
+    - name: 4.3 產生 Values (使用 Base64 寫入)
+      # Values 檔也用 Base64 處理，確保萬無一失
+      vars:
+        values_content: |
+          global:
+            clusterName: {{ test_model }}
+          volumeClaim:
+            create: false
+            name: slurm-shared-storage
+          controller:
+            size: 10Gi
+            storageClassName: "local-path"
+            resources:
+              limits:
+                cpu: 2
+                memory: 4Gi
+          slurmdbd:
+            enabled: true
+            storageClassName: "local-path"
+            size: 10Gi
+          login:
+            service:
+              type: NodePort
+              nodePort: 30022
+            ssh:
+              enabled: true
+          worker:
+            replicas: 1
+            resources:
+              limits:
+                cpu: 8
+                memory: 16Gi
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "printf 'global:\n  clusterName: {{ test_model }}\nvolumeClaim:\n  create: false\n  name: slurm-shared-storage\ncontroller:\n  size: 10Gi\n  storageClassName: \"local-path\"\n  resources:\n    limits:\n      cpu: 2\n      memory: 4Gi\nslurmdbd:\n  enabled: true\n  storageClassName: \"local-path\"\n  size: 10Gi\nlogin:\n  service:\n    type: NodePort\n    nodePort: 30022\n  ssh:\n    enabled: true\nworker:\n  replicas: 1\n  resources:\n    limits:\n      cpu: 8\n      memory: 16Gi\n' > /home/ubuntu/slurm-static-values.yaml"
+        "echo '{{ values_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-static-values.yaml"
       changed_when: false
 
     - name: 4.4 部署 Slurm
@@ -119,7 +179,6 @@
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 Slurm + NFS (Printf Version) 部署成功！"
-          - "我們使用了最嚴格的 printf 格式，確保 YAML 解析正確。"
-          - "請嘗試登入："
-          - "ssh rocky@{{ nfs_server_ip.stdout }} -p 30022"
+          - "🎉 Slurm + NFS (Base64 Mode) 部署成功！"
+          - "如果這次還不過，我把鍵盤吞下去 (開玩笑的，但這次真的最穩)"
+          - "登入 IP: {{ clean_ip }}"
