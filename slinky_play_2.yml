@@ -3,7 +3,7 @@
 # SKU: StackHPC-SlurmK8sCluster-FixCgroup
 # 依 stackhpc/slurm-k8s-cluster README 流程改寫：
 #   - 用 Helm 安裝 slurm-cluster-chart（不是 kubectl apply 外部 yaml）
-#   - initial only：generate-secrets.sh
+#   - initial only：generate-secrets.sh（若 repo 內找不到，將顯示訊息並跳過）
 #   - ssh keys：publish-keys.sh
 #   - 修 slurm.conf：ProctrackType=linuxproc + 移除 task/cgroup
 #   - 需要時 rollout restart（statefulset: slurmd/slurmctld；deployment: login/slurmdbd/mysql）
@@ -18,16 +18,19 @@
     namespace: "slurm-cluster"
     release_name: "slurm"
     repo_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
-    repo_dir: "/home/ubuntu/slurm-k8s-cluster"
+
+    # ✅ 修正：你實際的 repo root 在多一層子目錄底下
+    repo_dir: "/home/ubuntu/slurm-k8s-cluster/slurm-k8s-cluster"
+
     # 若你 k8s 已有可用 RWX StorageClass，就填它並關掉 rooknfs
     # 否則保持 rooknfs_enabled=true（README 預設會裝 rooknfs 供 RWX /home）
     rooknfs_enabled: true
-    storage_class: ""          # e.g. "nfs-rwx" / "rook-nfs-share1"；若留空且 rooknfs_enabled=true 就用 chart 預設
-    storage_capacity: "20Gi"   # /home 的 RWX PVC 容量（依 README：storage.capacity 可調）:contentReference[oaicite:3]{index=3}
+    storage_class: ""          # e.g. "nfs-rwx" / "rook-nfs-share1"
+    storage_capacity: "20Gi"   # /home 的 RWX PVC 容量
 
   tasks:
     # -----------------------------------------------------------
-    # 0) Namespace reset（你原本就要強制重建，我保留）
+    # 0) Namespace reset
     # -----------------------------------------------------------
     - name: 0.1 Delete namespace (force)
       shell: |
@@ -41,20 +44,24 @@
 
     # -----------------------------------------------------------
     # 1) 取得 repo（含 slurm-cluster-chart / rooknfs / scripts）
+    #    ✅ 修正：clone 到「上一層」，因為 repo 內會再生一層 slurm-k8s-cluster
     # -----------------------------------------------------------
     - name: 1.1 Clone or update stackhpc/slurm-k8s-cluster
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "set -e
-         if [ -d {{ repo_dir }} ]; then
-           cd {{ repo_dir }} && git fetch --all && git reset --hard origin/main
+         BASE=/home/ubuntu/slurm-k8s-cluster
+         mkdir -p $BASE
+         if [ -d $BASE/slurm-k8s-cluster/.git ]; then
+           cd $BASE/slurm-k8s-cluster && git fetch --all && git reset --hard origin/main
          else
-           git clone {{ repo_url }} {{ repo_dir }}
-         fi"
+           rm -rf $BASE/slurm-k8s-cluster
+           git clone {{ repo_url }} $BASE/slurm-k8s-cluster
+         fi
+         echo '[REPO ROOT]'; cd {{ repo_dir }}; pwd; ls -la"
 
     # -----------------------------------------------------------
-    # 2) 先修 slurm.conf（在 chart 的 files 內，讓它「一開始」就不碰 cgroup）
-    #    README：slurm-cluster-chart/files/* 會掛載進容器做設定 :contentReference[oaicite:4]{index=4}
+    # 2) 先修 slurm.conf（在 chart 的 files 內）
     # -----------------------------------------------------------
     - name: 2.1 Patch slurm.conf (single-line remote script, YAML-safe)
       shell: >
@@ -70,10 +77,10 @@
          egrep '^(ProctrackType|TaskPlugin)=' \"${SLURM_CONF}\" || true;"
       changed_when: true
 
-
     # -----------------------------------------------------------
-    # 3) Initial-only：generate-secrets.sh（README 明確：On initial deployment ONLY）:contentReference[oaicite:5]{index=5}
-    #    用 secret 存在與否來避免重跑
+    # 3) Initial-only：generate-secrets.sh
+    #    ✅ 修正：你目前 tree 內找不到 generate-secrets.sh
+    #    -> 改成先 find，找不到就顯示訊息並跳過（避免 rc=127 卡死）
     # -----------------------------------------------------------
     - name: 3.1 Check if secrets already exist
       shell: |
@@ -82,17 +89,25 @@
       register: slurm_secrets_name
       changed_when: false
 
-    - name: 3.2 Generate cluster secrets (initial only)
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "set -e
-         cd {{ repo_dir }}
-         ./generate-secrets.sh {{ namespace }}"
+    - name: 3.2 Generate cluster secrets (initial only, auto-detect script)
+      shell: >
+        juju ssh --model {{ test_model }} 0 -- bash -lc
+        "set -euo pipefail;
+         cd {{ repo_dir }};
+         SCRIPT=\$(find . -maxdepth 10 -type f -name 'generate-secrets.sh' -print -quit || true);
+         if [ -z \"\$SCRIPT\" ]; then
+           echo 'WARN: generate-secrets.sh not found in repo; skip secrets generation.';
+           echo '      You may need to check repo version/branch or create secrets manually.';
+           exit 0;
+         fi;
+         chmod +x \"\$SCRIPT\";
+         \"\$SCRIPT\" {{ namespace }};"
       when: slurm_secrets_name.stdout | trim == ""
       changed_when: true
 
     # -----------------------------------------------------------
-    # 4) publish-keys.sh：把本機 public keys 發到 k8s secret（README）:contentReference[oaicite:6]{index=6}
+    # 4) publish-keys.sh
+    #    ✅ 修正：script 在 {{ repo_dir }}/publish-keys.sh
     # -----------------------------------------------------------
     - name: 4.1 Check if ssh keys secret already exists
       shell: |
@@ -102,16 +117,17 @@
       changed_when: false
 
     - name: 4.2 Publish SSH public keys to k8s secret
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "set -e
-         cd {{ repo_dir }}
-         ./publish-keys.sh {{ namespace }}"
+      shell: >
+        juju ssh --model {{ test_model }} 0 -- bash -lc
+        "set -euo pipefail;
+         cd {{ repo_dir }};
+         chmod +x ./publish-keys.sh;
+         ./publish-keys.sh {{ namespace }};"
       when: slurm_keys_secret.stdout | trim == ""
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5) Helm values override（依 README：可設定 storageClass、rooknfs.enabled、storage.capacity）:contentReference[oaicite:7]{index=7}
+    # 5) Helm values override（安全寫檔）
     # -----------------------------------------------------------
     - name: 5.1 Write helm override values.yaml (safe, no heredoc)
       shell: |
@@ -119,9 +135,9 @@
           set -e
           f=/home/ubuntu/slurm-values.override.yaml
           : > \$f
-          echo \"rooknfs:\"                     >> \$f
+          echo \"rooknfs:\" >> \$f
           echo \"  enabled: {{ rooknfs_enabled | bool | lower }}\" >> \$f
-          echo \"storage:\"                     >> \$f
+          echo \"storage:\" >> \$f
           echo \"  capacity: {{ storage_capacity }}\" >> \$f
           {% if storage_class | trim != "" %}
           echo \"storageClass: {{ storage_class }}\" >> \$f
@@ -129,8 +145,9 @@
           echo \"---\"; cat \$f
         '"
 
-
-    # README：若用 rooknfs dependency，需先 helm dependency update :contentReference[oaicite:8]{index=8}
+    # -----------------------------------------------------------
+    # 5.2 helm dependency update（rooknfs enabled 時）
+    # -----------------------------------------------------------
     - name: 5.2 Helm dependency update (only when rooknfs enabled)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
@@ -141,7 +158,7 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 6) Helm install/upgrade Slurm cluster（README：helm install / helm upgrade）:contentReference[oaicite:9]{index=9}
+    # 6) Helm install/upgrade
     # -----------------------------------------------------------
     - name: 6.1 Deploy Slurm cluster via Helm (upgrade --install)
       shell: |
@@ -154,7 +171,7 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 7) 依 README 的重配方式：需要時 rollout restart（deployment vs statefulset）:contentReference[oaicite:10]{index=10}
+    # 7) rollout restart（deployment vs statefulset）
     # -----------------------------------------------------------
     - name: 7.1 Rollout restart deployments (login/slurmdbd/mysql)
       shell: |
@@ -169,7 +186,7 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 8) scontrol reconfigure（README：helm upgrade 後可在 pod 內 scontrol reconfigure）:contentReference[oaicite:11]{index=11}
+    # 8) scontrol reconfigure
     # -----------------------------------------------------------
     - name: 8.1 Run scontrol reconfigure in slurmctld pod
       shell: |
@@ -184,6 +201,7 @@
         msg:
           - "🎉 StackHPC slurm-k8s-cluster 已用 Helm 部署完成"
           - "已在 chart 的 slurm.conf 先修正 ProctrackType=linuxproc 並移除 task/cgroup"
-          - "已依 README 執行 generate-secrets/publish-keys（initial-only 以 secret 判斷）"
+          - "publish-keys 已執行（若 secrets 已存在則跳過）"
+          - "generate-secrets 若 repo 內不存在會跳過並提示（避免卡住）"
           - "已 rollout restart：deployment(login/slurmdbd/mysql) + statefulset(slurmd/slurmctld)"
           - "請用：kubectl get pods -n {{ namespace }}；再進 login pod/ssh 後 sinfo 驗證"
