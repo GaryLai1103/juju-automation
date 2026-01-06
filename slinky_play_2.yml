@@ -3,8 +3,8 @@
 # SKU: Slinky-App-Standalone-v4.8-FixCgroup
 # 修正：
 #   1. [Fix Crash] 修改 slurm.conf，將 ProctrackType 改為 linuxproc
-#   2. [Fix Crash] 禁用 TaskPlugin 的 cgroup 功能
-#   3. [Restart] 重啟 slurmd 讓設定生效
+#   2. [Fix Crash] 移除 TaskPlugin 中的 task/cgroup
+#   3. [Restart] 重啟 slurmd 和 login 節點讓設定生效
 # ========================================================
 - name: Application Layer - Deploy Slurm (Fix Cgroup Crash)
   hosts: maasjuju
@@ -24,18 +24,18 @@
       changed_when: false
 
     - name: 1.2 修改設定 (Cgroup -> LinuxProc)
-      # 我們用 sed 直接替換設定檔中的關鍵行
-      # 1. ProctrackType=proctrack/cgroup -> ProctrackType=proctrack/linuxproc
-      # 2. TaskPlugin=task/cgroup -> TaskPlugin=task/none (或註解掉)
+      # 使用 sed 替換掉會報錯的 Cgroup 設定
+      # 1. ProctrackType: 改用 linuxproc (單純追蹤進程，不碰 Cgroup)
+      # 2. TaskPlugin: 移除 task/cgroup
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sed -i 's/ProctrackType=proctrack\/cgroup/ProctrackType=proctrack\/linuxproc/g' /home/ubuntu/slurm.conf.current && \
-         sed -i 's/TaskPlugin=task\/cgroup/TaskPlugin=task\/none/g' /home/ubuntu/slurm.conf.current && \
-         sed -i 's/TaskPlugin=task\/affinity,task\/cgroup/TaskPlugin=task\/affinity/g' /home/ubuntu/slurm.conf.current"
+         sed -i 's/TaskPlugin=task\/affinity,task\/cgroup/TaskPlugin=task\/affinity/g' /home/ubuntu/slurm.conf.current && \
+         sed -i 's/TaskPlugin=task\/cgroup,task\/affinity/TaskPlugin=task\/affinity/g' /home/ubuntu/slurm.conf.current && \
+         sed -i 's/TaskPlugin=task\/cgroup/TaskPlugin=task\/none/g' /home/ubuntu/slurm.conf.current"
       changed_when: true
 
     - name: 1.3 將修改後的設定寫回 K8s ConfigMap
-      # 這招很實用：用 --from-file 直接更新 ConfigMap 中的特定鍵值
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl create configmap slurm-conf-configmap \
@@ -45,18 +45,25 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 2. 重啟 Worker 節點
+    # 2. 重啟節點 (讓它們讀取新設定)
     # -----------------------------------------------------------
-    - name: 2.1 刪除崩潰的運算節點 (讓它重啟讀取新設定)
+    - name: 2.1 重啟崩潰的運算節點 (slurmd)
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl delete pod -l app.kubernetes.io/component=slurmd -n {{ namespace }} --wait=false"
+      changed_when: true
+
+    - name: 2.2 重啟卡住的登入節點 (login)
+      # login 節點也掛載了同樣的 configmap，重啟它有助於解決卡住問題
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl delete pod -l app.kubernetes.io/component=login -n {{ namespace }} --wait=false"
       changed_when: true
 
     - name: ✅ 完成
       debug:
         msg: 
           - "🎉 V4.8 (Cgroup Fix) 執行成功！"
-          - "已將 Slurm 進程追蹤模式改為 linuxproc。"
-          - "運算節點正在重啟中..."
-          - "請等待 30 秒後檢查: kubectl get pods -n slurm-cluster"
+          - "已將設定改為 linuxproc 模式，避開了 Cgroup 報錯。"
+          - "正在重啟 Worker 和 Login 節點..."
+          - "請等待約 30~60 秒後檢查: kubectl get pods -n slurm-cluster"
