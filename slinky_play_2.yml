@@ -1,12 +1,12 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v4.1-DisableRook
+# SKU: Slinky-App-Standalone-v4.2-CleanHelm
 # 修正：
-#   1. 明確禁用 rook-nfs 子圖表 (解決 rook-nfs-backing-pv 卡死)
-#   2. 手動建立 PVC 並加上 Helm Labels (偽裝成 Helm 資源，避免所有權衝突)
-#   3. 使用 Base64 確保 YAML 格式完美
+#   1. [Fix Conflict] 刪除手動 PVC，交由 Helm 建立 (擁有權單一化)
+#   2. [Fix Hang] 設定 rook-nfs: enabled: false (避開 rook 卡死)
+#   3. [Binding] 使用 volumeName 強制 Helm 的 PVC 綁定靜態 PV
 # ========================================================
-- name: Application Layer - Deploy Slurm (No Rook Mode)
+- name: Application Layer - Deploy Slurm (Final Stable)
   hosts: maasjuju
   gather_facts: yes
   vars:
@@ -19,21 +19,19 @@
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 強力清理戰場
+    # 1. 清理衝突資源 (最重要的第一步)
     # -----------------------------------------------------------
-    - name: 1.1 清理所有卡住的資源
+    - name: 1.1 刪除擋路的手動 PVC
+      # 我們必須刪除它，讓 Helm 自己從頭建立一個乾淨的
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "helm uninstall {{ release_name }} -n {{ namespace }} --wait=false 2>/dev/null || true && \
-         kubectl delete pvc --all -n {{ namespace }} --wait=false 2>/dev/null || true && \
-         kubectl delete pv slurm-nfs-pv --wait=false 2>/dev/null || true && \
-         kubectl delete pvp rook-nfs-backing-pv -n {{ namespace }} --wait=false 2>/dev/null || true"
+        "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false 2>/dev/null || true"
       changed_when: true
 
     # -----------------------------------------------------------
-    # 2. 建立 PV (PersistentVolume)
+    # 2. 準備 PV (PersistentVolume) - 只有這個要手動建
     # -----------------------------------------------------------
-    - name: 2.1 定義 PV 內容
+    - name: 2.1 定義 PV 內容 (Base64)
       set_fact:
         pv_yaml_content: |
           apiVersion: v1
@@ -60,45 +58,7 @@
          kubectl apply -f /home/ubuntu/slurm-pv.yaml"
       changed_when: true
 
-    # -----------------------------------------------------------
-    # 3. 建立「偽裝」PVC (關鍵步驟)
-    # -----------------------------------------------------------
-    - name: 3.1 定義 PVC 內容 (加上 Helm Labels)
-      # 這裡我們加上了 Helm 的標籤，這樣 Helm 安裝時就會認為這個 PVC 是它管轄的
-      # 並且不會因為 AlreadyExists 而報錯，也不會試圖重建它
-      set_fact:
-        pvc_yaml_content: |
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: slurm-shared-storage
-            namespace: {{ namespace }}
-            labels:
-              app.kubernetes.io/managed-by: Helm
-            annotations:
-              meta.helm.sh/release-name: {{ release_name }}
-              meta.helm.sh/release-namespace: {{ namespace }}
-          spec:
-            accessModes:
-              - ReadWriteMany
-            resources:
-              requests:
-                storage: 20Gi
-            volumeName: slurm-nfs-pv
-            storageClassName: ""
-
-    - name: 3.2 寫入並應用 PVC
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl create ns {{ namespace }} 2>/dev/null || true && \
-         echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc.yaml && \
-         kubectl apply -f /home/ubuntu/slurm-pvc.yaml"
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 4. Host 端 NFS 確認
-    # -----------------------------------------------------------
-    - name: 4.1 確保 NFS Server 運作
+    - name: 2.3 確保 Host NFS 服務正常
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get update && \
@@ -111,9 +71,9 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5. 部署 Slurm (禁用 Rook)
+    # 3. 部署 Slurm
     # -----------------------------------------------------------
-    - name: 5.1 下載 StackHPC Chart
+    - name: 3.1 下載 StackHPC Chart
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get install -y git && \
@@ -121,28 +81,35 @@
          git clone --depth 1 {{ slurm_git_url }}"
       changed_when: true
 
-    - name: 5.2 下載依賴
+    - name: 3.2 下載依賴
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "cd slurm-k8s-cluster/slurm-cluster-chart && helm dependency update"
       changed_when: true
 
-    - name: 5.3 產生 Values (Disable Rook + Use Existing PVC)
-      # [重點修正]
-      # 1. rook-nfs: { enabled: false } -> 徹底殺死內建 NFS
-      # 2. volumeClaim: create: false -> 因為我們已經手動建了偽裝 PVC
+    - name: 3.3 產生 Values (完美設定版)
+      # 這裡是成功的關鍵組合：
+      # 1. rook-nfs: enabled: false (不准卡死)
+      # 2. volumeClaim: create: true (Helm 自己建)
+      # 3. volumeName: slurm-nfs-pv (但必須用我的硬碟)
       vars:
         values_content: |
           global:
             clusterName: {{ test_model }}
           
-          # [殺手鐧] 禁用內建 Rook NFS
+          # [關鍵 1] 徹底關閉內建 Rook NFS，避免 ImagePullBackOff 或 PVC Pending
           rook-nfs:
             enabled: false
           
+          # [關鍵 2] 讓 Helm 建立 PVC，並綁定到我們的靜態 PV
           volumeClaim:
-            create: false # 我們自己建了帶有 Helm 標籤的 PVC
+            create: true
             name: slurm-shared-storage
+            storageClassName: ""
+            volumeName: slurm-nfs-pv
+            accessModes:
+              - ReadWriteMany
+            size: 20Gi
             
           controller:
             size: 10Gi
@@ -172,7 +139,7 @@
         "echo '{{ values_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-static-values.yaml"
       changed_when: false
 
-    - name: 5.4 部署 Slurm
+    - name: 3.4 部署 Slurm
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
@@ -185,6 +152,6 @@
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 V4.1 (Disable Rook Mode) 部署成功！"
-          - "Rook 已被禁用，使用外部 NFS。"
+          - "🎉 V4.2 部署成功！"
+          - "這是最乾淨的部署模式：Helm 自己管理 PVC，但資料存在我們指定的 NFS 上。"
           - "請檢查: kubectl get pvc -n slurm-cluster"
