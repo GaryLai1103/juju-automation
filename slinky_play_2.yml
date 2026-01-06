@@ -1,11 +1,12 @@
 ---
 # ========================================================
-# SKU: Slinky-App-Standalone-v3.6-HardcodedIP
+# SKU: Slinky-App-Standalone-v4.0-HelmNative
 # 修正：
-#   1. 跳過不穩定的 IP 自動偵測，直接指定已知 IP
-#   2. 維持 Base64 傳輸，確保 YAML 格式完美
+#   1. 刪除手動建立的 PVC (解決 Helm 衝突)
+#   2. 保留手動建立的 PV (提供 NFS 對接)
+#   3. 設定 Helm create: true 但 storageClass: "" (實現靜態綁定)
 # ========================================================
-- name: Application Layer - Deploy Slurm (Direct IP Mode)
+- name: Application Layer - Deploy Slurm (Helm Native Binding)
   hosts: maasjuju
   gather_facts: yes
   vars:
@@ -14,79 +15,66 @@
     namespace: "slurm-cluster"
     slurm_git_url: "https://github.com/stackhpc/slurm-k8s-cluster.git"
     nfs_path: "/srv/nfs/kubedata"
-    
-    # [直接指定] 我們已經確認這是 Machine 0 的 IP
-    # 如果您的 IP 變了，請修改這裡
+    # [直接指定 IP]
     nfs_server_ip: "192.168.1.96"
 
   tasks:
     # -----------------------------------------------------------
-    # 1. 環境確認
+    # 1. 環境檢查
     # -----------------------------------------------------------
-    - name: 1.1 確認目標 IP 格式正確
-      debug:
-        msg: "🚀 將使用固定 IP 進行部署: [{{ nfs_server_ip }}]"
-
-    - name: 1.2 確認 Machine 0 存活
+    - name: 1.1 確認 Machine 0 存活
       shell: juju ssh --model {{ test_model }} 0 -- "echo 'alive'"
       register: machine_check
       ignore_errors: yes
 
-    - name: 1.3 終止檢查
+    - name: 1.2 終止檢查
       fail:
-        msg: "❌ 無法連線到 Machine 0，請檢查 Juju 狀態。"
+        msg: "❌ 無法連線到 Machine 0"
       when: machine_check.rc != 0
 
     # -----------------------------------------------------------
-    # 2. 準備 YAML 內容 (Base64 封裝)
+    # 2. 清理衝突資源 (關鍵步驟)
     # -----------------------------------------------------------
-    - name: 2.1 定義 PV 與 PVC 的 YAML 內容
+    - name: 2.1 [刪除] 手動 PVC (讓路給 Helm)
+      # 刪除那個沒有 Label 的 PVC，這樣 Helm 才能建立它自己的
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false 2>/dev/null || true"
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 3. 準備 PV (PersistentVolume) - Base64 模式
+    # -----------------------------------------------------------
+    - name: 3.1 定義 PV 內容
+      # PV 必須我們自己建，因為 Helm Chart 不知道實體 IP
       set_fact:
         pv_yaml_content: |
           apiVersion: v1
           kind: PersistentVolume
           metadata:
             name: slurm-nfs-pv
+            labels:
+              type: nfs-static
           spec:
             capacity:
               storage: 20Gi
             accessModes:
               - ReadWriteMany
             persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
             nfs:
               path: {{ nfs_path }}
               server: {{ nfs_server_ip }}
-        pvc_yaml_content: |
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: slurm-shared-storage
-            namespace: {{ namespace }}
-          spec:
-            accessModes:
-              - ReadWriteMany
-            resources:
-              requests:
-                storage: 20Gi
-            volumeName: slurm-nfs-pv
-            storageClassName: ""
 
-    # -----------------------------------------------------------
-    # 3. 傳輸並應用 (Base64 解碼寫入)
-    # -----------------------------------------------------------
-    - name: 3.1 寫入 PV 檔案
+    - name: 3.2 寫入並應用 PV
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
-        "echo '{{ pv_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pv.yaml"
+        "echo '{{ pv_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pv.yaml && \
+         kubectl delete pv slurm-nfs-pv --wait=false 2>/dev/null || true && \
+         kubectl apply -f /home/ubuntu/slurm-pv.yaml"
       changed_when: true
 
-    - name: 3.2 寫入 PVC 檔案
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "echo '{{ pvc_yaml_content | b64encode }}' | base64 -d > /home/ubuntu/slurm-pvc.yaml"
-      changed_when: true
-
-    - name: 3.3 確保 NFS Server 運作 (Host 端)
+    - name: 3.3 確保 Host 端 NFS 服務正常
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "sudo apt-get update && \
@@ -99,19 +87,8 @@
          sudo systemctl restart nfs-kernel-server"
       changed_when: true
 
-    - name: 3.4 應用 PV/PVC 設定
-      # 清理舊資源並建立新資源
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl delete pv slurm-nfs-pv --wait=false 2>/dev/null || true && \
-         kubectl delete pvc slurm-shared-storage -n {{ namespace }} --wait=false 2>/dev/null || true && \
-         kubectl create ns {{ namespace }} 2>/dev/null || true && \
-         kubectl apply -f /home/ubuntu/slurm-pv.yaml && \
-         kubectl apply -f /home/ubuntu/slurm-pvc.yaml"
-      changed_when: true
-
     # -----------------------------------------------------------
-    # 4. 部署 Slurm
+    # 4. 部署 Slurm (Helm 自動綁定模式)
     # -----------------------------------------------------------
     - name: 4.1 下載 StackHPC Chart
       shell: |
@@ -128,13 +105,22 @@
       changed_when: true
 
     - name: 4.3 產生 Values (Base64 寫入)
+      # [重點策略]
+      # 1. create: true -> 讓 Helm 建立 PVC (這樣它就擁有所有權，不會報錯)
+      # 2. storageClassName: "" -> 禁用動態分配，強迫它去尋找我們剛建好的 PV
+      # 3. volumeName: slurm-nfs-pv -> 明確指定要綁定哪一顆硬碟 (雙重保險)
       vars:
         values_content: |
           global:
             clusterName: {{ test_model }}
           volumeClaim:
-            create: false
+            create: true
             name: slurm-shared-storage
+            storageClassName: ""
+            volumeName: slurm-nfs-pv
+            accessModes:
+              - ReadWriteMany
+            size: 20Gi
           controller:
             size: 10Gi
             storageClassName: "local-path"
@@ -164,6 +150,7 @@
       changed_when: false
 
     - name: 4.4 部署 Slurm
+      # 這次 Helm 會自己建立 PVC，並成功綁定到我們的 PV
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "helm upgrade --install {{ release_name }} ./slurm-k8s-cluster/slurm-cluster-chart \
@@ -176,7 +163,7 @@
     - name: ✅ 完成
       debug:
         msg: 
-          - "🎉 Slurm + NFS (Direct IP Mode) 部署成功！"
-          - "我們繞過了所有自動偵測與格式問題。"
-          - "請檢查 Pod 狀態："
-          - "kubectl get pods -n slurm-cluster"
+          - "🎉 V4.0 部署成功！"
+          - "我們清除了衝突的 PVC，讓 Helm 自己建立並綁定 PV。"
+          - "請檢查 Pods: kubectl get pods -n slurm-cluster"
+          - "請檢查 PVC:  kubectl get pvc -n slurm-cluster (應該是 Bound 狀態)"
