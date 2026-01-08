@@ -346,74 +346,83 @@
         '
       changed_when: false
 
-    # [關鍵修復] 8.2 明確指定 StorageClass，使用 Heredoc 寫法
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Fixed Storage
+    # [最終修復] 8.2 使用 printf 逐行寫入 (避開 Heredoc 縮排地雷)
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Bulletproof
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
 
-          # 建立 values.yaml
-          cat <<EOF > /tmp/slurm-values.yaml
-          controller:
-            # 這裡強制指定 nfs-rwx，解決 Pending 問題
-            persistence:
-              enabled: true
-              size: 10Gi
-              storageClassName: "{{ nfs_storageclass }}"
-            
-            # 避免 Helm 合併衝突
-            extraConf: ""
-            extraConfMap: {}
+          # 定義一個 helper function 來寫檔，避免 printf 參數錯誤
+          # printf -- "%s\n" 可以安全處理以 "-" 開頭的字串
+          f="/tmp/slurm-values.yaml"
+          : > $f
+          function w { printf -- "%s\n" "$1" >> $f; }
 
-          nodesets:
-            slinky:
-              enabled: true
-              partition:
-                enabled: false
-              podSpec:
-                nodeSelector:
-                  kubernetes.io/hostname: {{ gpu_node_hostname }}
-                  kubernetes.io/os: linux
-                tolerations:
-                - effect: NoSchedule
-                  key: {{ gpu_taint_key }}
-                  operator: Equal
-                  value: "{{ gpu_taint_value }}"
-                useResourceLimits: true
-                slurmd:
-                  resources:
-                    limits:
-                      nvidia.com/gpu: {{ slurm_gpu_count }}
-                  args:
-                  - --conf
-                  - Gres=gpu:{{ slurm_gpu_count }}
+          echo "[INFO] Generating values.yaml..."
+          
+          # 開始逐行寫入 (縮排由字串內的空白控制)
+          w "controller:"
+          w "  persistence:"
+          w "    enabled: true"
+          w "    size: 10Gi"
+          w "    storageClassName: \"{{ nfs_storageclass }}\""
+          w "  extraConf: \"\""
+          w "  extraConfMap: {}"
+          
+          w "nodesets:"
+          w "  slinky:"
+          w "    enabled: true"
+          w "    partition:"
+          w "      enabled: false"
+          w "    podSpec:"
+          w "      nodeSelector:"
+          w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
+          w "        kubernetes.io/os: linux"
+          w "      tolerations:"
+          w "      - effect: NoSchedule"
+          w "        key: {{ gpu_taint_key }}"
+          w "        operator: Equal"
+          w "        value: \"{{ gpu_taint_value }}\""
+          w "      useResourceLimits: true"
+          w "      slurmd:"
+          w "        resources:"
+          w "          limits:"
+          w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
+          w "        args:"
+          w "        - --conf"
+          w "        - Gres=gpu:{{ slurm_gpu_count }}"
 
-          partitions:
-            all:
-              enabled: true
-              nodesets: [ALL]
-              configMap:
-                Default: "YES"
-                MaxTime: UNLIMITED
-                State: UP
-            slinky:
-              enabled: true
-              nodesets: [ALL]
-              configMap:
-                Default: "NO"
-                MaxTime: UNLIMITED
-                State: UP
+          w "partitions:"
+          w "  all:"
+          w "    enabled: true"
+          w "    nodesets: [ALL]"
+          w "    configMap:"
+          w "      Default: \"YES\""
+          w "      MaxTime: UNLIMITED"
+          w "      State: UP"
+          w "  slinky:"
+          w "    enabled: true"
+          w "    nodesets: [ALL]"
+          w "    configMap:"
+          w "      Default: \"NO\""
+          w "      MaxTime: UNLIMITED"
+          w "      State: UP"
 
-          configFiles:
-            gres.conf: |
-              AutoDetect=nvidia
-          EOF
+          w "configFiles:"
+          w "  gres.conf: |"
+          w "    AutoDetect=nvidia"
 
-          # 執行 Helm 安裝
+          echo "[INFO] Checking generated file..."
+          # 檢查檔案結尾，確保沒有多餘的垃圾
+          tail -n 5 $f
+
+          echo "[INFO] Executing Helm Upgrade..."
+          # 這裡加上 --wait 確保 Ansible 知道它真的裝完了
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
-            -f /tmp/slurm-values.yaml
+            -f $f \
+            --wait --timeout=300s
         '
       changed_when: true
 
