@@ -1,347 +1,352 @@
+---
 # ========================================================
-# SKU: Slinky-SlurmOnK8s-Standard
-# 依你剛剛成功流程標準化：
-#   - (optional) NFS server + nfs-subdir-external-provisioner
-#   - cert-manager
-#   - slurm-operator-crds + slurm-operator
-#   - nvidia k8s-device-plugin
-#   - slurm chart (OCI) + values (fix partition / fix duplicate extraConf / keep gres autodetect)
+# SKU: Slinky-SlurmOnK8s-Standardized
+# Goal:
+#   - Baseline (repeatable):
+#     1) NFS Server (on machine0) + nfs-subdir-external-provisioner + StorageClass
+#     2) NVIDIA k8s-device-plugin (Helm) with tolerations + nodeSelector
+#     3) cert-manager + slurm-operator-crds + slurm-operator + slurm chart (Slinky)
+#   - Avoid pitfalls:
+#     - NEVER kubectl patch Controller extraConf (Helm conflict)
+#     - Partitions do NOT depend on Feature
+#     - Device-plugin MUST have toleration + nodeSelector (GPU node taint)
 # ========================================================
 
-- name: Application Layer - Deploy Slinky Slurm on K8s (Standard)
+- name: Application Layer - Deploy Slinky Slurm on K8s (Standardized)
   hosts: maasjuju
   gather_facts: yes
 
   vars:
-    # -----------------------------
-    # Juju / Cluster
-    # -----------------------------
+    # ---- Juju / machines ----
     test_model: "slinky-cluster"
+    machine0: "0"                 # control-plane node (slurmhn)
+    machine1: "1"                 # gpu worker node (gpu-node01)
 
-    # 你現在的拓撲：machine0=control-plane(slurmhn)，machine1=gpu worker(gpu-node01)
-    # 如果不是 0/1，改這裡即可
-    machine_cp_id: "0"
-    machine_gpu_id: "1"
+    # ---- K8s nodes ----
+    controlplane_hostname: "slurmhn"
+    gpu_node_hostname: "gpu-node01"
 
-    # -----------------------------
-    # Namespaces / Release Names
-    # -----------------------------
-    cert_ns: "cert-manager"
-    operator_ns: "slinky"
-    slurm_ns: "slurm"
-    nfs_ns: "nfs-provisioner"
-    device_plugin_ns: "nvidia-device-plugin"
+    # ---- Namespaces ----
+    ns_certmgr: "cert-manager"
+    ns_nvidia: "nvidia-device-plugin"
+    ns_slurm_operator: "slinky"
+    ns_slurm: "slurm"
+    ns_nfs: "nfs-provisioner"
 
-    cert_release: "cert-manager"
-    operator_crds_release: "slurm-operator-crds"
-    operator_release: "slurm-operator"
-    slurm_release: "slurm"
-    nfs_release: "nfs-provisioner"
-    device_plugin_release: "nvidia-device-plugin"
+    # ---- NFS (server on machine0 by default) ----
+    nfs_server_setup: true
+    nfs_server: ""                # leave empty => use machine0_ip
+    nfs_export_path: "/srv/nfs/k8s"
+    nfs_storageclass: "nfs-rwx"
+    nfs_make_default_sc: false     # 如果你要把 nfs-rwx 設成 default，改 true
 
-    # -----------------------------
-    # Versions (你可固定以利重現)
-    # -----------------------------
-    cert_manager_version: "v1.19.2"
-    slinky_chart_version: "1.0.1"     # slurm / slurm-operator / slurm-operator-crds chart version
-    slinky_app_version: "25.11"       # 參考用（不是 helm 參數）
-    # Device plugin chart 版本你可自行固定；不填也可以
-    device_plugin_chart_version: ""   # e.g. "0.17.1" (留空=使用 repo 最新)
-
-    # -----------------------------
-    # Node naming (用來 nodeSelector / label / taint)
-    # -----------------------------
-    gpu_k8s_node_name: "gpu-node01"   # kubectl get nodes 的名稱
-
-    # 你目前的 GPU taint
+    # ---- NVIDIA device plugin ----
     gpu_taint_key: "node-role.anxpert/gpu"
     gpu_taint_value: "true"
-    gpu_taint_effect: "NoSchedule"
+    # 用 hostname selector 最穩，避免跑到別台
+    nvidia_node_selector:
+      kubernetes.io/hostname: "gpu-node01"
 
-    # 會補一個 label，讓 device-plugin 好選擇節點（且跟 taint key 同名比較直覺）
-    gpu_label_key: "node-role.anxpert/gpu"
-    gpu_label_value: "true"
+    # ---- Versions ----
+    cert_manager_chart_version: "v1.19.2"
 
-    # -----------------------------
-    # Optional: NFS (for standardization)
-    # -----------------------------
-    nfs_enabled: true
-    # NFS export path on control-plane node
-    nfs_export_dir: "/srv/nfs/k8s"
-    # provisioner 使用的子路徑（PV 會在此底下自動建立子目錄）
-    nfs_provisioner_path: "/srv/nfs/k8s"
-    nfs_storage_class: "nfs-rwx"
-    # 你要不要讓 slurm controller 的 statesave PVC 使用 NFS 的 storageClass
-    #（你剛剛成功不一定需要，但標準化時常會想指定）
-    slurm_controller_storageclass: "nfs-rwx"
+    # Slinky charts (OCI)
+    slurm_operator_chart_ver: "1.0.1"
+    slurm_chart_ver: "1.0.1"
 
-    # -----------------------------
-    # Optional: Reset namespaces (測試重佈署建議 true)
-    # -----------------------------
-    reset_before_install: true
+    # ---- Slurm nodeset resources ----
+    slurm_gpu_count: 1
 
   tasks:
     # -----------------------------------------------------------
-    # 1.0) Runtime Discovery - Machine IPs
+    # 1) Discover machine IPs from Juju
     # -----------------------------------------------------------
-    - name: 1.1 Get Juju status JSON
+    - name: 1.1 Get Juju model status (json)
       shell: "juju status --model {{ test_model }} --format json"
       register: juju_status_raw
       changed_when: false
 
-    - name: 1.2 Extract machine IPs
+    - name: 1.2 Parse machine0/machine1 IPv4
       set_fact:
-        machine0_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine_cp_id]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
-        machine1_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine_gpu_id]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
+        machine0_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine0]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
+        machine1_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine1]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
 
-    - name: 1.3 Show detected IPs
+    - name: 1.3 Show discovered IPs
       debug:
         msg:
-          - "Control-plane machine {{ machine_cp_id }} IP: {{ machine0_ip }}"
-          - "GPU worker   machine {{ machine_gpu_id }} IP: {{ machine1_ip }}"
+          - "Machine0 (control-plane) IP: {{ machine0_ip }}"
+          - "Machine1 (gpu worker)   IP: {{ machine1_ip }}"
+
+    - name: 1.4 Decide NFS server IP
+      set_fact:
+        nfs_server_ip: "{{ (nfs_server | trim) if (nfs_server | trim != '') else machine0_ip }}"
 
     # -----------------------------------------------------------
-    # 2.0) Install Helm (machine0)
+    # 2) Ensure Helm exists on machine0
     # -----------------------------------------------------------
-    - name: 2.1 Ensure helm installed on machine0
+    - name: 2.1 Install Helm on machine0 if missing
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
           if ! command -v helm >/dev/null 2>&1; then
             echo "[INFO] Installing Helm..."
             curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           else
-            echo "[INFO] Helm already installed: $(helm version --short || true)"
+            echo "[INFO] Helm already installed"
           fi
         '
       changed_when: false
 
     # -----------------------------------------------------------
-    # 3.0) Optional Reset (namespaces)
+    # 3) (Optional) Setup NFS server on machine0
     # -----------------------------------------------------------
-    - name: 3.1 Reset namespaces (slurm/slinky/cert-manager/device-plugin/nfs)
+    - name: 3.1 Setup NFS server export on machine0 (optional)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
-          set -e
-          for ns in {{ slurm_ns }} {{ operator_ns }} {{ cert_ns }} {{ device_plugin_ns }} {{ nfs_ns }}; do
-            kubectl delete ns "$ns" --ignore-not-found=true --wait=true || true
-          done
-        '
-      when: reset_before_install | bool
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 4.0) Optional NFS: server + provisioner (machine0)
-    # -----------------------------------------------------------
-    - name: 4.1 (NFS) Install nfs-kernel-server on machine0
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
           sudo apt-get update -y
           sudo apt-get install -y nfs-kernel-server
-        '
-      when: nfs_enabled | bool
-      changed_when: true
-
-    - name: 4.2 (NFS) Create export dir + export config
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
-          set -e
-          sudo mkdir -p "{{ nfs_export_dir }}"
-          sudo chown -R nobody:nogroup "{{ nfs_export_dir }}"
-          sudo chmod 0777 "{{ nfs_export_dir }}"
-
-          # 允許你的 cluster 網段存取（你可自行收斂）
-          EXPORT_LINE="{{ nfs_export_dir }} *(rw,sync,no_subtree_check,no_root_squash)"
-          if ! sudo grep -qF "$EXPORT_LINE" /etc/exports; then
-            echo "$EXPORT_LINE" | sudo tee -a /etc/exports >/dev/null
+          sudo mkdir -p {{ nfs_export_path }}
+          sudo chmod 777 {{ nfs_export_path }}
+          # allow your cluster subnet(s); adjust if needed
+          EXPORT_LINE="{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)"
+          if ! sudo grep -qF "{{ nfs_export_path }}" /etc/exports; then
+            echo "$EXPORT_LINE" | sudo tee -a /etc/exports
           fi
-
           sudo exportfs -ra
-          sudo systemctl restart nfs-kernel-server
-          sudo exportfs -v
+          sudo systemctl enable --now nfs-server
+          echo "[INFO] NFS exports:"
+          sudo exportfs -v | sed -n "1,120p"
         '
-      when: nfs_enabled | bool
-      changed_when: true
-
-    - name: 4.3 (NFS) Install nfs-subdir-external-provisioner (creates StorageClass)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
-          set -e
-          kubectl get ns {{ nfs_ns }} >/dev/null 2>&1 || kubectl create ns {{ nfs_ns }}
-
-          helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ || true
-          helm repo update
-
-          # 安裝 provisioner
-          helm upgrade --install {{ nfs_release }} nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-            -n {{ nfs_ns }} \
-            --set nfs.server={{ machine0_ip }} \
-            --set nfs.path={{ nfs_provisioner_path }} \
-            --set storageClass.name={{ nfs_storage_class }} \
-            --set storageClass.defaultClass=false \
-            --set storageClass.archiveOnDelete=false
-
-          # 等 DS ready
-          kubectl -n {{ nfs_ns }} rollout status deploy/{{ nfs_release }} --timeout=180s || true
-          kubectl get sc | egrep -n "{{ nfs_storage_class }}|NAME" || true
-        '
-      when: nfs_enabled | bool
+      when: nfs_server_setup | bool
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5.0) Prepare GPU node label/taint consistency (machine0)
+    # 4) Install NFS provisioner (nfs-subdir-external-provisioner)
     # -----------------------------------------------------------
-    - name: 5.1 Ensure GPU node label exists (for nodeSelector)
+    - name: 4.1 Create namespace for NFS provisioner
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
-          set -e
-          kubectl label node {{ gpu_k8s_node_name }} {{ gpu_label_key }}={{ gpu_label_value }} --overwrite
-          kubectl get node {{ gpu_k8s_node_name }} --show-labels | tr "," "\n" | egrep -n "{{ gpu_label_key }}|kubernetes.io/hostname"
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          kubectl create ns {{ ns_nfs }} --dry-run=client -o yaml | kubectl apply -f -
         '
-      changed_when: true
+      changed_when: false
 
-    - name: 5.2 Ensure GPU node taint exists (NoSchedule)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          # 若已存在不會報錯（或你可改成先檢查）
-          kubectl taint node {{ gpu_k8s_node_name }} {{ gpu_taint_key }}={{ gpu_taint_value }}:{{ gpu_taint_effect }} --overwrite || true
-          kubectl describe node {{ gpu_k8s_node_name }} | egrep -i "Taints|{{ gpu_taint_key }}" || true
+          helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
+          helm repo update >/dev/null 2>&1
+
+          cat > /tmp/nfs-values.yaml <<EOF
+nfs:
+  server: "{{ nfs_server_ip }}"
+  path: "{{ nfs_export_path }}"
+storageClass:
+  name: "{{ nfs_storageclass }}"
+  defaultClass: {{ (nfs_make_default_sc | bool) | lower }}
+  reclaimPolicy: Delete
+  archiveOnDelete: true
+EOF
+
+          helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+            -n {{ ns_nfs }} --create-namespace \
+            -f /tmp/nfs-values.yaml
         '
       changed_when: true
 
     # -----------------------------------------------------------
-    # 6.0) Install NVIDIA k8s-device-plugin (machine0)
+    # 5) Install NVIDIA device plugin (Helm) with toleration + nodeSelector
     # -----------------------------------------------------------
-    - name: 6.1 Install NVIDIA device plugin via Helm (tolerate your GPU taint)
+    - name: 5.1 Create namespace for NVIDIA device plugin
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          kubectl create ns {{ ns_nvidia }} --dry-run=client -o yaml | kubectl apply -f -
+        '
+      changed_when: false
+
+    - name: 5.2 Install/upgrade NVIDIA device plugin (daemonset) with tolerations + nodeSelector
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          kubectl get ns {{ device_plugin_ns }} >/dev/null 2>&1 || kubectl create ns {{ device_plugin_ns }}
+          helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
+          helm repo update >/dev/null 2>&1
 
-          helm repo add nvdp https://nvidia.github.io/k8s-device-plugin || true
-          helm repo update
+          cat > /tmp/nvidia-device-plugin-values.yaml <<EOF
+tolerations:
+  - key: "{{ gpu_taint_key }}"
+    operator: "Equal"
+    value: "{{ gpu_taint_value }}"
+    effect: "NoSchedule"
+nodeSelector:
+  kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+EOF
 
-          # 組出 version 參數（若 device_plugin_chart_version 留空則不帶 --version）
-          VER_ARG=""
-          if [ -n "{{ device_plugin_chart_version }}" ]; then
-            VER_ARG="--version {{ device_plugin_chart_version }}"
-          fi
+          helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
+            -n {{ ns_nvidia }} --create-namespace \
+            -f /tmp/nvidia-device-plugin-values.yaml
 
-          # 安裝 / 升級
-          # 只跑在你標記的 GPU nodes，並容忍 NoSchedule taint
-          helm upgrade --install {{ device_plugin_release }} nvdp/nvidia-device-plugin \
-            -n {{ device_plugin_ns }} \
-            $VER_ARG \
-            --set nodeSelector."{{ gpu_label_key }}"="{{ gpu_label_value }}" \
-            --set tolerations[0].key="{{ gpu_taint_key }}" \
-            --set tolerations[0].operator="Equal" \
-            --set tolerations[0].value="{{ gpu_taint_value }}" \
-            --set tolerations[0].effect="{{ gpu_taint_effect }}"
+          echo "[INFO] wait device-plugin ready..."
+          kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=180s
+        '
+      changed_when: true
 
-          # 等 daemonset ready（chart 有時是 daemonset）
-          kubectl -n {{ device_plugin_ns }} get ds -o wide || true
-          DS=$(kubectl -n {{ device_plugin_ns }} get ds -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || true)
-          if [ -n "$DS" ]; then
-            kubectl -n {{ device_plugin_ns }} rollout status ds/$DS --timeout=180s || true
-          fi
+    - name: 5.3 Verify GPU allocatable on gpu node
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          kubectl describe node {{ gpu_node_hostname }} | egrep -i "Taints|nvidia.com/gpu|Allocatable|Capacity" -n || true
+        '
+      changed_when: false
 
-          # 驗證 GPU resource 有出現
-          kubectl get node {{ gpu_k8s_node_name }} -o jsonpath="{.status.capacity.nvidia\.com/gpu}{\"\n\"}" || true
+    # (Optional) quick smoke test pod (idempotent: delete then apply)
+    - name: 5.4 GPU smoke test pod (delete -> run -> logs -> delete)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -e
+          kubectl delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
+
+          cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-smoke
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+  tolerations:
+  - key: "{{ gpu_taint_key }}"
+    operator: "Equal"
+    value: "{{ gpu_taint_value }}"
+    effect: "NoSchedule"
+  containers:
+  - name: c
+    image: nvidia/cuda:12.4.1-base-ubuntu22.04
+    command: ["bash","-lc","nvidia-smi -L || true; ls -l /dev/nvidia0 || true; sleep 2"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+EOF
+
+          kubectl wait --for=condition=Ready pod/gpu-smoke --timeout=120s || true
+          kubectl logs gpu-smoke || true
+          kubectl delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
         '
       changed_when: true
 
     # -----------------------------------------------------------
-    # 7.0) Install cert-manager (machine0)
+    # 6) Install cert-manager (required by operator webhook)
     # -----------------------------------------------------------
-    - name: 7.1 Install cert-manager (required by webhook)
+    - name: 6.1 Create namespace cert-manager
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          kubectl create ns {{ ns_certmgr }} --dry-run=client -o yaml | kubectl apply -f -
+        '
+      changed_when: false
+
+    - name: 6.2 Install/upgrade cert-manager via Helm
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          kubectl get ns {{ cert_ns }} >/dev/null 2>&1 || kubectl create ns {{ cert_ns }}
+          helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
+          helm repo update >/dev/null 2>&1
 
-          helm repo add jetstack https://charts.jetstack.io || true
-          helm repo update
-
-          helm upgrade --install {{ cert_release }} jetstack/cert-manager \
-            -n {{ cert_ns }} \
-            --version {{ cert_manager_version }} \
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            -n {{ ns_certmgr }} --create-namespace \
+            --version {{ cert_manager_chart_version }} \
             --set crds.enabled=true
 
-          kubectl -n {{ cert_ns }} rollout status deploy/{{ cert_release }} --timeout=240s || true
-          kubectl -n {{ cert_ns }} get pods -o wide
+          kubectl -n {{ ns_certmgr }} rollout status deploy/cert-manager --timeout=180s
+          kubectl -n {{ ns_certmgr }} rollout status deploy/cert-manager-webhook --timeout=180s
+          kubectl -n {{ ns_certmgr }} rollout status deploy/cert-manager-cainjector --timeout=180s
         '
       changed_when: true
 
     # -----------------------------------------------------------
-    # 8.0) Install slurm-operator CRDs + operator (machine0)
+    # 7) Install slurm-operator-crds + slurm-operator (OCI charts)
     # -----------------------------------------------------------
-    - name: 8.1 Install slurm-operator-crds (OCI)
+    - name: 7.1 Create namespace for slurm operator
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
-          set -e
-          helm upgrade --install {{ operator_crds_release }} oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
-            --version {{ slinky_chart_version }}
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          kubectl create ns {{ ns_slurm_operator }} --dry-run=client -o yaml | kubectl apply -f -
+        '
+      changed_when: false
 
-          # CRDs 出現即可
-          kubectl get crd | egrep "slinky\.slurm\.net" || true
+    - name: 7.2 Install/upgrade slurm-operator-crds (OCI)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -e
+          helm upgrade --install slurm-operator-crds oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+            -n default --create-namespace \
+            --version {{ slurm_operator_chart_ver }}
         '
       changed_when: true
 
-    - name: 8.2 Install slurm-operator (OCI) in operator_ns
+    - name: 7.3 Install/upgrade slurm-operator (OCI)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          kubectl get ns {{ operator_ns }} >/dev/null 2>&1 || kubectl create ns {{ operator_ns }}
+          helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
+            -n {{ ns_slurm_operator }} --create-namespace \
+            --version {{ slurm_operator_chart_ver }}
 
-          helm upgrade --install {{ operator_release }} oci://ghcr.io/slinkyproject/charts/slurm-operator \
-            -n {{ operator_ns }} \
-            --version {{ slinky_chart_version }}
-
-          kubectl -n {{ operator_ns }} get pods -o wide
+          kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator --timeout=180s
         '
       changed_when: true
 
     # -----------------------------------------------------------
-    # 9.0) Deploy Slurm (OCI) with the "stable values" you ended up using
+    # 8) Install slurm chart (OCI) with stable values (no Feature dependency)
     # -----------------------------------------------------------
-    - name: 9.1 Write slurm values (stable) to machine0
+    - name: 8.1 Create namespace slurm
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          kubectl create ns {{ ns_slurm }} --dry-run=client -o yaml | kubectl apply -f -
+        '
+      changed_when: false
+
+    - name: 8.2 Install/upgrade slurm chart with stable partitions + GRES autodetect
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          cat > /home/ubuntu/slinky-slurm-values.yaml <<EOF
+
+          cat > /tmp/slurm-values.yaml <<EOF
 controller:
-  # 清空避免跟 chart 自己產生內容重複/打架（你之前遇到 duplicate partition 就是這類型）
+  # 避免 controller 又塞 extraConf 造成重複/衝突
   extraConf: ""
   extraConfMap: {}
-  persistence:
-    enabled: true
-    {{- " "}}
-    {{- ""}}
 
 nodesets:
   slinky:
     enabled: true
-    # 關掉 nodeset 自動生 partition，避免依賴 Feature/NodeSet 波動造成 partition 0 n/a
+
+    # nodeset 不要自動生成 partition（避免依賴 Feature）
     partition:
       enabled: false
-    useResourceLimits: true
+
+    # 固定排到 GPU node（最穩）
     podSpec:
       nodeSelector:
-        kubernetes.io/hostname: {{ gpu_k8s_node_name }}
+        kubernetes.io/hostname: "{{ gpu_node_hostname }}"
         kubernetes.io/os: linux
       tolerations:
-      - key: "{{ gpu_taint_key }}"
-        operator: "Equal"
+      - effect: NoSchedule
+        key: "{{ gpu_taint_key }}"
+        operator: Equal
         value: "{{ gpu_taint_value }}"
-        effect: "{{ gpu_taint_effect }}"
+
+    useResourceLimits: true
+
     slurmd:
       resources:
         limits:
-          nvidia.com/gpu: 1
+          nvidia.com/gpu: {{ slurm_gpu_count }}
+      # 不靠 Feature，僅宣告 Gres（slurmd 會用 configless 回報）
+      args:
+      - --conf
+      - Gres=gpu:{{ slurm_gpu_count }}
 
 partitions:
+  # default partition 一定要存在（避免 "No partition specified"）
   all:
     enabled: true
     nodesets: [ALL]
@@ -350,6 +355,7 @@ partitions:
       MaxTime: UNLIMITED
       State: UP
 
+  # slinky partition：不靠 feature，直接吃 ALL（你實測最穩）
   slinky:
     enabled: true
     nodesets: [ALL]
@@ -363,86 +369,63 @@ configFiles:
     AutoDetect=nvidia
 EOF
 
-          # 若你想強制 controller statesave 也走 NFS SC，可打開下面兩行（前提 nfs_enabled=true 且 SC 存在）
-          if [ "{{ nfs_enabled | bool | lower }}" = "true" ] && kubectl get sc {{ slurm_controller_storageclass }} >/dev/null 2>&1; then
-            echo "[INFO] Patch controller.persistence.storageClassName={{ slurm_controller_storageclass }}"
-            yq -i ".controller.persistence.storageClassName = \"{{ slurm_controller_storageclass }}\"" /home/ubuntu/slinky-slurm-values.yaml || true
-          fi
-
-          echo "=== /home/ubuntu/slinky-slurm-values.yaml ==="
-          cat /home/ubuntu/slinky-slurm-values.yaml
+          helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
+            -n {{ ns_slurm }} --create-namespace \
+            --version {{ slurm_chart_ver }} \
+            -f /tmp/slurm-values.yaml
         '
       changed_when: true
 
-    - name: 9.2 Install/Upgrade slurm chart (OCI) in slurm_ns
+    # -----------------------------------------------------------
+    # 9) Restart controller + worker to ensure clean re-read
+    # -----------------------------------------------------------
+    - name: 9.1 Restart slurm controller + worker pods
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          kubectl get ns {{ slurm_ns }} >/dev/null 2>&1 || kubectl create ns {{ slurm_ns }}
-
-          helm upgrade --install {{ slurm_release }} oci://ghcr.io/slinkyproject/charts/slurm \
-            -n {{ slurm_ns }} \
-            --version {{ slinky_chart_version }} \
-            -f /home/ubuntu/slinky-slurm-values.yaml
-
-          kubectl -n {{ slurm_ns }} get pods -o wide
+          kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true || true
+          kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true || true
+          kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod -l app.kubernetes.io/name=slurmctld --timeout=180s
+          kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod -l app.kubernetes.io/name=slurmd --timeout=180s
         '
       changed_when: true
 
     # -----------------------------------------------------------
-    # 10.0) Restart controller + worker to make sure config settled
+    # 10) Verify (sinfo + srun inside slurmctld pod)
     # -----------------------------------------------------------
-    - name: 10.1 Restart slurm controller + worker pods
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld pod)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
-          set -e
-          # 直接刪 pod 讓它們重建（你實測最直覺）
-          kubectl -n {{ slurm_ns }} delete pod slurm-controller-0 slurm-worker-slinky-0 --ignore-not-found=true || true
-          kubectl -n {{ slurm_ns }} get pods -w --timeout=180s || true
-          kubectl -n {{ slurm_ns }} get pods -o wide
-        '
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 11.0) Verification (inside slurm-controller pod)
-    # -----------------------------------------------------------
-    - name: 11.1 Verify partitions + GPU GRES + run srun (inside slurmctld pod)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine_cp_id }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
           echo "== pods =="
-          kubectl -n {{ slurm_ns }} get pods -o wide
-
-          echo
-          echo "== slurm.conf partitions =="
-          kubectl -n {{ slurm_ns }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
-            "grep -n \"^PartitionName=\" /etc/slurm/slurm.conf || true"
+          kubectl -n {{ ns_slurm }} get pods -o wide
 
           echo
           echo "== sinfo =="
-          kubectl -n {{ slurm_ns }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
-            "sinfo -o \"%P %a %l %D %t %N\""
+          kubectl -n {{ ns_slurm }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
+            '"'"'sinfo -o "%P %a %l %D %t %N"'"'"'
 
           echo
-          echo "== node gres =="
-          kubectl -n {{ slurm_ns }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
-            "scontrol show node slinky-0 | egrep -i \"Gres=|CfgTRES=|State=|Reason=\" || true"
+          echo "== node GRES =="
+          kubectl -n {{ ns_slurm }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
+            '"'"'scontrol show node slinky-0 | egrep -i "NodeName=|State=|Reason=|Gres=|CfgTRES="'"'"'
 
           echo
-          echo "== srun GPU test (default/all) =="
-          kubectl -n {{ slurm_ns }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
-            "srun -N1 -n1 --gres=gpu:1 bash -lc \"ls -l /dev/nvidia0 && echo GPU_OK\""
+          echo "== srun GPU test (partition=all) =="
+          kubectl -n {{ ns_slurm }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
+            '"'"'srun -p all -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc "ls -l /dev/nvidia0 && echo GPU_OK"'"'"'
 
           echo
-          echo "== srun GPU test (partition slinky) =="
-          kubectl -n {{ slurm_ns }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
-            "srun -p slinky -N1 -n1 --gres=gpu:1 bash -lc \"ls -l /dev/nvidia0 && echo GPU_OK\""
+          echo "== srun GPU test (partition=slinky) =="
+          kubectl -n {{ ns_slurm }} exec -it slurm-controller-0 -c slurmctld -- bash -lc \
+            '"'"'srun -p slinky -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc "ls -l /dev/nvidia0 && echo GPU_OK"'"'"'
         '
       changed_when: false
 
-    - name: 12.0 Done
+    - name: Done
       debug:
         msg:
-          - "🎉 Slinky Slurm on K8s 已完成標準化部署"
-          - "包含：NFS(可選) + NVIDIA device-plugin + cert-manager + slurm-operator + slurm chart"
-          - "驗證請看最後一步：sinfo / scontrol / srun GPU_OK"
+          - "🎉 Standardized Slinky Slurm on K8s deployed"
+          - "NFS SC: {{ nfs_storageclass }} (default={{ nfs_make_default_sc }})"
+          - "NVIDIA device-plugin: installed in ns={{ ns_nvidia }} with nodeSelector={{ gpu_node_hostname }} + toleration {{ gpu_taint_key }}={{ gpu_taint_value }}"
+          - "Slurm: ns={{ ns_slurm }}, partitions: all(default) + slinky, GRES autodetect nvidia"
