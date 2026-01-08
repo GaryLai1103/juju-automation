@@ -347,72 +347,69 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) with stable values (no Feature dependency)
+    - name: 8.2 Install/upgrade slurm chart (OCI) with Heredoc & Explicit Storage
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
 
-          f=/tmp/slurm-values.yaml
-          : > $f
-
-          # controller: avoid extraConf duplication/Helm conflict
-          printf "controller:\n" >> $f
-          printf "  extraConf: \"\"\n" >> $f
-          printf "  extraConfMap: {}\n" >> $f
-
-          # nodeset: no auto partition, schedule to GPU node, request GPU
-          printf "nodesets:\n" >> $f
-          printf "  slinky:\n" >> $f
-          printf "    enabled: true\n" >> $f
-          printf "    partition:\n" >> $f
-          printf "      enabled: false\n" >> $f
-
-          printf "    podSpec:\n" >> $f
-          printf "      nodeSelector:\n" >> $f
-          printf "        kubernetes.io/hostname: %s\n" "{{ gpu_node_hostname }}" >> $f
-          printf "        kubernetes.io/os: linux\n" >> $f
-          printf "      tolerations:\n" >> $f
-          printf "      - effect: NoSchedule\n" >> $f
-          printf "        key: %s\n" "{{ gpu_taint_key }}" >> $f
-          printf "        operator: Equal\n" >> $f
-          printf "        value: \"%s\"\n" "{{ gpu_taint_value }}" >> $f
-
-          printf "    useResourceLimits: true\n" >> $f
-          printf "    slurmd:\n" >> $f
-          printf "      resources:\n" >> $f
-          printf "        limits:\n" >> $f
-          printf "          nvidia.com/gpu: %d\n" {{ slurm_gpu_count }} >> $f
-          printf "      args:\n" >> $f
-          printf "      - --conf\n" >> $f
-          printf "      - Gres=gpu:%d\n" {{ slurm_gpu_count }} >> $f
-
-          # partitions: do NOT depend on Feature; use ALL (stable)
-          printf "partitions:\n" >> $f
-          printf "  all:\n" >> $f
-          printf "    enabled: true\n" >> $f
-          printf "    nodesets: [ALL]\n" >> $f
-          printf "    configMap:\n" >> $f
-          printf "      Default: \"YES\"\n" >> $f
-          printf "      MaxTime: UNLIMITED\n" >> $f
-          printf "      State: UP\n" >> $f
-
-          printf "  slinky:\n" >> $f
-          printf "    enabled: true\n" >> $f
-          printf "    nodesets: [ALL]\n" >> $f
-          printf "    configMap:\n" >> $f
-          printf "      Default: \"NO\"\n" >> $f
-          printf "      MaxTime: UNLIMITED\n" >> $f
-          printf "      State: UP\n" >> $f
-
-          # gres autodetect
-          printf "configFiles:\n" >> $f
-          printf "  gres.conf: |\n" >> $f
-          printf "    AutoDetect=nvidia\n" >> $f
+          # 使用 Heredoc 產生 values
+          cat <<EOF > /tmp/slurm-values.yaml
+          controller:
+            # [FIX] 明確指定 StorageClass，不再依賴叢集 Default
+            persistence:
+              enabled: true
+              size: 10Gi
+              storageClassName: "{{ nfs_storageclass }}"
+            
+            extraConf: ""
+            extraConfMap: {}
+            
+          nodesets:
+            slinky:
+              enabled: true
+              partition:
+                enabled: false
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/hostname: {{ gpu_node_hostname }}
+                  kubernetes.io/os: linux
+                tolerations:
+                - effect: NoSchedule
+                  key: {{ gpu_taint_key }}
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+                useResourceLimits: true
+                slurmd:
+                  resources:
+                    limits:
+                      nvidia.com/gpu: {{ slurm_gpu_count }}
+                  args:
+                  - --conf
+                  - Gres=gpu:{{ slurm_gpu_count }}
+          partitions:
+            all:
+              enabled: true
+              nodesets: [ALL]
+              configMap:
+                Default: "YES"
+                MaxTime: UNLIMITED
+                State: UP
+            slinky:
+              enabled: true
+              nodesets: [ALL]
+              configMap:
+                Default: "NO"
+                MaxTime: UNLIMITED
+                State: UP
+          configFiles:
+            gres.conf: |
+              AutoDetect=nvidia
+          EOF
 
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
-            -f $f
+            -f /tmp/slurm-values.yaml
         '
       changed_when: true
 
