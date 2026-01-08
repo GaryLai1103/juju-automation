@@ -23,7 +23,7 @@
 
   vars:
     # ---- Mode ----
-    reset_before_install: false
+    reset_before_install: true
 
     # ---- Juju / machines ----
     test_model: "slinky-cluster"
