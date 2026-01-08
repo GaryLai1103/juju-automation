@@ -471,6 +471,36 @@
         '
       changed_when: true
 
+    - name: 8.3 Patch NodeSet slurmd probes to exec (permanent, repeatable)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -euo pipefail
+          kubectl -n {{ ns_slurm }} patch nodeset slurm-worker-slinky --type merge -p "
+          spec:
+            slurmd:
+              startupProbe:
+                exec:
+                  command: [\"bash\",\"-lc\",\"pidof slurmd >/dev/null || pgrep -f \\\"[s]lurmd\\\" >/dev/null\"]
+                periodSeconds: 5
+                timeoutSeconds: 2
+                failureThreshold: 120
+              readinessProbe:
+                exec:
+                  command: [\"bash\",\"-lc\",\"pidof slurmd >/dev/null || pgrep -f \\\"[s]lurmd\\\" >/dev/null\"]
+                periodSeconds: 5
+                timeoutSeconds: 2
+                failureThreshold: 12
+              livenessProbe:
+                exec:
+                  command: [\"bash\",\"-lc\",\"pidof slurmd >/dev/null || pgrep -f \\\"[s]lurmd\\\" >/dev/null\"]
+                periodSeconds: 10
+                timeoutSeconds: 2
+                failureThreshold: 12
+          "
+        '
+      changed_when: true
+
+
     # -----------------------------------------------------------
     # 9) Restart controller + worker (Robust check)
     # -----------------------------------------------------------
