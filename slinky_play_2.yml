@@ -393,18 +393,37 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 9) Restart controller + worker to ensure clean re-read
+    # 9) Restart controller + worker (Robust & Debug mode)
     # -----------------------------------------------------------
-    - name: 9.1 Restart slurm controller + worker pods (reschedule)
+    - name: 9.1 Restart slurm controller + worker pods (Robust)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
-          kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true || true
-          kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true || true
+          echo "[INFO] 1. Deleting old pods (Waiting for termination)..."
+          # --wait=true 確保舊 Pod 真正消失才會往下一行執行
+          kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true --wait=true
+          kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true --wait=true
 
-          kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
-          kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
+          echo "[INFO] 2. Sleeping 10s to allow StatefulSet to recreate pods..."
+          sleep 10
 
+          echo "[INFO] 3. Waiting for NEW pods to be Ready..."
+          # 這裡加了 || false 捕捉錯誤，並在失敗時印出除錯資訊
+          if ! kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s; then
+            echo "================ DEBUG INFO (Controller) ================"
+            kubectl -n {{ ns_slurm }} get pods
+            kubectl -n {{ ns_slurm }} describe pod slurm-controller-0
+            kubectl -n {{ ns_slurm }} get pvc
+            exit 1
+          fi
+
+          if ! kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s; then
+            echo "================ DEBUG INFO (Worker) ================"
+            kubectl -n {{ ns_slurm }} describe pod slurm-worker-slinky-0
+            exit 1
+          fi
+
+          echo "[INFO] 4. All pods Ready!"
           kubectl -n {{ ns_slurm }} get pods -o wide
         '
       changed_when: true
