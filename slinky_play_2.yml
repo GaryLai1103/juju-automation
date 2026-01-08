@@ -193,24 +193,34 @@
         '
       changed_when: false
 
-    - name: 5.2 Install/upgrade NVIDIA device plugin (NO heredoc)
+    - name: 5.2 Install/upgrade NVIDIA device plugin (use values file; avoid --set typing issues)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
           helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
     
+          f=/tmp/nvidia-device-plugin-values.yaml
+          rm -f "$f"
+          printf "%s\n" "tolerations:" >> "$f"
+          printf "%s\n" "  - key: \"{{ gpu_taint_key }}\"" >> "$f"
+          printf "%s\n" "    operator: \"Equal\"" >> "$f"
+          printf "%s\n" "    value: \"{{ gpu_taint_value }}\"" >> "$f"
+          printf "%s\n" "    effect: \"NoSchedule\"" >> "$f"
+          printf "%s\n" "nodeSelector:" >> "$f"
+          printf "%s\n" "  \"kubernetes.io/hostname\": \"{{ gpu_node_hostname }}\"" >> "$f"
+    
+          # 若你之前安裝到一半留下殘骸，先清掉會最乾淨
+          helm -n {{ ns_nvidia }} uninstall nvidia-device-plugin >/dev/null 2>&1 || true
+    
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
-            --set nodeSelector.kubernetes\.io/hostname="{{ gpu_node_hostname }}" \
-            --set tolerations[0].key="{{ gpu_taint_key }}" \
-            --set tolerations[0].operator="Equal" \
-            --set tolerations[0].value="{{ gpu_taint_value }}" \
-            --set tolerations[0].effect="NoSchedule"
+            -f "$f"
     
           kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
         '
       changed_when: true
+
     
 
     - name: 5.3 Verify GPU allocatable on gpu node
