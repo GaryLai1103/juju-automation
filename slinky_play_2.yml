@@ -346,8 +346,8 @@
         '
       changed_when: false
 
-    # [修正版] 8.2 使用 printf 寫入 (修正欄位名稱 size -> capacity)
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Fixed Schema
+    # [最終修正版] 8.2 使用標準 K8s PVC 結構 (resources.requests.storage)
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Standard PVC Spec
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
@@ -362,9 +362,13 @@
           w "controller:"
           w "  persistence:"
           w "    enabled: true"
-          w "    # [FIX] Slinky Operator 使用 capacity 而不是 size"
-          w "    capacity: 10Gi"
           w "    storageClassName: \"{{ nfs_storageclass }}\""
+          w "    accessModes:"
+          w "      - ReadWriteOnce"
+          # [FIX] 改用標準 K8s PVC 資源定義
+          w "    resources:"
+          w "      requests:"
+          w "        storage: 10Gi"
           w "  extraConf: \"\""
           w "  extraConfMap: {}"
           
@@ -414,13 +418,10 @@
           w "  gres.conf: |"
           w "    AutoDetect=nvidia"
 
-          echo "[INFO] Generated values head/tail:"
-          head -n 3 $f
-          echo "..."
-          tail -n 3 $f
+          echo "[INFO] Generated values head:"
+          head -n 10 $f
 
           echo "[INFO] Executing Helm Upgrade..."
-          # 加上 --wait 確保安裝完成
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
