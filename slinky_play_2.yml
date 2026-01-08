@@ -314,31 +314,37 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # [NEW] 7.4 強制等待 Webhook Service 有 Endpoints
+    # [MUST HAVE] 7.4 等待 Webhook Service 真正就緒
     # -----------------------------------------------------------
     - name: 7.4 Wait for Slurm Operator Webhook to be functional
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
           echo "[INFO] Waiting for webhook service to map endpoints..."
-          # 迴圈檢查 Service 是否有掛載 IP (代表 Pod Ready 且 Service 關聯成功)
-          for i in {1..60}; do
+          # 嘗試 20 次，每次等 6 秒 (共 2 分鐘)
+          for i in {1..20}; do
+            # 檢查 Service 是否有 Endpoints (IP)
             EP=$(kubectl -n {{ ns_slurm_operator }} get ep slurm-operator-webhook -o jsonpath="{.subsets[*].addresses[*].ip}")
+            
             if [ -n "$EP" ]; then
-              echo "Webhook is ready with endpoints: $EP"
+              echo "✅ Webhook is ready with endpoints: $EP"
               exit 0
             fi
-            echo "Waiting for webhook endpoints... ($i/60)"
-            sleep 5
+            
+            echo "⏳ Waiting for webhook endpoints... ($i/20)"
+            # 同時印出 Pod 狀態供除錯
+            kubectl -n {{ ns_slurm_operator }} get pods -l control-plane=controller-manager --no-headers | awk "{print \$1 \" \" \$3}"
+            sleep 6
           done
-          echo "[ERROR] Webhook service timed out!"
+          
+          echo "❌ Webhook service timed out!"
           kubectl -n {{ ns_slurm_operator }} describe pod -l control-plane=controller-manager
           exit 1
         '
       changed_when: false
-      
+
     # -----------------------------------------------------------
-    # 8) slurm chart (OCI) with stable partitions + GRES autodetect
+    # 8) slurm chart (OCI)
     # -----------------------------------------------------------
     - name: 8.1 Create namespace slurm
       shell: |
@@ -347,23 +353,20 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) with Heredoc & Explicit Storage
+    - name: 8.2 Install/upgrade slurm chart (OCI) with Storage Fix
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
 
-          # 使用 Heredoc 產生 values
           cat <<EOF > /tmp/slurm-values.yaml
           controller:
-            # [FIX] 明確指定 StorageClass，不再依賴叢集 Default
+            # 明確指定 StorageClass
             persistence:
               enabled: true
               size: 10Gi
               storageClassName: "{{ nfs_storageclass }}"
-            
             extraConf: ""
             extraConfMap: {}
-            
           nodesets:
             slinky:
               enabled: true
