@@ -346,29 +346,29 @@
         '
       changed_when: false
 
-    # [最終修復] 8.2 使用 printf 逐行寫入 (避開 Heredoc 縮排地雷)
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Bulletproof
+    # [修正版] 8.2 使用 printf 寫入 (修正欄位名稱 size -> capacity)
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Fixed Schema
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
 
-          # 定義一個 helper function 來寫檔，避免 printf 參數錯誤
-          # printf -- "%s\n" 可以安全處理以 "-" 開頭的字串
           f="/tmp/slurm-values.yaml"
           : > $f
           function w { printf -- "%s\n" "$1" >> $f; }
 
           echo "[INFO] Generating values.yaml..."
           
-          # 開始逐行寫入 (縮排由字串內的空白控制)
+          # --- Controller ---
           w "controller:"
           w "  persistence:"
           w "    enabled: true"
-          w "    size: 10Gi"
+          w "    # [FIX] Slinky Operator 使用 capacity 而不是 size"
+          w "    capacity: 10Gi"
           w "    storageClassName: \"{{ nfs_storageclass }}\""
           w "  extraConf: \"\""
           w "  extraConfMap: {}"
           
+          # --- NodeSets ---
           w "nodesets:"
           w "  slinky:"
           w "    enabled: true"
@@ -392,6 +392,7 @@
           w "        - --conf"
           w "        - Gres=gpu:{{ slurm_gpu_count }}"
 
+          # --- Partitions ---
           w "partitions:"
           w "  all:"
           w "    enabled: true"
@@ -408,16 +409,18 @@
           w "      MaxTime: UNLIMITED"
           w "      State: UP"
 
+          # --- ConfigFiles ---
           w "configFiles:"
           w "  gres.conf: |"
           w "    AutoDetect=nvidia"
 
-          echo "[INFO] Checking generated file..."
-          # 檢查檔案結尾，確保沒有多餘的垃圾
-          tail -n 5 $f
+          echo "[INFO] Generated values head/tail:"
+          head -n 3 $f
+          echo "..."
+          tail -n 3 $f
 
           echo "[INFO] Executing Helm Upgrade..."
-          # 這裡加上 --wait 確保 Ansible 知道它真的裝完了
+          # 加上 --wait 確保安裝完成
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
