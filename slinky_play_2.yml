@@ -346,12 +346,13 @@
         '
       changed_when: false
 
-    # [關鍵修復] 8.2 明確指定 StorageClass，不再依賴 Default
+    # [關鍵修復] 8.2 明確指定 StorageClass，使用 Heredoc 寫法
     - name: 8.2 Install/upgrade slurm chart (OCI) - Fixed Storage
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
 
+          # 建立 values.yaml
           cat <<EOF > /tmp/slurm-values.yaml
           controller:
             # 這裡強制指定 nfs-rwx，解決 Pending 問題
@@ -359,8 +360,11 @@
               enabled: true
               size: 10Gi
               storageClassName: "{{ nfs_storageclass }}"
+            
+            # 避免 Helm 合併衝突
             extraConf: ""
             extraConfMap: {}
+
           nodesets:
             slinky:
               enabled: true
@@ -383,6 +387,7 @@
                   args:
                   - --conf
                   - Gres=gpu:{{ slurm_gpu_count }}
+
           partitions:
             all:
               enabled: true
@@ -398,11 +403,13 @@
                 Default: "NO"
                 MaxTime: UNLIMITED
                 State: UP
+
           configFiles:
             gres.conf: |
               AutoDetect=nvidia
           EOF
 
+          # 執行 Helm 安裝
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
