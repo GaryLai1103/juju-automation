@@ -215,7 +215,7 @@
         '
       changed_when: false
 
-    - name: 5.2 Install/upgrade NVIDIA device plugin (Fix: use values file to clear affinity)
+    - name: "5.2 Install/upgrade NVIDIA device plugin (Fix: use values file to clear affinity)"
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
