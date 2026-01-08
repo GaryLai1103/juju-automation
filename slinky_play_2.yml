@@ -215,25 +215,30 @@
         '
       changed_when: false
 
-    - name: 5.2 Install/upgrade NVIDIA device plugin (Helm, affinity={})
+    - name: 5.2 Install/upgrade NVIDIA device plugin (Fix: use values file to clear affinity)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
           helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
 
+          # 建立 values 檔案，明確覆蓋 affinity 為 null
+          f=/tmp/nvidia-values.yaml
+          : > $f
+          printf "affinity: {}\n" >> $f
+          printf "nodeSelector:\n" >> $f
+          printf "  kubernetes.io/hostname: %s\n" "{{ gpu_node_hostname }}" >> $f
+          printf "tolerations:\n" >> $f
+          printf "- key: %s\n" "{{ gpu_taint_key }}" >> $f
+          printf "  operator: Equal\n" >> $f
+          printf "  value: \"%s\"\n" "{{ gpu_taint_value }}" >> $f
+          printf "  effect: NoSchedule\n" >> $f
+
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
-            --set-string "nodeSelector.kubernetes\.io/hostname={{ gpu_node_hostname }}" \
-            --set-string "tolerations[0].key={{ gpu_taint_key }}" \
-            --set-string "tolerations[0].operator=Equal" \
-            --set-string "tolerations[0].value={{ gpu_taint_value }}" \
-            --set-string "tolerations[0].effect=NoSchedule" \
-            --set-json "affinity={}"
+            -f $f
 
           kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
-          kubectl -n {{ ns_nvidia }} get ds -o wide
-          kubectl -n {{ ns_nvidia }} get pods -o wide
         '
       changed_when: true
 
