@@ -1,14 +1,15 @@
 ---
 # ========================================================
-# SKU: Slinky-SlurmOnK8s-Standardized
+# SKU: Slinky-SlurmOnK8s-Standardized (Final Version)
 # Goal (repeatable):
 #   1) NFS Server (machine0) + nfs-subdir-external-provisioner + StorageClass
 #   2) NVIDIA k8s-device-plugin (Helm) with tolerations + nodeSelector
 #   3) cert-manager + slurm-operator-crds + slurm-operator + slurm chart (Slinky)
-# Pitfalls:
+# Pitfalls Avoided:
 #   - NEVER kubectl patch Controller extraConf (Helm conflict)
 #   - Partitions do NOT depend on Feature
 #   - Device-plugin MUST have toleration + nodeSelector (GPU node taint)
+#   - Proper YAML indentation inside shell modules
 # ========================================================
 
 - name: Application Layer - Deploy Slinky Slurm on K8s (Standardized)
@@ -74,7 +75,7 @@
       debug:
         msg:
           - "Machine0 (control-plane) IP: {{ machine0_ip }}"
-          - "Machine1 (gpu worker)   IP: {{ machine1_ip }}"
+          - "Machine1 (gpu worker)    IP: {{ machine1_ip }}"
 
     - name: 1.4 Decide NFS server IP
       set_fact:
@@ -168,15 +169,15 @@
           helm repo update >/dev/null 2>&1
 
           cat > /tmp/nfs-values.yaml <<'"'"'EOF'"'"'
-nfs:
-  server: "{{ nfs_server_ip }}"
-  path: "{{ nfs_export_path }}"
-storageClass:
-  name: "{{ nfs_storageclass }}"
-  defaultClass: {{ (nfs_make_default_sc | bool) | lower }}
-  reclaimPolicy: Delete
-  archiveOnDelete: true
-EOF
+          nfs:
+            server: "{{ nfs_server_ip }}"
+            path: "{{ nfs_export_path }}"
+          storageClass:
+            name: "{{ nfs_storageclass }}"
+            defaultClass: {{ (nfs_make_default_sc | bool) | lower }}
+            reclaimPolicy: Delete
+            archiveOnDelete: true
+          EOF
 
           helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
             -n {{ ns_nfs }} --create-namespace \
@@ -202,14 +203,14 @@ EOF
           helm repo update >/dev/null 2>&1
 
           cat > /tmp/nvidia-device-plugin-values.yaml <<'"'"'EOF'"'"'
-tolerations:
-  - key: "{{ gpu_taint_key }}"
-    operator: "Equal"
-    value: "{{ gpu_taint_value }}"
-    effect: "NoSchedule"
-nodeSelector:
-  kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-EOF
+          tolerations:
+            - key: "{{ gpu_taint_key }}"
+              operator: "Equal"
+              value: "{{ gpu_taint_value }}"
+              effect: "NoSchedule"
+          nodeSelector:
+            kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+          EOF
 
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
@@ -232,29 +233,31 @@ EOF
           set -e
           kubectl delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
 
+          # 修正重點：Here-Doc 內容必須向右縮排以符合 YAML 語法
           cat <<'"'"'EOF'"'"' | kubectl apply -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: gpu-smoke
-spec:
-  restartPolicy: Never
-  nodeSelector:
-    kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-  tolerations:
-  - key: "{{ gpu_taint_key }}"
-    operator: "Equal"
-    value: "{{ gpu_taint_value }}"
-    effect: "NoSchedule"
-  containers:
-  - name: c
-    image: nvidia/cuda:12.4.1-base-ubuntu22.04
-    command: ["bash","-lc","nvidia-smi -L || true; ls -l /dev/nvidia0 || true; sleep 2"]
-    resources:
-      limits:
-        nvidia.com/gpu: 1
-EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: gpu-smoke
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+            tolerations:
+            - key: "{{ gpu_taint_key }}"
+              operator: "Equal"
+              value: "{{ gpu_taint_value }}"
+              effect: "NoSchedule"
+            containers:
+            - name: c
+              image: nvidia/cuda:12.4.1-base-ubuntu22.04
+              command: ["bash","-lc","nvidia-smi -L || true; ls -l /dev/nvidia0 || true; sleep 2"]
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+          EOF
 
+          kubectl wait --for=condition=Ready pod/gpu-smoke --timeout=120s || true
           kubectl logs gpu-smoke || true
           kubectl delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
         '
@@ -336,53 +339,53 @@ EOF
           set -euo pipefail
 
           cat > /tmp/slurm-values.yaml <<'"'"'EOF'"'"'
-controller:
-  extraConf: ""
-  extraConfMap: {}
+          controller:
+            extraConf: ""
+            extraConfMap: {}
 
-nodesets:
-  slinky:
-    enabled: true
-    partition:
-      enabled: false
-    podSpec:
-      nodeSelector:
-        kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-        kubernetes.io/os: linux
-      tolerations:
-      - effect: NoSchedule
-        key: "{{ gpu_taint_key }}"
-        operator: Equal
-        value: "{{ gpu_taint_value }}"
-    useResourceLimits: true
-    slurmd:
-      resources:
-        limits:
-          nvidia.com/gpu: {{ slurm_gpu_count }}
-      args:
-      - --conf
-      - Gres=gpu:{{ slurm_gpu_count }}
+          nodesets:
+            slinky:
+              enabled: true
+              partition:
+                enabled: false
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+                  kubernetes.io/os: linux
+                tolerations:
+                - effect: NoSchedule
+                  key: "{{ gpu_taint_key }}"
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+              useResourceLimits: true
+              slurmd:
+                resources:
+                  limits:
+                    nvidia.com/gpu: {{ slurm_gpu_count }}
+                args:
+                - --conf
+                - Gres=gpu:{{ slurm_gpu_count }}
 
-partitions:
-  all:
-    enabled: true
-    nodesets: [ALL]
-    configMap:
-      Default: "YES"
-      MaxTime: UNLIMITED
-      State: UP
-  slinky:
-    enabled: true
-    nodesets: [ALL]
-    configMap:
-      Default: "NO"
-      MaxTime: UNLIMITED
-      State: UP
+          partitions:
+            all:
+              enabled: true
+              nodesets: [ALL]
+              configMap:
+                Default: "YES"
+                MaxTime: UNLIMITED
+                State: UP
+            slinky:
+              enabled: true
+              nodesets: [ALL]
+              configMap:
+                Default: "NO"
+                MaxTime: UNLIMITED
+                State: UP
 
-configFiles:
-  gres.conf: |
-    AutoDetect=nvidia
-EOF
+          configFiles:
+            gres.conf: |
+              AutoDetect=nvidia
+          EOF
 
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
