@@ -162,31 +162,26 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm (NO heredoc)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
           helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
-
-          cat > /tmp/nfs-values.yaml <<EOF
-nfs:
-  server: "{{ nfs_server_ip }}"
-  path: "{{ nfs_export_path }}"
-storageClass:
-  name: "{{ nfs_storageclass }}"
-  defaultClass: {{ (nfs_make_default_sc | bool) | lower }}
-  reclaimPolicy: Delete
-  archiveOnDelete: true
-EOF
-
+    
           helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
             -n {{ ns_nfs }} --create-namespace \
-            -f /tmp/nfs-values.yaml
-
+            --set nfs.server="{{ nfs_server_ip }}" \
+            --set nfs.path="{{ nfs_export_path }}" \
+            --set storageClass.name="{{ nfs_storageclass }}" \
+            --set storageClass.defaultClass={{ (nfs_make_default_sc | bool) | lower }} \
+            --set storageClass.reclaimPolicy=Delete \
+            --set storageClass.archiveOnDelete=true
+    
           kubectl -n {{ ns_nfs }} rollout status deploy/nfs-provisioner-nfs-subdir-external-provisioner --timeout=240s
         '
       changed_when: true
+
 
     # -----------------------------------------------------------
     # 5) NVIDIA device plugin (Helm) with toleration + nodeSelector
@@ -198,30 +193,25 @@ EOF
         '
       changed_when: false
 
-    - name: 5.2 Install/upgrade NVIDIA device plugin
+    - name: 5.2 Install/upgrade NVIDIA device plugin (NO heredoc)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
           helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
-
-          cat > /tmp/nvidia-device-plugin-values.yaml <<EOF
-tolerations:
-  - key: "{{ gpu_taint_key }}"
-    operator: "Equal"
-    value: "{{ gpu_taint_value }}"
-    effect: "NoSchedule"
-nodeSelector:
-  kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-EOF
-
+    
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
-            -f /tmp/nvidia-device-plugin-values.yaml
-
+            --set nodeSelector.kubernetes\.io/hostname="{{ gpu_node_hostname }}" \
+            --set tolerations[0].key="{{ gpu_taint_key }}" \
+            --set tolerations[0].operator="Equal" \
+            --set tolerations[0].value="{{ gpu_taint_value }}" \
+            --set tolerations[0].effect="NoSchedule"
+    
           kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
         '
       changed_when: true
+    
 
     - name: 5.3 Verify GPU allocatable on gpu node
       shell: |
