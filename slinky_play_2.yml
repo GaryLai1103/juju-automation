@@ -138,16 +138,17 @@
           helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
 
+          # 注意：這裡所有的內容都必須縮排，不能貼齊最左邊
           cat > /tmp/nfs-values.yaml <<EOF
-nfs:
-  server: "{{ nfs_server_ip }}"
-  path: "{{ nfs_export_path }}"
-storageClass:
-  name: "{{ nfs_storageclass }}"
-  defaultClass: {{ (nfs_make_default_sc | bool) | lower }}
-  reclaimPolicy: Delete
-  archiveOnDelete: true
-EOF
+          nfs:
+            server: "{{ nfs_server_ip }}"
+            path: "{{ nfs_export_path }}"
+          storageClass:
+            name: "{{ nfs_storageclass }}"
+            defaultClass: {{ (nfs_make_default_sc | bool) | lower }}
+            reclaimPolicy: Delete
+            archiveOnDelete: true
+          EOF
 
           helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
             -n {{ ns_nfs }} --create-namespace \
@@ -173,14 +174,14 @@ EOF
           helm repo update >/dev/null 2>&1
 
           cat > /tmp/nvidia-device-plugin-values.yaml <<EOF
-tolerations:
-  - key: "{{ gpu_taint_key }}"
-    operator: "Equal"
-    value: "{{ gpu_taint_value }}"
-    effect: "NoSchedule"
-nodeSelector:
-  kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-EOF
+          tolerations:
+            - key: "{{ gpu_taint_key }}"
+              operator: "Equal"
+              value: "{{ gpu_taint_value }}"
+              effect: "NoSchedule"
+          nodeSelector:
+            kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+          EOF
 
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
@@ -310,64 +311,53 @@ EOF
           set -e
 
           cat > /tmp/slurm-values.yaml <<EOF
-controller:
-  # 避免 controller 又塞 extraConf 造成重複/衝突
-  extraConf: ""
-  extraConfMap: {}
+          controller:
+            extraConf: ""
+            extraConfMap: {}
 
-nodesets:
-  slinky:
-    enabled: true
+          nodesets:
+            slinky:
+              enabled: true
+              partition:
+                enabled: false
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/hostname: "{{ gpu_node_hostname }}"
+                  kubernetes.io/os: linux
+                tolerations:
+                - effect: NoSchedule
+                  key: "{{ gpu_taint_key }}"
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+              useResourceLimits: true
+              slurmd:
+                resources:
+                  limits:
+                    nvidia.com/gpu: {{ slurm_gpu_count }}
+                args:
+                - --conf
+                - Gres=gpu:{{ slurm_gpu_count }}
 
-    # nodeset 不要自動生成 partition（避免依賴 Feature）
-    partition:
-      enabled: false
+          partitions:
+            all:
+              enabled: true
+              nodesets: [ALL]
+              configMap:
+                Default: "YES"
+                MaxTime: UNLIMITED
+                State: UP
+            slinky:
+              enabled: true
+              nodesets: [ALL]
+              configMap:
+                Default: "NO"
+                MaxTime: UNLIMITED
+                State: UP
 
-    # 固定排到 GPU node（最穩）
-    podSpec:
-      nodeSelector:
-        kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-        kubernetes.io/os: linux
-      tolerations:
-      - effect: NoSchedule
-        key: "{{ gpu_taint_key }}"
-        operator: Equal
-        value: "{{ gpu_taint_value }}"
-
-    useResourceLimits: true
-
-    slurmd:
-      resources:
-        limits:
-          nvidia.com/gpu: {{ slurm_gpu_count }}
-      # 不靠 Feature，僅宣告 Gres（slurmd 會用 configless 回報）
-      args:
-      - --conf
-      - Gres=gpu:{{ slurm_gpu_count }}
-
-partitions:
-  # default partition 一定要存在（避免 "No partition specified"）
-  all:
-    enabled: true
-    nodesets: [ALL]
-    configMap:
-      Default: "YES"
-      MaxTime: UNLIMITED
-      State: UP
-
-  # slinky partition：不靠 feature，直接吃 ALL（你實測最穩）
-  slinky:
-    enabled: true
-    nodesets: [ALL]
-    configMap:
-      Default: "NO"
-      MaxTime: UNLIMITED
-      State: UP
-
-configFiles:
-  gres.conf: |
-    AutoDetect=nvidia
-EOF
+          configFiles:
+            gres.conf: |
+              AutoDetect=nvidia
+          EOF
 
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
