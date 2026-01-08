@@ -406,11 +406,11 @@
           w "    storageClassName: \"{{ nfs_storageclass }}\""
           w "    accessModes:"
           w "      - ReadWriteOnce"
-          # [FIX] 改用標準 K8s PVC 資源定義
           w "    resources:"
           w "      requests:"
           w "        storage: 10Gi"
-          w "  extraConf: \"\""
+          w "  extraConf: |"
+          w "    GresTypes=gpu"
           w "  extraConfMap: {}"
           
           # --- NodeSets ---
@@ -457,7 +457,7 @@
           # --- ConfigFiles ---
           w "configFiles:"
           w "  gres.conf: |"
-          w "    AutoDetect=nvidia"
+          w "    AutoDetect=nvml"
 
           echo "[INFO] Generated values head:"
           head -n 10 $f
