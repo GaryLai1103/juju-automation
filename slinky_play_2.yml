@@ -220,41 +220,37 @@
         '
       changed_when: false
 
-    - name: 5.4 GPU smoke test pod (write full yaml -> apply -> logs -> delete)
+    - name: 5.4 GPU smoke test pod (NO heredoc, use kubectl run)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
-          kubectl delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
-
-          cat > /tmp/gpu-smoke.yaml <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: gpu-smoke
-spec:
-  restartPolicy: Never
-  nodeSelector:
-    kubernetes.io/hostname: "{{ gpu_node_hostname }}"
-  tolerations:
-    - key: "{{ gpu_taint_key }}"
-      operator: "Equal"
-      value: "{{ gpu_taint_value }}"
-      effect: "NoSchedule"
-  containers:
-    - name: c
-      image: nvidia/cuda:12.4.1-base-ubuntu22.04
-      command: ["bash","-lc","nvidia-smi -L || true; ls -l /dev/nvidia0 || true; sleep 2"]
-      resources:
-        limits:
-          nvidia.com/gpu: 1
-EOF
-
-          kubectl apply -f /tmp/gpu-smoke.yaml
-          kubectl wait --for=condition=Ready pod/gpu-smoke --timeout=180s || true
-          kubectl logs gpu-smoke || true
-          kubectl delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
+    
+          kubectl -n default delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
+    
+          kubectl -n default run gpu-smoke \
+            --restart=Never \
+            --image=nvidia/cuda:12.4.1-base-ubuntu22.04 \
+            --overrides='"'"'{
+              "apiVersion":"v1",
+              "spec":{
+                "nodeSelector":{"kubernetes.io/hostname":"{{ gpu_node_hostname }}"},
+                "tolerations":[{"key":"{{ gpu_taint_key }}","operator":"Equal","value":"{{ gpu_taint_value }}","effect":"NoSchedule"}],
+                "containers":[{
+                  "name":"gpu-smoke",
+                  "image":"nvidia/cuda:12.4.1-base-ubuntu22.04",
+                  "command":["bash","-lc","nvidia-smi -L || true; ls -l /dev/nvidia0 || true; sleep 2"],
+                  "resources":{"limits":{"nvidia.com/gpu":1}}
+                }]
+              }
+            }'"'"' \
+            --command -- bash -lc "nvidia-smi -L || true; ls -l /dev/nvidia0 || true; sleep 2" >/dev/null 2>&1 || true
+    
+          kubectl -n default wait --for=condition=Ready pod/gpu-smoke --timeout=180s || true
+          kubectl -n default logs gpu-smoke || true
+          kubectl -n default delete pod gpu-smoke --ignore-not-found=true >/dev/null 2>&1 || true
         '
       changed_when: true
+
 
     # -----------------------------------------------------------
     # 6) cert-manager
