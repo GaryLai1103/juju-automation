@@ -194,6 +194,47 @@
       changed_when: true
 
     # -----------------------------------------------------------
+    # [新增] 4.5 安裝 NVIDIA Container Toolkit (Host Level)
+    # 這是為了讓 Containerd 知道如何把 GPU 掛進容器
+    # 注意：目標是 machine1 (GPU Node)，不是 machine0
+    # -----------------------------------------------------------
+    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine1 }} -- bash -lc '
+          set -e
+          
+          # 1. 檢查是否已安裝，避免重複執行 (冪等性檢查)
+          if dpkg -l | grep -q nvidia-container-toolkit; then
+            echo "[INFO] Toolkit already installed."
+            # 檢查 config 是否已經修改過
+            if grep -q "nvidia-container-runtime" /etc/containerd/config.toml; then
+               echo "[INFO] Containerd already configured."
+               exit 0
+            fi
+          fi
+
+          echo "[INFO] Installing NVIDIA Container Toolkit..."
+          curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+          
+          curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+            sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
+            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+          sudo apt-get update
+          sudo apt-get install -y nvidia-container-toolkit
+
+          echo "[INFO] Configuring containerd to use NVIDIA runtime..."
+          # 這行指令會自動修改 /etc/containerd/config.toml
+          sudo nvidia-ctk runtime configure --runtime=containerd
+          
+          echo "[INFO] Restarting containerd..."
+          sudo systemctl restart containerd
+          
+          echo "[INFO] Done. GPU Node is ready for passthrough."
+        '
+      changed_when: true
+
+    # -----------------------------------------------------------
     # 5) NVIDIA device plugin (A方案：清空 affinity，避免 NFD 依賴)
     # -----------------------------------------------------------
     - name: 5.0 Precheck gpu node labels/taints
