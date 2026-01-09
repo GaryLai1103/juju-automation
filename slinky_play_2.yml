@@ -489,24 +489,30 @@
         '
       changed_when: true
 
-    - name: 8.25 Verify worker got correct gres.conf and GPU device
+    - name: 8.25 Verify worker got correct gres.conf and GPU device (wait ready)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          NS="{{ ns_slurm }}"
-          WRK="slurm-worker-slinky-0"
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        NS="{{ ns_slurm }}"
+        WRK="slurm-worker-slinky-0"
+        C="slurmd"
     
-          echo "[CHECK] gres.conf:"
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf
+        echo "[INFO] wait worker pod ready..."
+        kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK" --timeout=300s
     
-          echo "[CHECK] /dev/nvidia0:"
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0
+        echo "[CHECK] container names:"
+        kubectl -n "$NS" get pod "$WRK" -o jsonpath='{.spec.containers[*].name}{"\n"}'
     
-          echo "[CHECK] nvidia-smi -L:"
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- nvidia-smi -L
-        '
+        echo "[CHECK] gres.conf:"
+        kubectl -n "$NS" exec "$WRK" -c "$C" -- cat /run/slurm/conf/gres.conf
+    
+        echo "[CHECK] /dev/nvidia0:"
+        kubectl -n "$NS" exec "$WRK" -c "$C" -- ls -l /dev/nvidia0
+    
+        echo "[CHECK] nvidia-smi -L:"
+        kubectl -n "$NS" exec "$WRK" -c "$C" -- nvidia-smi -L
+        EOS
       changed_when: false
-
 
     - name: 8.3 Patch NodeSet slurmd probes to exec (permanent, repeatable)
       shell: |
