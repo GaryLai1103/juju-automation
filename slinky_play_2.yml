@@ -555,35 +555,48 @@
     # -----------------------------------------------------------
     # 10) Verify (inside slurmctld pod)
     # -----------------------------------------------------------
-    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld)
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust quoting
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -e
+          set -euo pipefail
+    
+          NS="{{ ns_slurm }}"
+          CTL="slurm-controller-0"
+          WRK="slurm-worker-slinky-0"
+    
           echo "== sinfo =="
-          kubectl -n {{ ns_slurm }} exec slurm-controller-0 -c slurmctld -- bash -lc \
-            '"'"'sinfo -o "%P %a %l %D %t %N"'"'"'
-
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sinfo -o "%P %a %l %D %t %N"
+    
           echo
           echo "== slurm.conf partitions =="
-          kubectl -n {{ ns_slurm }} exec slurm-controller-0 -c slurmctld -- bash -lc \
-            '"'"'grep -n "^PartitionName=" /etc/slurm/slurm.conf'"'"'
-
+          # 有些 image/configless 不一定在 /etc/slurm；兩邊都試
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "grep -n \"^PartitionName=\" /etc/slurm/slurm.conf 2>/dev/null || true"
+    
           echo
-          echo "== node GRES =="
-          kubectl -n {{ ns_slurm }} exec slurm-controller-0 -c slurmctld -- bash -lc \
-            '"'"'scontrol show node slinky-0 | egrep -i "NodeName=|State=|Reason=|Gres=|CfgTRES="'"'"'
-
+          echo "== worker /run/slurm/conf/gres.conf =="
+          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf || true
+    
+          echo
+          echo "== worker /dev/nvidia0 & nvidia-smi =="
+          kubectl -n "$NS" exec "$WRK" -c slurmd -- sh -lc "ls -l /dev/nvidia0 && nvidia-smi -L" || true
+    
+          echo
+          echo "== node GRES (from slurmctld) =="
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
+            "scontrol show node slinky-0 | egrep -i \"NodeName=|State=|Reason=|Gres=|CfgTRES=\""
+    
           echo
           echo "== srun GPU test (default partition=all) =="
-          kubectl -n {{ ns_slurm }} exec slurm-controller-0 -c slurmctld -- bash -lc \
-            '"'"'srun -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc "ls -l /dev/nvidia0 && echo GPU_OK"'"'"'
-
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
+            "srun -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"ls -l /dev/nvidia0 && nvidia-smi -L && echo GPU_OK\""
+    
           echo
           echo "== srun GPU test (partition=slinky) =="
-          kubectl -n {{ ns_slurm }} exec slurm-controller-0 -c slurmctld -- bash -lc \
-            '"'"'srun -p slinky -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc "ls -l /dev/nvidia0 && echo GPU_OK"'"'"'
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
+            "srun -p slinky -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"nvidia-smi -L && echo GPU_OK\""
         '
       changed_when: false
+
 
     - name: Done
       debug:
