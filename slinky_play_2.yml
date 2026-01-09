@@ -256,16 +256,25 @@
         '
       changed_when: false
 
-    - name: "5.2 Install/upgrade NVIDIA device plugin (Fix: use Heredoc)"
+    - name: "5.2 Install/upgrade NVIDIA device plugin (Fix: override NFD affinity + reset-values)"
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
           helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
-
-          # 使用 Heredoc 建立 values 檔案 (解決 printf 無法處理開頭 "-" 的問題)
+    
+          # values.yaml：用 hostname nodeAffinity 明確覆蓋預設的 NFD affinity
+          # 並保留 nodeSelector + toleration 綁定 GPU node
           cat <<EOF > /tmp/nvidia-values.yaml
-          affinity: {}
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                    - {{ gpu_node_hostname }}
           nodeSelector:
             kubernetes.io/hostname: {{ gpu_node_hostname }}
           tolerations:
@@ -274,17 +283,26 @@
             value: "{{ gpu_taint_value }}"
             effect: NoSchedule
           EOF
-
+    
           echo "== Generated Values File =="
           cat /tmp/nvidia-values.yaml
-
+    
+          # 關鍵：--reset-values 清掉舊 release 殘留的 nodeAffinity（feature.node.kubernetes.io/*）
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
+            --reset-values \
             -f /tmp/nvidia-values.yaml
-
+    
           kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
+    
+          echo "== Device Plugin DS status =="
+          kubectl -n {{ ns_nvidia }} get ds -o wide
+    
+          echo "== GPU capacity/allocatable on node =="
+          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A5 || true
         '
       changed_when: true
+
 
     - name: 5.3 Verify nvidia.com/gpu on gpu node
       shell: |
@@ -457,7 +475,7 @@
           # --- ConfigFiles ---
           w "configFiles:"
           w "  gres.conf: |"
-          w "    AutoDetect=nvml"
+          w "    Name=gpu File=/dev/nvidia0"
 
           echo "[INFO] Generated values head:"
           head -n 10 $f
