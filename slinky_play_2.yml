@@ -562,7 +562,7 @@
     # -----------------------------------------------------------
     # 10) Verify (inside slurmctld pod)
     # -----------------------------------------------------------
-    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust quoting
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust + no pod nvidia-smi dependency
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
@@ -576,16 +576,15 @@
     
           echo
           echo "== slurm.conf partitions =="
-          # 有些 image/configless 不一定在 /etc/slurm；兩邊都試
           kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "grep -n \"^PartitionName=\" /etc/slurm/slurm.conf 2>/dev/null || true"
     
           echo
           echo "== worker /run/slurm/conf/gres.conf =="
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf || true
+          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf
     
           echo
-          echo "== worker /dev/nvidia0 & nvidia-smi =="
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- sh -lc "ls -l /dev/nvidia0 && nvidia-smi -L" || true
+          echo "== worker /dev/nvidia0 =="
+          kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0
     
           echo
           echo "== node GRES (from slurmctld) =="
@@ -595,12 +594,12 @@
           echo
           echo "== srun GPU test (default partition=all) =="
           kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "srun -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"ls -l /dev/nvidia0 && nvidia-smi -L && echo GPU_OK\""
+            "srun -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"hostname; ls -l /dev/nvidia0; echo GPU_OK\""
     
           echo
           echo "== srun GPU test (partition=slinky) =="
           kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "srun -p slinky -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"nvidia-smi -L && echo GPU_OK\""
+            "srun -p slinky -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"hostname; ls -l /dev/nvidia0; echo GPU_OK\""
         '
       changed_when: false
 
