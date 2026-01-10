@@ -131,30 +131,38 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3) (Optional) Setup NFS server on machine0
+    # 3.0 Install NFS client utils on ALL nodes (IMPORTANT)
+    # - Fix: mount: bad option ... need /sbin/mount.nfs
     # -----------------------------------------------------------
+    - name: 3.0 Install nfs-common on machine0+machine1
+      shell: |
+        for m in {{ machine0 }} {{ machine1 }}; do
+          juju ssh --model {{ test_model }} $m -- bash -lc '
+            set -e
+            sudo apt-get update -y
+            sudo apt-get install -y nfs-common
+            command -v mount.nfs >/dev/null 2>&1 && echo "[OK] mount.nfs exists" || (echo "[FAIL] mount.nfs missing" && exit 1)
+          '
+        done
+      changed_when: true
+    
     - name: 3.1 Setup NFS server export on machine0 (optional)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          sudo -n true
-
-          export DEBIAN_FRONTEND=noninteractive
-          export NEEDRESTART_MODE=a
-
-          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
-          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-kernel-server
-
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y nfs-kernel-server
           sudo mkdir -p {{ nfs_export_path }}
           sudo chmod 777 {{ nfs_export_path }}
 
+          # ✅ ensure exports.d exists
           sudo mkdir -p /etc/exports.d
 
-          EXPORT_LINE="{{ nfs_export_path }} 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)"
+          EXPORT_LINE="{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)"
           echo "$EXPORT_LINE" | sudo tee /etc/exports.d/k8s.exports >/dev/null
 
           sudo exportfs -ra
-          sudo systemctl enable --now nfs-kernel-server
+          sudo systemctl enable --now nfs-server
 
           echo "[INFO] exportfs:"
           sudo exportfs -v | sed -n "1,120p"
@@ -427,114 +435,121 @@
       changed_when: false
 
     # -----------------------------------------------------------
-    # [修正版] 8.2 強制 Controller 在 slurmhn, Worker 在 gpu-node
+    # [修正版] 8.2 強制 Controller/RestAPI 在 slurmhn, Worker 在 gpu-node01
     # -----------------------------------------------------------
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller to ControlPlane
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller/RestAPI/Worker
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
 
-          f="/tmp/slurm-values.yaml"
-          : > $f
-          function w { printf -- "%s\n" "$1" >> $f; }
+        NS="{{ ns_slurm }}"
+        f="/tmp/slurm-values.yaml"
+        : > "$f"
+        w(){ printf -- "%s\n" "$1" >> "$f"; }
 
-          echo "[INFO] Generating values.yaml..."
-          
-          # --- Controller (slurmctld) ---
-          w "controller:"
-          
-          # [NEW] 強制綁定到 slurmhn
-          w "  nodeSelector:"
-          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
-          
-          # [NEW] 如果 slurmhn 有 Taint (例如 control-plane:NoSchedule)，需要加上容忍
-          w "  tolerations:"
-          w "  - key: node-role.kubernetes.io/control-plane"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-          w "  - key: node-role.kubernetes.io/master"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
+        echo "[INFO] Generating values.yaml..."
 
-          w "  persistence:"
-          w "    enabled: true"
-          w "    storageClassName: \"{{ nfs_storageclass }}\""
-          w "    accessModes:"
-          w "      - ReadWriteOnce"
-          w "    resources:"
-          w "      requests:"
-          w "        storage: 10Gi"
-          w "  extraConf: |"
-          w "    GresTypes=gpu"
-          w "  extraConfMap: {}"
-          
-          # --- Telemetry (包含 REST API 與 Prometheus exporter) ---
-          # [NEW] 確保 REST API 也跑在 slurmhn
-          w "telemetry:"
-          w "  enabled: true"
-          w "  nodeSelector:"
-          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "  tolerations:"
-          w "  - key: node-role.kubernetes.io/control-plane"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
+        # --- Controller (slurmctld) ---
+        w "controller:"
+        w "  podSpec:"
+        w "    nodeSelector:"
+        w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
+        w "      kubernetes.io/os: linux"
+        w "    tolerations:"
+        w "    - key: node-role.kubernetes.io/control-plane"
+        w "      operator: Exists"
+        w "      effect: NoSchedule"
+        w "    - key: node-role.kubernetes.io/master"
+        w "      operator: Exists"
+        w "      effect: NoSchedule"
 
-          # --- NodeSets (Worker) ---
-          w "nodesets:"
-          w "  slinky:"
-          w "    enabled: true"
-          w "    partition:"
-          w "      enabled: false"
-          w "    podSpec:"
-          w "      nodeSelector:"
-          w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
-          w "        kubernetes.io/os: linux"
-          w "      tolerations:"
-          w "      - effect: NoSchedule"
-          w "        key: {{ gpu_taint_key }}"
-          w "        operator: Equal"
-          w "        value: \"{{ gpu_taint_value }}\""
-          w "      useResourceLimits: true"
-          w "      slurmd:"
-          w "        resources:"
-          w "          limits:"
-          w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
-          w "        args:"
-          w "        - --conf"
-          w "        - Gres=gpu:{{ slurm_gpu_count }}"
+        w "  persistence:"
+        w "    enabled: true"
+        w "    storageClassName: \"{{ nfs_storageclass }}\""
+        w "    accessModes:"
+        w "      - ReadWriteOnce"
+        w "    resources:"
+        w "      requests:"
+        w "        storage: 10Gi"
+        w "  extraConf: |"
+        w "    GresTypes=gpu"
+        w "  extraConfMap: {}"
 
-          # --- Partitions ---
-          w "partitions:"
-          w "  all:"
-          w "    enabled: true"
-          w "    nodesets: [ALL]"
-          w "    configMap:"
-          w "      Default: \"YES\""
-          w "      MaxTime: UNLIMITED"
-          w "      State: UP"
-          w "  slinky:"
-          w "    enabled: true"
-          w "    nodesets: [ALL]"
-          w "    configMap:"
-          w "      Default: \"NO\""
-          w "      MaxTime: UNLIMITED"
-          w "      State: UP"
+        # --- REST API ---
+        # 你先前 kubectl 看過 slurm-restapi deployment 能吃 nodeSelector/tolerations
+        # 這裡用常見 key: restapi.podSpec（如果 chart 不是這個 key，下面我也給你驗證方法）
+        w "restapi:"
+        w "  podSpec:"
+        w "    nodeSelector:"
+        w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
+        w "      kubernetes.io/os: linux"
+        w "    tolerations:"
+        w "    - key: node-role.kubernetes.io/control-plane"
+        w "      operator: Exists"
+        w "      effect: NoSchedule"
+        w "    - key: node-role.kubernetes.io/master"
+        w "      operator: Exists"
+        w "      effect: NoSchedule"
 
-          # --- ConfigFiles ---
-          w "configFiles:"
-          w "  gres.conf: |"
-          w "    Name=gpu File=/dev/nvidia0"
+        # --- NodeSets (Worker) ---
+        w "nodesets:"
+        w "  slinky:"
+        w "    enabled: true"
+        w "    partition:"
+        w "      enabled: false"
+        w "    podSpec:"
+        w "      nodeSelector:"
+        w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
+        w "        kubernetes.io/os: linux"
+        w "      tolerations:"
+        w "      - effect: NoSchedule"
+        w "        key: {{ gpu_taint_key }}"
+        w "        operator: Equal"
+        w "        value: \"{{ gpu_taint_value }}\""
+        w "      useResourceLimits: true"
+        w "      slurmd:"
+        w "        resources:"
+        w "          limits:"
+        w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
+        w "        args:"
+        w "        - --conf"
+        w "        - Gres=gpu:{{ slurm_gpu_count }}"
 
-          echo "[INFO] Generated values head:"
-          head -n 20 $f
+        # --- Partitions ---
+        w "partitions:"
+        w "  all:"
+        w "    enabled: true"
+        w "    nodesets: [ALL]"
+        w "    configMap:"
+        w "      Default: \"YES\""
+        w "      MaxTime: UNLIMITED"
+        w "      State: UP"
+        w "  slinky:"
+        w "    enabled: true"
+        w "    nodesets: [ALL]"
+        w "    configMap:"
+        w "      Default: \"NO\""
+        w "      MaxTime: UNLIMITED"
+        w "      State: UP"
 
-          echo "[INFO] Executing Helm Upgrade..."
-          helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-            -n {{ ns_slurm }} --create-namespace \
-            --version {{ slurm_chart_ver }} \
-            -f $f \
-            --wait --timeout=300s
-        '
+        # --- ConfigFiles ---
+        w "configFiles:"
+        w "  gres.conf: |"
+        w "    Name=gpu File=/dev/nvidia0"
+
+        echo "[INFO] values.yaml head:"
+        head -n 60 "$f"
+
+        echo "[INFO] Helm upgrade..."
+        helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
+          -n "$NS" --create-namespace \
+          --version {{ slurm_chart_ver }} \
+          -f "$f" \
+          --wait --timeout=300s
+
+        echo "[INFO] Pods placement:"
+        kubectl -n "$NS" get pods -o wide
+        EOS
       changed_when: true
 
     - name: 8.25 Verify worker got correct gres.conf and GPU device (wait ready) - no nvidia-smi dependency
