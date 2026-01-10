@@ -625,41 +625,32 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 8.25 Verify worker got correct gres.conf and GPU device + srun smoke test
+    # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
     # -----------------------------------------------------------
-    - name: 8.25 Verify worker gres.conf + /dev/nvidia0 + srun GPU smoke test
+    - name: 8.25 Verify worker Ready + gres.conf + /dev/nvidia0 (no srun here)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
+    
         NS="{{ ns_slurm }}"
         WRK="slurm-worker-slinky-0"
-        CTL="slurm-controller-0"
     
         echo "[INFO] wait worker Ready..."
         kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK" --timeout=300s
     
-        echo "[CHECK] gres.conf:"
+        echo
+        echo "[CHECK] worker gres.conf:"
         kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf
     
-        echo "[CHECK] /dev/nvidia0:"
+        echo
+        echo "[CHECK] worker /dev/nvidia0:"
         kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0
     
         echo
-        echo "== sinfo =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- sinfo -o "%P %a %D %t %N" || true
-    
-        echo
-        echo "== scontrol show nodes (brief) =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc 'scontrol show nodes | egrep -i "NodeName=|State=|Gres=|CfgTRES=" | head -n 120' || true
-    
-        echo
-        echo "[CHECK] srun GPU smoke test (authoritative):"
-        # 如果你的 partition 不是預設，請把 -p slinky 或 -p all 打開其中一個
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-          'timeout 60s srun --immediate=10 -N1 -n1 --gres=gpu:1 bash -lc "hostname; ls -l /dev/nvidia0; echo GPU_OK"'
+        echo "[CHECK] node GPU capacity (k8s):"
+        kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A6 || true
         EOS
       changed_when: false
-
 
     # -----------------------------------------------------------
     # 9) Restart controller + worker (Robust check)
@@ -695,60 +686,61 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 10) Verify (inside slurmctld pod)
+    # 10.1 Verify partitions/nodes/GRES and run GPU job (Slurm layer)
+    # - robust: use srun --wrap (avoid nested bash -lc quoting issues)
+    # - bounded: --time + --immediate
+    # - cleanup: scancel old gpu-smoke-* jobs
     # -----------------------------------------------------------
-    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - bounded + cleanup + immediate
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust (wrap) + cleanup
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
     
-          NS="{{ ns_slurm }}"
-          CTL="slurm-controller-0"
-          WRK="slurm-worker-slinky-0"
-          GPU="{{ slurm_gpu_count | default(1) }}"
+        NS="{{ ns_slurm }}"
+        CTL="slurm-controller-0"
+        GPU_CNT="{{ slurm_gpu_count | default(1) }}"
     
-          echo "== sinfo =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sinfo -o "%P %a %l %D %t %N" || true
+        echo "== sinfo (brief) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'sinfo -o "%P %a %l %D %t %N"'
     
-          echo
-          echo "== slurm.conf partitions =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "grep -n \"^PartitionName=\" /etc/slurm/slurm.conf 2>/dev/null || true"
+        echo
+        echo "== slurm.conf partitions =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'grep -n "^PartitionName=" /etc/slurm/slurm.conf 2>/dev/null || true'
     
-          echo
-          echo "== worker /run/slurm/conf/gres.conf =="
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf || true
+        echo
+        echo "== node GRES / TRES (from slurmctld) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'scontrol show node slinky-0 | egrep -i "NodeName=|State=|Reason=|Gres=|CfgTRES=|AllocTRES="'
     
-          echo
-          echo "== worker /dev/nvidia0 =="
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0 || true
-    
-          echo
-          echo "== node GRES (from slurmctld) =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "scontrol show node slinky-0 | egrep -i \"NodeName=|State=|Reason=|Gres=|CfgTRES=|AllocTRES=\" || true"
-    
-          echo
-          echo "== cleanup old test jobs (avoid Resources pending forever) =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "squeue -a || true; scancel -u slurm || true; sleep 2; squeue -a || true"
-    
-          echo
-          echo "== srun GPU test (default partition=all) [bounded] =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "timeout 150s srun -N1 -n1 --gres=gpu:${GPU} --mem=1G --time=00:02:00 --immediate=30 --kill-on-bad-exit=1 \
-             bash -lc \"hostname; ls -l /dev/nvidia0 || true; echo GPU_OK(all)\""
-    
-          echo
-          echo "== srun GPU test (partition=slinky) [bounded] =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "timeout 150s srun -p slinky -N1 -n1 --gres=gpu:${GPU} --mem=1G --time=00:02:00 --immediate=30 --kill-on-bad-exit=1 \
-             bash -lc \"hostname; ls -l /dev/nvidia0 || true; echo GPU_OK(slinky)\""
-    
-          echo
-          echo "== final squeue =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "squeue -a || true"
+        echo
+        echo "== cleanup old test jobs (by name gpu-smoke-*) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc '
+          squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
+          scancel -u slurm -n gpu-smoke-all    >/dev/null 2>&1 || true
+          scancel -u slurm -n gpu-smoke-slinky >/dev/null 2>&1 || true
+          squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
         '
+    
+        echo
+        echo "== srun GPU test (default partition=all) [bounded] =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
+          srun -N1 -n1 --job-name=gpu-smoke-all \
+            --gres=gpu:${GPU_CNT} --time=00:02:00 --immediate=30 \
+            --wrap='hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_all'
+        "
+    
+        echo
+        echo "== srun GPU test (partition=slinky) [bounded] =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
+          srun -p slinky -N1 -n1 --job-name=gpu-smoke-slinky \
+            --gres=gpu:${GPU_CNT} --time=00:02:00 --immediate=30 \
+            --wrap='hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_slinky'
+        "
+    
+        echo
+        echo "== final squeue =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true'
+        EOS
       changed_when: false
-
-
 
     - name: Done
       debug:
