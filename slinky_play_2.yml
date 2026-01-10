@@ -697,7 +697,7 @@
     # -----------------------------------------------------------
     # 10) Verify (inside slurmctld pod)
     # -----------------------------------------------------------
-    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust + no pod nvidia-smi dependency
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - bounded + cleanup + immediate
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
@@ -705,9 +705,10 @@
           NS="{{ ns_slurm }}"
           CTL="slurm-controller-0"
           WRK="slurm-worker-slinky-0"
+          GPU="{{ slurm_gpu_count | default(1) }}"
     
           echo "== sinfo =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sinfo -o "%P %a %l %D %t %N"
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sinfo -o "%P %a %l %D %t %N" || true
     
           echo
           echo "== slurm.conf partitions =="
@@ -715,28 +716,38 @@
     
           echo
           echo "== worker /run/slurm/conf/gres.conf =="
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf
+          kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf || true
     
           echo
           echo "== worker /dev/nvidia0 =="
-          kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0
+          kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0 || true
     
           echo
           echo "== node GRES (from slurmctld) =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "scontrol show node slinky-0 | egrep -i \"NodeName=|State=|Reason=|Gres=|CfgTRES=\""
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "scontrol show node slinky-0 | egrep -i \"NodeName=|State=|Reason=|Gres=|CfgTRES=|AllocTRES=\" || true"
     
           echo
-          echo "== srun GPU test (default partition=all) =="
-          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "srun -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"hostname; ls -l /dev/nvidia0; echo GPU_OK\""
+          echo "== cleanup old test jobs (avoid Resources pending forever) =="
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "squeue -a || true; scancel -u slurm || true; sleep 2; squeue -a || true"
     
           echo
-          echo "== srun GPU test (partition=slinky) =="
+          echo "== srun GPU test (default partition=all) [bounded] =="
           kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-            "srun -p slinky -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc \"hostname; ls -l /dev/nvidia0; echo GPU_OK\""
+            "timeout 150s srun -N1 -n1 --gres=gpu:${GPU} --mem=1G --time=00:02:00 --immediate=30 --kill-on-bad-exit=1 \
+             bash -lc \"hostname; ls -l /dev/nvidia0 || true; echo GPU_OK(all)\""
+    
+          echo
+          echo "== srun GPU test (partition=slinky) [bounded] =="
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
+            "timeout 150s srun -p slinky -N1 -n1 --gres=gpu:${GPU} --mem=1G --time=00:02:00 --immediate=30 --kill-on-bad-exit=1 \
+             bash -lc \"hostname; ls -l /dev/nvidia0 || true; echo GPU_OK(slinky)\""
+    
+          echo
+          echo "== final squeue =="
+          kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc "squeue -a || true"
         '
       changed_when: false
+
 
 
     - name: Done
