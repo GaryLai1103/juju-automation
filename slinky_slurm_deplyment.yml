@@ -494,56 +494,77 @@
         '
       changed_when: true
 
-    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - robust
+    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - self-heal Signed-By + no bash -lc quoting
       shell: |
-        juju ssh --model {{ test_model }} {{ machine1 }} -- bash -lc '
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+        juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
-          sudo -n true
+        sudo -n true
 
-          # idempotency quick check
-          if dpkg -l | grep -q "^ii  nvidia-container-toolkit"; then
-            echo "[INFO] nvidia-container-toolkit already installed."
-          fi
+        echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+          echo "[WAIT] dpkg lock held..."; sleep 5
+        done
 
-          echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
-          while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-            echo "[WAIT] dpkg lock held..."; sleep 5
-          done
+        echo "[FIX] remove conflicting NVIDIA apt source lists (Signed-By conflict)..."
+        # 常見衝突來源：舊的 libnvidia-container*.list / nvidia-container-toolkit.list
+        sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list \
+                   /etc/apt/sources.list.d/libnvidia-container*.list || true
 
-          echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
-          curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        # 再保險：把 sources.list.d 裡面所有含 libnvidia-container 的檔案列出來
+        ls -1 /etc/apt/sources.list.d | grep -i nvidia || true
 
-          curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-            sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
-            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+        echo "[INFO] install prereqs (curl/gnupg/ca-certificates)..."
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y ca-certificates curl gnupg
 
-          echo "[INFO] apt update/install (ForceIPv4 + lock wait)..."
-          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+        echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
+        sudo install -d -m 0755 /usr/share/keyrings
+        curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL \
+          https://nvidia.github.io/libnvidia-container/gpgkey | \
+          sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
-          while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-            echo "[WAIT] dpkg lock held..."; sleep 5
-          done
+        ARCH="$(dpkg --print-architecture)"
+        LIST="/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+        echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/${ARCH}/ /" | \
+          sudo tee "${LIST}" >/dev/null
 
-          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
+        echo "[INFO] apt update/install (ForceIPv4)..."
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
 
-          echo "[INFO] configure containerd runtime..."
+        echo "[INFO] locate containerd config.toml..."
+        CFG="/etc/containerd/config.toml"
+        if [ -f /var/snap/containerd/common/etc/containerd/config.toml ]; then
+          CFG="/var/snap/containerd/common/etc/containerd/config.toml"
+        fi
+        echo "[INFO] containerd cfg=${CFG}"
+
+        echo "[INFO] configure containerd runtime..."
+        # nvidia-ctk 支援 --config 時才用（不同版本有差）
+        if nvidia-ctk runtime configure --help 2>/dev/null | grep -q -- "--config"; then
+          sudo nvidia-ctk runtime configure --runtime=containerd --config="${CFG}"
+        else
           sudo nvidia-ctk runtime configure --runtime=containerd
+        fi
 
-          echo "[INFO] restart containerd + kubelet..."
-          sudo systemctl restart containerd
-          sudo systemctl restart kubelet || true
+        echo "[INFO] restart containerd + kubelet (systemd or snap)..."
+        sudo systemctl restart containerd 2>/dev/null || true
+        sudo systemctl restart kubelet   2>/dev/null || true
+        sudo systemctl restart snap.containerd.daemon 2>/dev/null || true
+        sudo systemctl restart snap.kubelet.daemon    2>/dev/null || true
+        sudo snap restart containerd 2>/dev/null || true
+        sudo snap restart kubelet   2>/dev/null || true
 
-          echo "[INFO] quick verify:"
-          command -v nvidia-ctk || true
-          sudo ctr version || true
-          sudo grep -n "nvidia" /etc/containerd/config.toml | head -n 40 || true
+        echo "[INFO] quick verify:"
+        command -v nvidia-ctk || true
+        dpkg -l | egrep -n "nvidia-container-toolkit|libnvidia-container" || true
+        echo "== ${LIST} =="; sudo cat "${LIST}" || true
 
-          echo "✅ NVIDIA Container Toolkit ready"
-        '
+        echo "✅ NVIDIA Container Toolkit ready"
+        EOS
       changed_when: true
-
 
     - name: 4.6 Prefer IPv4 for image pulls on ALL nodes (Machine 0 + 1)
       shell: |
