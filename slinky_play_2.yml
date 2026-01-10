@@ -162,6 +162,21 @@
       when: nfs_server_setup | bool
       changed_when: true
 
+    - name: 3.9 Install nfs-common on k8s nodes (required for NFS mounts)
+      shell: |
+        juju ssh --model {{ test_model }} {{ item }} -- bash -lc '
+          set -euo pipefail
+          sudo -n true
+          export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-common
+          command -v mount.nfs || ls -l /sbin/mount.nfs* || true
+        '
+      loop:
+        - "{{ machine0 }}"
+        - "{{ machine1 }}"
+      changed_when: true
+
     # -----------------------------------------------------------
     # 4) Install NFS provisioner (no heredoc)
     # -----------------------------------------------------------
