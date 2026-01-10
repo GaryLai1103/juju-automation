@@ -494,7 +494,7 @@
         '
       changed_when: true
 
-    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - self-heal Signed-By + no bash -lc quoting
+    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - purge duplicate libnvidia-container repo then add signed-by
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -507,19 +507,36 @@
           echo "[WAIT] dpkg lock held..."; sleep 5
         done
 
-        echo "[FIX] remove conflicting NVIDIA apt source lists (Signed-By conflict)..."
-        # 常見衝突來源：舊的 libnvidia-container*.list / nvidia-container-toolkit.list
-        sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list \
-                   /etc/apt/sources.list.d/libnvidia-container*.list || true
+        echo "[FIX] purge ANY existing libnvidia-container stable/deb sources to avoid Signed-By conflict..."
+        # 1) /etc/apt/sources.list 內若有殘留，直接刪除該行
+        if sudo grep -q "nvidia.github.io/libnvidia-container/stable/deb" /etc/apt/sources.list 2>/dev/null; then
+          echo "[INFO] remove lines from /etc/apt/sources.list"
+          sudo sed -i '\|nvidia.github.io/libnvidia-container/stable/deb|d' /etc/apt/sources.list
+        fi
 
-        # 再保險：把 sources.list.d 裡面所有含 libnvidia-container 的檔案列出來
+        # 2) sources.list.d 內任何檔案只要含該 repo，全部移除（包含你現在的 nvidia.list）
+        if [ -d /etc/apt/sources.list.d ]; then
+          mapfile -t hitfiles < <(sudo grep -RIl "nvidia.github.io/libnvidia-container/stable/deb" /etc/apt/sources.list.d 2>/dev/null || true)
+          if [ "${#hitfiles[@]}" -gt 0 ]; then
+            echo "[INFO] removing files that contain libnvidia-container stable/deb:"
+            printf " - %s\n" "${hitfiles[@]}"
+            for f in "${hitfiles[@]}"; do
+              sudo rm -f "$f"
+            done
+          else
+            echo "[INFO] no existing libnvidia-container stable/deb files found in sources.list.d"
+          fi
+        fi
+
+        # 3) 再保險：把 sources.list.d 裡所有 nvidia* 列出來給 log
+        echo "[INFO] remaining NVIDIA-related source files:"
         ls -1 /etc/apt/sources.list.d | grep -i nvidia || true
 
-        echo "[INFO] install prereqs (curl/gnupg/ca-certificates)..."
+        echo "[INFO] install prereqs (ca-certificates/curl/gnupg)..."
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y ca-certificates curl gnupg
 
-        echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
+        echo "[INFO] add NVIDIA Container Toolkit key + repo (single source of truth)..."
         sudo install -d -m 0755 /usr/share/keyrings
         curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL \
           https://nvidia.github.io/libnvidia-container/gpgkey | \
@@ -530,7 +547,7 @@
         echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/${ARCH}/ /" | \
           sudo tee "${LIST}" >/dev/null
 
-        echo "[INFO] apt update/install (ForceIPv4)..."
+        echo "[INFO] apt update/install nvidia-container-toolkit..."
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
 
@@ -542,7 +559,6 @@
         echo "[INFO] containerd cfg=${CFG}"
 
         echo "[INFO] configure containerd runtime..."
-        # nvidia-ctk 支援 --config 時才用（不同版本有差）
         if nvidia-ctk runtime configure --help 2>/dev/null | grep -q -- "--config"; then
           sudo nvidia-ctk runtime configure --runtime=containerd --config="${CFG}"
         else
@@ -558,9 +574,8 @@
         sudo snap restart kubelet   2>/dev/null || true
 
         echo "[INFO] quick verify:"
-        command -v nvidia-ctk || true
-        dpkg -l | egrep -n "nvidia-container-toolkit|libnvidia-container" || true
         echo "== ${LIST} =="; sudo cat "${LIST}" || true
+        dpkg -l | egrep -n "nvidia-container-toolkit|libnvidia-container" || true
 
         echo "✅ NVIDIA Container Toolkit ready"
         EOS
