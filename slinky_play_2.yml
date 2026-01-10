@@ -435,23 +435,27 @@
       changed_when: false
 
     # -----------------------------------------------------------
-    # 8.2 Install/upgrade slurm chart (OCI) - Pin Controller/Telemetry/Worker
+    # [修正版] 8.2 使用原始 printf 風格生成 values.yaml (已修正縮排)
     # -----------------------------------------------------------
     - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller to ControlPlane
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
-    
+
           f="/tmp/slurm-values.yaml"
-          : > "$f"
-          w(){ printf -- "%s\n" "$1" >> "$f"; }
-    
+          : > $f
+          # 定義寫入函式，維持原本風格
+          function w { printf -- "%s\n" "$1" >> $f; }
+
           echo "[INFO] Generating values.yaml..."
-    
+          
           # --- Controller (slurmctld) ---
           w "controller:"
+          # [NEW] 指定 Controller 到 Control Plane (注意: YAML縮排要在字串內手動對齊)
           w "  nodeSelector:"
           w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          
+          # [NEW] 加上 Control Plane 的 Tolerations
           w "  tolerations:"
           w "  - key: node-role.kubernetes.io/control-plane"
           w "    operator: Exists"
@@ -459,7 +463,7 @@
           w "  - key: node-role.kubernetes.io/master"
           w "    operator: Exists"
           w "    effect: NoSchedule"
-    
+
           w "  persistence:"
           w "    enabled: true"
           w "    storageClassName: \"{{ nfs_storageclass }}\""
@@ -468,12 +472,12 @@
           w "    resources:"
           w "      requests:"
           w "        storage: 10Gi"
-    
           w "  extraConf: |"
           w "    GresTypes=gpu"
           w "  extraConfMap: {}"
-    
-          # --- Telemetry (REST API etc.) ---
+          
+          # --- Telemetry (REST API) ---
+          # [NEW] 確保 REST API 也跑在 Control Plane，不佔用 GPU Node
           w "telemetry:"
           w "  enabled: true"
           w "  nodeSelector:"
@@ -482,7 +486,7 @@
           w "  - key: node-role.kubernetes.io/control-plane"
           w "    operator: Exists"
           w "    effect: NoSchedule"
-    
+
           # --- NodeSets (Worker) ---
           w "nodesets:"
           w "  slinky:"
@@ -506,7 +510,7 @@
           w "        args:"
           w "        - --conf"
           w "        - Gres=gpu:{{ slurm_gpu_count }}"
-    
+
           # --- Partitions ---
           w "partitions:"
           w "  all:"
@@ -523,23 +527,24 @@
           w "      Default: \"NO\""
           w "      MaxTime: UNLIMITED"
           w "      State: UP"
-    
+
           # --- ConfigFiles ---
           w "configFiles:"
           w "  gres.conf: |"
           w "    Name=gpu File=/dev/nvidia0"
-    
-          echo "[INFO] values head:"
-          head -n 40 "$f"
-    
-          echo "[INFO] Helm upgrade..."
+
+          echo "[INFO] Generated values head (Check indentation):"
+          head -n 25 $f
+
+          echo "[INFO] Executing Helm Upgrade..."
+          # 加上 --force 確保 StatefulSet 欄位衝突時能強制重建
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
-            -f "$f" \
+            -f $f \
             --wait --timeout=300s
         '
-      changed_when: true    
+      changed_when: true
     
     # -----------------------------------------------------------
     # 8.23 Patch Worker NodeSet slurmd probes -> tcpSocket:6818
