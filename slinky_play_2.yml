@@ -426,8 +426,10 @@
         '
       changed_when: false
 
-    # [最終修正版] 8.2 使用標準 K8s PVC 結構 (resources.requests.storage)
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Standard PVC Spec
+    # -----------------------------------------------------------
+    # [修正版] 8.2 強制 Controller 在 slurmhn, Worker 在 gpu-node
+    # -----------------------------------------------------------
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller to ControlPlane
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
@@ -438,8 +440,22 @@
 
           echo "[INFO] Generating values.yaml..."
           
-          # --- Controller ---
+          # --- Controller (slurmctld) ---
           w "controller:"
+          
+          # [NEW] 強制綁定到 slurmhn
+          w "  nodeSelector:"
+          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          
+          # [NEW] 如果 slurmhn 有 Taint (例如 control-plane:NoSchedule)，需要加上容忍
+          w "  tolerations:"
+          w "  - key: node-role.kubernetes.io/control-plane"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+          w "  - key: node-role.kubernetes.io/master"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+
           w "  persistence:"
           w "    enabled: true"
           w "    storageClassName: \"{{ nfs_storageclass }}\""
@@ -452,7 +468,18 @@
           w "    GresTypes=gpu"
           w "  extraConfMap: {}"
           
-          # --- NodeSets ---
+          # --- Telemetry (包含 REST API 與 Prometheus exporter) ---
+          # [NEW] 確保 REST API 也跑在 slurmhn
+          w "telemetry:"
+          w "  enabled: true"
+          w "  nodeSelector:"
+          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "  tolerations:"
+          w "  - key: node-role.kubernetes.io/control-plane"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+
+          # --- NodeSets (Worker) ---
           w "nodesets:"
           w "  slinky:"
           w "    enabled: true"
@@ -499,7 +526,7 @@
           w "    Name=gpu File=/dev/nvidia0"
 
           echo "[INFO] Generated values head:"
-          head -n 10 $f
+          head -n 20 $f
 
           echo "[INFO] Executing Helm Upgrade..."
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
