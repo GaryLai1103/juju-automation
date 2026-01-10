@@ -434,22 +434,34 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/restapi to slurmhn, worker to gpu-node01
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/telemetry to slurmhn, worker to gpu-node01 (NO PATCH)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
     
           f="/tmp/slurm-values.yaml"
-          : > $f
-          function w { printf -- "%s\n" "$1" >> $f; }
+          : > "$f"
+          function w { printf -- "%s\n" "$1" >> "$f"; }
     
           echo "[INFO] Generating values.yaml..."
     
-          # -------------------------
+          # =========================================================
           # Controller (slurmctld)
-          # schema: controller.podSpec.nodeSelector / tolerations
-          # -------------------------
+          # ✅ 用你之前確定有效的 schema：controller.nodeSelector / controller.tolerations
+          # ✅ 同時保留 persistence / extraConf / extraConfMap
+          # ✅ 把 probes 明確寫在 controller.podSpec.containers (若 chart 有吃就會覆蓋；沒吃也不會壞)
+          # =========================================================
           w "controller:"
+          w "  nodeSelector:"
+          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "  tolerations:"
+          w "  - key: node-role.kubernetes.io/control-plane"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+          w "  - key: node-role.kubernetes.io/master"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+    
           w "  persistence:"
           w "    enabled: true"
           w "    storageClassName: \"{{ nfs_storageclass }}\""
@@ -458,93 +470,106 @@
           w "    resources:"
           w "      requests:"
           w "        storage: 10Gi"
-          w "  extraConfMap:"
-          w "    GresTypes: gpu"
+    
+          # Slurm.conf extra
+          w "  extraConf: |"
+          w "    GresTypes=gpu"
+          w "  extraConfMap: {}"
+    
+          # (可選) 如果 chart 有把 controller.podSpec 直接帶進 STS template，這裡可覆蓋 probes
+          # 你遇到的抖動就是 httpGet /readyz /livez，改成 tcpSocket 最穩
           w "  podSpec:"
-          w "    nodeSelector:"
-          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "    tolerations:"
-          w "      - key: node-role.kubernetes.io/control-plane"
-          w "        operator: Exists"
-          w "        effect: NoSchedule"
-          w "      - key: node-role.kubernetes.io/master"
-          w "        operator: Exists"
-          w "        effect: NoSchedule"
-          # (可選) 直接把 slurmctld probes 改 tcpSocket，避免 httpGet /livez 抖動
           w "    containers:"
-          w "      - name: slurmctld"
+          w "    - name: slurmctld"
+          w "      startupProbe:"
+          w "        tcpSocket:"
+          w "          port: 6817"
+          w "        failureThreshold: 120"
+          w "        periodSeconds: 5"
+          w "        timeoutSeconds: 1"
+          w "      readinessProbe:"
+          w "        tcpSocket:"
+          w "          port: 6817"
+          w "        failureThreshold: 12"
+          w "        periodSeconds: 5"
+          w "        timeoutSeconds: 1"
+          w "      livenessProbe:"
+          w "        tcpSocket:"
+          w "          port: 6817"
+          w "        failureThreshold: 6"
+          w "        periodSeconds: 10"
+          w "        timeoutSeconds: 1"
+    
+          # =========================================================
+          # Telemetry (REST API / slurmrestd)
+          # ✅ 你之前已證實 telemetry.enabled 會產生 slurm-restapi deploy
+          # ✅ 同樣用 telemetry.nodeSelector / telemetry.tolerations 綁到 control-plane
+          # =========================================================
+          w "telemetry:"
+          w "  enabled: true"
+          w "  nodeSelector:"
+          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "  tolerations:"
+          w "  - key: node-role.kubernetes.io/control-plane"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+          w "  - key: node-role.kubernetes.io/master"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+    
+          # =========================================================
+          # NodeSets (Worker)
+          # ✅ NodeSet 不是 containers[] schema，你之前錯在這裡
+          # ✅ 用 nodesets.<name>.podSpec.slurmd.* 才是你 values 對應的 CRD 生成方式
+          # ✅ 用 slurmd.args 灌入 Gres=gpu:1，避免 srun --gres=gpu:1 找不到資源
+          # ✅ probes 寫在 podSpec.slurmd.*（不是 containers）
+          # =========================================================
+          w "nodesets:"
+          w "  slinky:"
+          w "    enabled: true"
+          w "    partition:"
+          w "      enabled: false"
+          w "    podSpec:"
+          w "      nodeSelector:"
+          w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
+          w "        kubernetes.io/os: linux"
+          w "      tolerations:"
+          w "      - key: {{ gpu_taint_key }}"
+          w "        operator: Equal"
+          w "        value: \"{{ gpu_taint_value }}\""
+          w "        effect: NoSchedule"
+          w "      useResourceLimits: true"
+          w "      slurmd:"
+          w "        resources:"
+          w "          limits:"
+          w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
+          w "        args:"
+          w "        - --conf"
+          w "        - Gres=gpu:{{ slurm_gpu_count }}"
+    
+          # ✅ 把 probes 放到 slurmd (NodeSet 會吃這個)
           w "        startupProbe:"
-          w "          tcpSocket: { port: 6817 }"
+          w "          tcpSocket:"
+          w "            port: 6818"
           w "          failureThreshold: 120"
           w "          periodSeconds: 5"
           w "          timeoutSeconds: 1"
           w "        readinessProbe:"
-          w "          tcpSocket: { port: 6817 }"
+          w "          tcpSocket:"
+          w "            port: 6818"
           w "          failureThreshold: 12"
           w "          periodSeconds: 5"
           w "          timeoutSeconds: 1"
           w "        livenessProbe:"
-          w "          tcpSocket: { port: 6817 }"
+          w "          tcpSocket:"
+          w "            port: 6818"
           w "          failureThreshold: 6"
           w "          periodSeconds: 10"
           w "          timeoutSeconds: 1"
     
-          # -------------------------
-          # REST API (slurmrestd)
-          # schema: restapi.podSpec.nodeSelector / tolerations
-          # -------------------------
-          w "restapi:"
-          w "  enabled: true"
-          w "  podSpec:"
-          w "    nodeSelector:"
-          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "    tolerations:"
-          w "      - key: node-role.kubernetes.io/control-plane"
-          w "        operator: Exists"
-          w "        effect: NoSchedule"
-    
-          # -------------------------
-          # NodeSets (Worker)
-          # schema: nodesets.<name>.podSpec + extraConfMap(Gres)
-          # -------------------------
-          w "nodesets:"
-          w "  slinky:"
-          w "    enabled: true"
-          # ✅ 讓 Slurm 真的註冊到 Gres=gpu:1，否則 srun --gres=gpu:1 會找不到資源
-          w "    extraConfMap:"
-          w "      Gres:"
-          w "        - \"gpu:{{ slurm_gpu_count }}\""
-          w "    useResourceLimits: true"
-          w "    podSpec:"
-          w "      nodeSelector:"
-          w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
-          w "      tolerations:"
-          w "        - key: {{ gpu_taint_key }}"
-          w "          operator: Equal"
-          w "          value: \"{{ gpu_taint_value }}\""
-          w "          effect: NoSchedule"
-          # (可選) 把 slurmd probes 改 tcpSocket，避免 httpGet /readyz 抖動
-          w "      containers:"
-          w "        - name: slurmd"
-          w "          startupProbe:"
-          w "            tcpSocket: { port: 6818 }"
-          w "            failureThreshold: 120"
-          w "            periodSeconds: 5"
-          w "            timeoutSeconds: 1"
-          w "          readinessProbe:"
-          w "            tcpSocket: { port: 6818 }"
-          w "            failureThreshold: 12"
-          w "            periodSeconds: 5"
-          w "            timeoutSeconds: 1"
-          w "          livenessProbe:"
-          w "            tcpSocket: { port: 6818 }"
-          w "            failureThreshold: 6"
-          w "            periodSeconds: 10"
-          w "            timeoutSeconds: 1"
-    
-          # -------------------------
+          # =========================================================
           # Partitions
-          # -------------------------
+          # =========================================================
           w "partitions:"
           w "  all:"
           w "    enabled: true"
@@ -561,72 +586,24 @@
           w "      MaxTime: UNLIMITED"
           w "      State: UP"
     
-          # -------------------------
+          # =========================================================
           # ConfigFiles - gres.conf
-          # 建議用 AutoDetect=nvidia，未來多卡比較不會卡死在 /dev/nvidia0
-          # -------------------------
+          # ✅ 建議 AutoDetect=nvidia（多卡也穩，不綁死 /dev/nvidia0）
+          # =========================================================
           w "configFiles:"
           w "  gres.conf: |"
           w "    AutoDetect=nvidia"
     
           echo "[INFO] Generated values head:"
-          head -n 80 $f
+          head -n 140 "$f"
     
           echo "[INFO] Executing Helm Upgrade..."
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
-            -f $f \
+            -f "$f" \
             --wait --timeout=300s
         '
-      changed_when: true
-
-    - name: 8.23 (AWX) Force worker slurmd probes to tcpSocket:6818 via NodeSet.spec.podSpec (no python)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          NS="{{ ns_slurm }}"
-          WRK_POD="slurm-worker-slinky-0"
-    
-          NODESET="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath="{.metadata.ownerReferences[0].name}")"
-          KIND="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath="{.metadata.ownerReferences[0].kind}")"
-          echo "[8.23] owner kind=$KIND name=$NODESET"
-          test "$KIND" = "NodeSet"
-    
-          echo "[8.23] patch NodeSet.spec.podSpec.containers[name=slurmd] probes => tcpSocket:6818"
-          kubectl -n "$NS" patch nodeset "$NODESET" --type merge -p "
-    spec:
-      podSpec:
-        containers:
-        - name: slurmd
-          startupProbe:
-            tcpSocket: { port: 6818 }
-            failureThreshold: 120
-            periodSeconds: 5
-            timeoutSeconds: 1
-          readinessProbe:
-            tcpSocket: { port: 6818 }
-            failureThreshold: 12
-            periodSeconds: 5
-            timeoutSeconds: 1
-          livenessProbe:
-            tcpSocket: { port: 6818 }
-            failureThreshold: 6
-            periodSeconds: 10
-            timeoutSeconds: 1
-    "
-    
-          echo "[8.23] restart worker pod"
-          kubectl -n "$NS" delete pod "$WRK_POD" --ignore-not-found=true
-    
-          echo "[8.23] wait Ready"
-          kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK_POD" --timeout=300s
-    
-          echo "[8.23] verify probes"
-          kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath="{.spec.containers[?(@.name==\"slurmd\")].readinessProbe}{\"\n\"}"
-        '
-      args:
-        executable: /bin/bash
       changed_when: true
 
     # -----------------------------------------------------------
