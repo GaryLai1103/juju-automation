@@ -1,4 +1,162 @@
+---
+# ==========================================
+# SKU: Slinky-K8s-v1.6-Remote-Exec
+# 特點：
+#   1. 完全不動 maasjuju (不裝 Python 庫，不改 Kubeconfig)
+#   2. 透過 juju ssh 在 Master 節點內部執行 kubectl
+#   3. 確保 Local Path 裝在正確的新叢集上
+# ==========================================
+- name: Infrastructure Test - Deploy Modern Charmed Kubernetes
+  hosts: maasjuju
+  gather_facts: yes
+  vars:
+    test_model: "slinky-cluster"
+    k8s_channel: "1.31/stable"
+    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-modern.yaml"
 
+  tasks:
+    # 1. 環境清理
+    - name: 1.0 強制清理舊模型
+      command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
+      register: destroy_result
+      failed_when: 
+        - destroy_result.rc != 0 
+        - '"not found" not in destroy_result.stderr'
+      ignore_errors: yes
+
+    - name: 1.1 等待模型釋放
+      pause:
+        seconds: 15
+
+    - name: 1.2 建立全新 Juju Model
+      shell: juju add-model {{ test_model }}
+
+    # 2. 製作藍圖
+    - name: 2.0 清除舊的 Bundle 檔案
+      become: yes
+      file:
+        path: "{{ bundle_path }}"
+        state: absent
+        
+    - name: 2.1 產生本地 Bundle 檔案
+      copy:
+        dest: "{{ bundle_path }}"
+        mode: '0644'
+        content: |
+          description: Slinky Modern K8s Cluster
+          base: ubuntu@22.04
+          
+          machines:
+            "0":
+              constraints: tags=virtual
+            "1":
+              constraints: tags=slurm-node
+
+          applications:
+            easyrsa:
+              charm: easyrsa
+              channel: latest/stable
+              num_units: 1
+              to: ["0"]
+            
+            etcd:
+              charm: etcd
+              channel: latest/stable
+              num_units: 1
+              to: ["0"]
+
+            kubernetes-control-plane:
+              charm: kubernetes-control-plane
+              channel: {{ k8s_channel }}
+              num_units: 1
+              to: ["0"]
+              options:
+                allow-privileged: "true"
+
+            kubernetes-worker:
+              charm: kubernetes-worker
+              channel: {{ k8s_channel }}
+              num_units: 1
+              to: ["1"]
+              expose: true
+
+            calico:
+              charm: calico
+              channel: latest/stable
+              
+            containerd:
+              charm: containerd
+              channel: latest/stable
+
+          relations:
+            - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
+            - ["kubernetes-control-plane:certificates", "easyrsa:client"]
+            - ["etcd:certificates", "easyrsa:client"]
+            - ["kubernetes-control-plane:etcd", "etcd:db"]
+            - ["kubernetes-worker:certificates", "easyrsa:client"]
+            - ["calico:etcd", "etcd:db"]
+            - ["calico:cni", "kubernetes-control-plane:cni"]
+            - ["calico:cni", "kubernetes-worker:cni"]
+            - ["containerd:containerd", "kubernetes-worker:container-runtime"]
+            - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
+
+    # 3. 執行部署
+    - name: 3.1 部署 Bundle
+      shell: |
+        juju deploy {{ bundle_path }} --model {{ test_model }} --trust
+      register: deploy_out
+      until: deploy_out.rc == 0
+      retries: 3
+      delay: 10
+
+    # -----------------------------------------------------------
+    # 4. 監控 (無限等待版)
+    # -----------------------------------------------------------
+    - name: 4.1 等待 K8s 狀態變為 Active
+      shell: |
+        echo "⏳ 進入無限監測模式... (請手動監控 juju status)"
+        
+        while true; do
+          STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-worker"]["application-status"].current')
+          CP_STATUS=$(juju status --model {{ test_model }} --format json | jq -r '.applications["kubernetes-control-plane"]["application-status"].current')
+
+          if [ "$STATUS" == "active" ] && [ "$CP_STATUS" == "active" ]; then
+            echo "✅ Kubernetes Cluster is Ready!"
+            exit 0
+          fi
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      register: k8s_wait_result
+      changed_when: false 
+
+    # -----------------------------------------------------------
+    # 5. Local Path Provisioner (遠端執行 - 不動 maasjuju)
+    # -----------------------------------------------------------
+    # [修正重點]
+    # 1. 移除了所有 pip/apt 安裝步驟 (Task 4.2 已刪除)
+    # 2. 改用 juju ssh 到 Machine 0 內部執行 kubectl
+    # 3. 這樣 maasjuju 不需要任何 K8s 設定，也不會裝錯到舊叢集
+    
+    - name: 5.1 安裝 Local Path Provisioner (Remote Exec)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
+      register: install_sc
+      # 為了讓 Ansible 顯示 changed 狀態，我們簡單判斷輸出
+      changed_when: "'created' in install_sc.stdout or 'configured' in install_sc.stdout"
+
+    - name: 5.2 設定為預設 StorageClass (Remote Exec)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
+      register: patch_sc
+      changed_when: "'patched' in patch_sc.stdout"
+
+    - name: ✅ 部署完成
+      debug:
+        msg: "Charmed Kubernetes 已成功部署。StorageClass 已透過 Machine 0 內部指令完成配置，未更動 maasjuju 環境。"
 
 
 
