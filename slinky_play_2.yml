@@ -134,29 +134,47 @@
     # 3.0 Install NFS client utils on ALL nodes (IMPORTANT)
     # - Fix: mount: bad option ... need /sbin/mount.nfs
     # -----------------------------------------------------------
-    - name: 3.0 Setup NFS server export on machine0 (optional)
+    - name: 3.0 Setup NFS server export on machine0 (robust)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -e
-          sudo apt-get update -y
-          sudo apt-get install -y nfs-kernel-server
-          sudo mkdir -p {{ nfs_export_path }}
-          sudo chmod 777 {{ nfs_export_path }}
-
-          # ✅ ensure exports.d exists
-          sudo mkdir -p /etc/exports.d
-
-          EXPORT_LINE="{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)"
-          echo "$EXPORT_LINE" | sudo tee /etc/exports.d/k8s.exports >/dev/null
-
-          sudo exportfs -ra
-          sudo systemctl enable --now nfs-server
-
-          echo "[INFO] exportfs:"
-          sudo exportfs -v | sed -n "1,120p"
-        '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+    
+        sudo -n true
+    
+        echo "[INFO] wait dpkg lock..."
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+          echo "[WAIT] dpkg lock held..."; sleep 5
+        done
+    
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+    
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+          echo "[WAIT] dpkg lock held..."; sleep 5
+        done
+    
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-kernel-server
+    
+        sudo mkdir -p {{ nfs_export_path }}
+        sudo chmod 777 {{ nfs_export_path }}
+        sudo mkdir -p /etc/exports.d
+    
+        # ✅ 關鍵：/etc/exports 必須存在，否則 exportfs 會報 can't open /etc/exports
+        sudo touch /etc/exports
+        sudo chmod 644 /etc/exports
+    
+        EXPORT_LINE="{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)"
+        echo "$EXPORT_LINE" | sudo tee /etc/exports.d/k8s.exports >/dev/null
+    
+        sudo exportfs -ra
+        timeout 60 sudo systemctl enable --now nfs-server
+    
+        echo "[INFO] exportfs:"
+        sudo exportfs -v | sed -n "1,120p"
+        EOS
       when: nfs_server_setup | bool
       changed_when: true
+    
 
     - name: 3.1 Install nfs-common on k8s nodes (required for NFS mounts) - robust + wait dpkg lock
       shell: |
