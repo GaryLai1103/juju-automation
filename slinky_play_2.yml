@@ -523,17 +523,20 @@
         echo "[INFO] values head:"
         head -n 120 /tmp/slurm-values.yaml
     
-        echo "[INFO] Ensure yq exists..."
-        if ! command -v yq >/dev/null 2>&1; then
-          curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-          chmod +x /usr/local/bin/yq
-          yq --version
+        echo "[INFO] Ensure yq exists (install to /tmp/yq; no sudo needed)..."
+        YQ="/tmp/yq"
+        if [ ! -x "$YQ" ]; then
+          curl -fsSL -o "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x "$YQ"
         fi
+        "$YQ" --version
     
         echo "[INFO] Write helm post-renderer (force probes tcpSocket)..."
         cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
         set -euo pipefail
+    
+        YQ="/tmp/yq"
     
         tmpdir="$(mktemp -d)"
         trap 'rm -rf "$tmpdir"' EXIT
@@ -541,8 +544,7 @@
     
         cat > "$in"
     
-        # multi-doc safe
-        yq eval-all -i '
+        "$YQ" eval-all -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers[] | select(.name=="slurmctld")
           ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}
@@ -580,10 +582,10 @@
           --post-renderer /tmp/slurm-post-renderer.sh \
           --wait --timeout=300s
     
-        echo "[INFO] Verify:"
-        kubectl -n "$NS" get pods -o wide
+        echo "[INFO] Verify probes are tcpSocket now:"
         kubectl -n "$NS" get pod slurm-controller-0 -o jsonpath='{.spec.containers[?(@.name=="slurmctld")].startupProbe}{"\n"}'
-        kubectl -n "$NS" get nodeset slurm-worker-slinky -o yaml | egrep -n "slurmd:|startupProbe:|readinessProbe:|livenessProbe:|tcpSocket" | head -n 80
+        kubectl -n "$NS" get pod slurm-worker-slinky-0 -o jsonpath='{.spec.containers[?(@.name=="slurmd")].startupProbe}{"\n"}'
+        kubectl -n "$NS" get pods -o wide
         EOS
       changed_when: true
 
