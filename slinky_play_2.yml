@@ -427,27 +427,40 @@
         '
       changed_when: true
 
-    # [關鍵新增] 7.4 等待 Operator 的 Webhook 服務真正就緒 (避免 Helm 安裝失敗)
-    - name: 7.4 Wait for Slurm Operator Webhook Service
+    - name: 7.4 Wait for Slurm Operator Webhook endpoints (robust)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -e
-          echo "[INFO] Waiting for webhook service endpoints..."
-          # 迴圈檢查 Service 是否有 IP (代表 Pod Ready 且 Cert 完成)
-          for i in {1..30}; do
-            EP=$(kubectl -n {{ ns_slurm_operator }} get ep slurm-operator-webhook -o jsonpath="{.subsets[*].addresses[*].ip}")
-            if [ -n "$EP" ]; then
-              echo "✅ Webhook is ready with endpoints: $EP"
-              # 額外多等 5 秒讓 Service 穩定
-              sleep 5
-              exit 0
-            fi
-            echo "⏳ Waiting for webhook endpoints... ($i/30)"
-            sleep 5
-          done
-          echo "❌ Webhook timed out!"
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        NS="{{ ns_slurm_operator }}"
+    
+        echo "[INFO] wait webhook deployment ready..."
+        kubectl -n "$NS" rollout status deploy/slurm-operator-webhook --timeout=300s || true
+    
+        echo "[INFO] discover webhook service..."
+        SVC=$(kubectl -n "$NS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2 || true)
+        if [ -z "$SVC" ]; then
+          echo "[FAIL] no webhook service found"
+          kubectl -n "$NS" get svc -o wide || true
           exit 1
-        '
+        fi
+        echo "[INFO] webhook svc=$SVC"
+    
+        echo "[INFO] wait endpoints..."
+        for i in {1..120}; do
+          EP=$(kubectl -n "$NS" get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
+          if [ -n "$EP" ]; then
+            echo "✅ Webhook endpoints ready: $EP"
+            exit 0
+          fi
+          echo "⏳ waiting endpoints... ($i/120)"
+          sleep 5
+        done
+    
+        echo "❌ timeout"
+        kubectl -n "$NS" get pods,svc,ep -o wide || true
+        kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 60 || true
+        exit 1
+        EOS
       changed_when: false
 
     # -----------------------------------------------------------
