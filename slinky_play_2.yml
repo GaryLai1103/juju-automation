@@ -434,168 +434,148 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/restapi to slurmhn, worker to gpu-node01
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/restapi to slurmhn, worker to gpu-node01 (post-renderer, no kubectl patch)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
     
-          f="/tmp/slurm-values.yaml"
-          : > "$f"
-          function w { printf -- "%s\n" "$1" >> "$f"; }
+        NS="{{ ns_slurm }}"
+        CHART_VER="{{ slurm_chart_ver }}"
     
-          echo "[INFO] Generating values.yaml..."
+        cat > /tmp/slurm-values.yaml <<EOF
+        controller:
+          persistence:
+            enabled: true
+            storageClassName: "{{ nfs_storageclass }}"
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 10Gi
+          extraConf: |
+            GresTypes=gpu
+          podSpec:
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+                effect: NoSchedule
     
-          # -------------------------
-          # Controller (slurmctld)
-          # IMPORTANT:
-          #   probes 要放在 controller.slurmctld.*（operator 會吃這個）
-          #   pod placement 放在 controller.podSpec.*
-          # -------------------------
-          w "controller:"
-          w "  persistence:"
-          w "    enabled: true"
-          w "    storageClassName: \"{{ nfs_storageclass }}\""
-          w "    accessModes:"
-          w "      - ReadWriteOnce"
-          w "    resources:"
-          w "      requests:"
-          w "        storage: 10Gi"
+        restapi:
+          replicas: 1
+          podSpec:
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
     
-          w "  extraConf: |"
-          w "    GresTypes=gpu"
+        nodesets:
+          slinky:
+            enabled: true
+            useResourceLimits: true
+            podSpec:
+              nodeSelector:
+                kubernetes.io/hostname: {{ gpu_node_hostname }}
+                kubernetes.io/os: linux
+              tolerations:
+                - key: {{ gpu_taint_key }}
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+                  effect: NoSchedule
+            slurmd:
+              resources:
+                limits:
+                  nvidia.com/gpu: {{ slurm_gpu_count }}
+              args:
+                - --conf
+                - Gres=gpu:{{ slurm_gpu_count }}
     
-          # ✅ 讓 operator 生成的 slurmctld 用 tcpSocket probes (取代 httpGet /livez /readyz 抖動)
-          w "  slurmctld:"
-          w "    startupProbe:"
-          w "      tcpSocket:"
-          w "        port: 6817"
-          w "      failureThreshold: 120"
-          w "      periodSeconds: 5"
-          w "      timeoutSeconds: 1"
-          w "    readinessProbe:"
-          w "      tcpSocket:"
-          w "        port: 6817"
-          w "      failureThreshold: 12"
-          w "      periodSeconds: 5"
-          w "      timeoutSeconds: 1"
-          w "    livenessProbe:"
-          w "      tcpSocket:"
-          w "        port: 6817"
-          w "      failureThreshold: 6"
-          w "      periodSeconds: 10"
-          w "      timeoutSeconds: 1"
+        partitions:
+          all:
+            enabled: true
+            nodesets: [ALL]
+            configMap: { Default: "YES", MaxTime: UNLIMITED, State: UP }
+          slinky:
+            enabled: true
+            nodesets: [ALL]
+            configMap: { Default: "NO",  MaxTime: UNLIMITED, State: UP }
     
-          w "  podSpec:"
-          w "    nodeSelector:"
-          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "      kubernetes.io/os: linux"
-          w "    tolerations:"
-          w "      - key: node-role.kubernetes.io/control-plane"
-          w "        operator: Exists"
-          w "        effect: NoSchedule"
-          w "      - key: node-role.kubernetes.io/master"
-          w "        operator: Exists"
-          w "        effect: NoSchedule"
+        configFiles:
+          gres.conf: |
+            AutoDetect=nvidia
+        EOF
     
-          # -------------------------
-          # REST API (slurmrestd)
-          # placement 在 restapi.podSpec.*
-          # -------------------------
-          w ""
-          w "restapi:"
-          w "  replicas: 1"
-          w "  podSpec:"
-          w "    nodeSelector:"
-          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "      kubernetes.io/os: linux"
-          w "    tolerations:"
-          w "      - key: node-role.kubernetes.io/control-plane"
-          w "        operator: Exists"
-          w "        effect: NoSchedule"
+        echo "[INFO] values head:"
+        head -n 80 /tmp/slurm-values.yaml
     
-          # -------------------------
-          # NodeSets (Worker)
-          # probes / resources / args 要放 nodesets.<name>.slurmd.*
-          # -------------------------
-          w ""
-          w "nodesets:"
-          w "  slinky:"
-          w "    enabled: true"
-          w "    useResourceLimits: true"
-          w "    podSpec:"
-          w "      nodeSelector:"
-          w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
-          w "        kubernetes.io/os: linux"
-          w "      tolerations:"
-          w "        - key: {{ gpu_taint_key }}"
-          w "          operator: Equal"
-          w "          value: \"{{ gpu_taint_value }}\""
-          w "          effect: NoSchedule"
+        echo "[INFO] fetch yq to /tmp (no sudo)..."
+        if [ ! -x /tmp/yq ]; then
+          curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /tmp/yq
+        fi
+        /tmp/yq --version
     
-          w "    slurmd:"
-          w "      resources:"
-          w "        limits:"
-          w "          nvidia.com/gpu: {{ slurm_gpu_count }}"
-          w "      args:"
-          w "        - --conf"
-          w "        - Gres=gpu:{{ slurm_gpu_count }}"
-          w "      startupProbe:"
-          w "        tcpSocket:"
-          w "          port: 6818"
-          w "        failureThreshold: 120"
-          w "        periodSeconds: 5"
-          w "        timeoutSeconds: 1"
-          w "      readinessProbe:"
-          w "        tcpSocket:"
-          w "          port: 6818"
-          w "        failureThreshold: 12"
-          w "        periodSeconds: 5"
-          w "        timeoutSeconds: 1"
-          w "      livenessProbe:"
-          w "        tcpSocket:"
-          w "          port: 6818"
-          w "        failureThreshold: 6"
-          w "        periodSeconds: 10"
-          w "        timeoutSeconds: 1"
+        echo "[INFO] write post-renderer..."
+        cat > /tmp/slurm-post-renderer.sh <<'SH'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        YQ=/tmp/yq
+        tmpdir="$(mktemp -d)"
+        trap 'rm -rf "$tmpdir"' EXIT
+        in="$tmpdir/in.yaml"
+        cat > "$in"
     
-          # -------------------------
-          # Partitions
-          # -------------------------
-          w ""
-          w "partitions:"
-          w "  all:"
-          w "    enabled: true"
-          w "    nodesets: [ALL]"
-          w "    configMap:"
-          w "      Default: \"YES\""
-          w "      MaxTime: UNLIMITED"
-          w "      State: UP"
-          w "  slinky:"
-          w "    enabled: true"
-          w "    nodesets: [ALL]"
-          w "    configMap:"
-          w "      Default: \"NO\""
-          w "      MaxTime: UNLIMITED"
-          w "      State: UP"
+        $YQ eval-all -i '
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}
+          |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}
+          |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}
+          |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky")
+            .spec.slurmd
+          ).startupProbe = {"tcpSocket":{"port":6818},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}
+          |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky")
+            .spec.slurmd
+          ).readinessProbe = {"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}
+          |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky")
+            .spec.slurmd
+          ).livenessProbe = {"tcpSocket":{"port":6818},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}
+        ' "$in"
     
-          # -------------------------
-          # ConfigFiles - gres.conf
-          # -------------------------
-          w ""
-          w "configFiles:"
-          w "  gres.conf: |"
-          w "    AutoDetect=nvidia"
+        cat "$in"
+        SH
+        chmod +x /tmp/slurm-post-renderer.sh
     
-          echo "[INFO] Generated values head:"
-          head -n 120 "$f"
+        echo "[INFO] helm upgrade/install..."
+        helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
+          -n "$NS" --create-namespace \
+          --version "$CHART_VER" \
+          -f /tmp/slurm-values.yaml \
+          --post-renderer /tmp/slurm-post-renderer.sh \
+          --wait --timeout=300s
     
-          echo "[INFO] Executing Helm Upgrade..."
-          helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-            -n {{ ns_slurm }} --create-namespace \
-            --version {{ slurm_chart_ver }} \
-            -f "$f" \
-            --wait --timeout=300s
-        '
+        echo "[INFO] verify probes + placement:"
+        kubectl -n "$NS" describe pod slurm-controller-0 | egrep -n "Liveness:|Readiness:|Startup:|http-get|tcp-socket" || true
+        kubectl -n "$NS" get pod -o wide
+        EOS
+      args:
+        executable: /bin/bash
       changed_when: true
 
     # -----------------------------------------------------------
