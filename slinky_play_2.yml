@@ -434,22 +434,22 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/restapi to slurmhn, worker to gpu-node01 (NO kubectl patch)
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/restapi to slurmhn, worker to gpu-node01 (NO kubectl patch; use helm post-renderer)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
+    
+          NS="{{ ns_slurm }}"
+          CHART_VER="{{ slurm_chart_ver }}"
     
           f="/tmp/slurm-values.yaml"
           : > "$f"
           w(){ printf -- "%s\n" "$1" >> "$f"; }
     
-          echo "[INFO] Generating values.yaml (pin only, no probe override)..."
+          echo "[INFO] Generating values.yaml..."
     
           # -------------------------
           # Controller (slurmctld)
-          # 1) 保守同時寫兩種 schema：
-          #    - controller.nodeSelector / tolerations
-          #    - controller.podSpec.nodeSelector / tolerations
           # -------------------------
           w "controller:"
           w "  persistence:"
@@ -460,67 +460,34 @@
           w "    resources:"
           w "      requests:"
           w "        storage: 10Gi"
-    
-          # Slurm 全域 extraConf (安全)
+          # 用 extraConf 最保險（extraConfMap 也行，但這個最直觀）
           w "  extraConf: |"
           w "    GresTypes=gpu"
-          w "  extraConfMap: {}"
-    
-          # schema-A: controller.nodeSelector/tolerations
-          w "  nodeSelector:"
-          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "  tolerations:"
-          w "  - key: node-role.kubernetes.io/control-plane"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-          w "  - key: node-role.kubernetes.io/master"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-    
-          # schema-B: controller.podSpec.nodeSelector/tolerations
           w "  podSpec:"
           w "    nodeSelector:"
           w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "      kubernetes.io/os: linux"
           w "    tolerations:"
-          w "    - key: node-role.kubernetes.io/control-plane"
-          w "      operator: Exists"
-          w "      effect: NoSchedule"
-          w "    - key: node-role.kubernetes.io/master"
-          w "      operator: Exists"
-          w "      effect: NoSchedule"
+          w "      - key: node-role.kubernetes.io/control-plane"
+          w "        operator: Exists"
+          w "        effect: NoSchedule"
+          w "      - key: node-role.kubernetes.io/master"
+          w "        operator: Exists"
+          w "        effect: NoSchedule"
     
           # -------------------------
-          # REST API / Telemetry
-          # 你先前查到 restapi deploy 是 slurm-restapi，
-          # 很多版本是掛在 telemetry.enabled 下面。
-          # 這裡同時寫 telemetry 與 restapi 兩種 schema，提高命中率。
+          # REST API (slurmrestd)
           # -------------------------
-          w "telemetry:"
-          w "  enabled: true"
-          w "  nodeSelector:"
-          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "  tolerations:"
-          w "  - key: node-role.kubernetes.io/control-plane"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-          w "  podSpec:"
-          w "    nodeSelector:"
-          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "    tolerations:"
-          w "    - key: node-role.kubernetes.io/control-plane"
-          w "      operator: Exists"
-          w "      effect: NoSchedule"
-    
-          # fallback schema（若 chart 用 restapi:）
           w "restapi:"
-          w "  enabled: true"
+          w "  replicas: 1"
           w "  podSpec:"
           w "    nodeSelector:"
           w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "      kubernetes.io/os: linux"
           w "    tolerations:"
-          w "    - key: node-role.kubernetes.io/control-plane"
-          w "      operator: Exists"
-          w "      effect: NoSchedule"
+          w "      - key: node-role.kubernetes.io/control-plane"
+          w "        operator: Exists"
+          w "        effect: NoSchedule"
     
           # -------------------------
           # NodeSets (Worker)
@@ -528,21 +495,24 @@
           w "nodesets:"
           w "  slinky:"
           w "    enabled: true"
-    
-          # ✅ 讓 slurmd 註冊 GRES（配合 gres.conf AutoDetect）
-          w "    extraConfMap:"
-          w "      Gres:"
-          w "        - \"gpu:{{ slurm_gpu_count }}\""
-    
           w "    useResourceLimits: true"
           w "    podSpec:"
           w "      nodeSelector:"
           w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
+          w "        kubernetes.io/os: linux"
           w "      tolerations:"
-          w "      - key: {{ gpu_taint_key }}"
-          w "        operator: Equal"
-          w "        value: \"{{ gpu_taint_value }}\""
-          w "        effect: NoSchedule"
+          w "        - key: {{ gpu_taint_key }}"
+          w "          operator: Equal"
+          w "          value: \"{{ gpu_taint_value }}\""
+          w "          effect: NoSchedule"
+          # 這一段是你原本跑得通的 worker GPU 掛載/宣告方式（保留）
+          w "    slurmd:"
+          w "      resources:"
+          w "        limits:"
+          w "          nvidia.com/gpu: {{ slurm_gpu_count }}"
+          w "      args:"
+          w "        - --conf"
+          w "        - Gres=gpu:{{ slurm_gpu_count }}"
     
           # -------------------------
           # Partitions
@@ -570,15 +540,80 @@
           w "  gres.conf: |"
           w "    AutoDetect=nvidia"
     
-          echo "[INFO] Generated values.yaml (head):"
-          sed -n "1,200p" "$f"
+          echo "[INFO] values.yaml (head):"
+          head -n 120 "$f"
     
-          echo "[INFO] Helm upgrade..."
+          echo
+          echo "[INFO] Preparing helm post-renderer to force probes tcpSocket..."
+    
+          # 1) install yq v4 if missing (needed by post-renderer)
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "[INFO] Installing yq (mikefarah/yq v4)..."
+            YQ=/usr/local/bin/yq
+            curl -fsSL -o "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            chmod +x "$YQ"
+            yq --version
+          fi
+    
+          # 2) post-renderer script: rewrite probes in rendered manifests (NO kubectl patch)
+          cat > /tmp/slurm-post-renderer.sh <<'"'"'SH'"'"'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp -d)"
+    trap "rm -rf $tmp" EXIT
+    
+    cat > "$tmp/in.yaml"
+    
+    # controller: StatefulSet/slurm-controller container=slurmctld -> tcpSocket:6817
+    yq -i '"'"'
+      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+        .spec.template.spec.containers[] | select(.name=="slurmctld")
+      ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}
+      |
+      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+        .spec.template.spec.containers[] | select(.name=="slurmctld")
+      ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}
+      |
+      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+        .spec.template.spec.containers[] | select(.name=="slurmctld")
+      ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}
+    '"'"' "$tmp/in.yaml"
+    
+    # worker: NodeSet/slurm-worker-slinky spec.slurmd -> tcpSocket:6818
+    yq -i '"'"'
+      (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky")
+        .spec.slurmd
+      ).startupProbe = {"tcpSocket":{"port":6818},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}
+      |
+      (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky")
+        .spec.slurmd
+      ).readinessProbe = {"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}
+      |
+      (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky")
+        .spec.slurmd
+      ).livenessProbe = {"tcpSocket":{"port":6818},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}
+    '"'"' "$tmp/in.yaml"
+    
+    cat "$tmp/in.yaml"
+    SH
+          chmod +x /tmp/slurm-post-renderer.sh
+    
+          echo
+          echo "[INFO] Executing Helm Upgrade with post-renderer..."
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-            -n {{ ns_slurm }} --create-namespace \
-            --version {{ slurm_chart_ver }} \
+            -n "$NS" --create-namespace \
+            --version "$CHART_VER" \
             -f "$f" \
-            --wait --timeout=600s
+            --post-renderer /tmp/slurm-post-renderer.sh \
+            --wait --timeout=300s
+    
+          echo
+          echo "[INFO] Quick verify probes (should be tcpSocket now):"
+          kubectl -n "$NS" get pod slurm-controller-0 -o jsonpath="{.spec.containers[?(@.name==\"slurmctld\")].startupProbe}{\"\n\"}"
+          kubectl -n "$NS" get nodeset slurm-worker-slinky -o yaml | egrep -n "slurmd:|startupProbe:|readinessProbe:|livenessProbe:|tcpSocket" -n | head -n 80
+    
+          echo
+          kubectl -n "$NS" get pods -o wide
         '
       changed_when: true
 
