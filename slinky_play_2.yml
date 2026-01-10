@@ -704,7 +704,7 @@
     # - bounded: --time + --immediate
     # - cleanup: scancel old gpu-smoke-* jobs
     # -----------------------------------------------------------
-    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust (wrap) + cleanup
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust (no --wrap) + cleanup
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -728,25 +728,27 @@
         echo "== cleanup old test jobs (by name gpu-smoke-*) =="
         kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc '
           squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
-          scancel -u slurm -n gpu-smoke-all    >/dev/null 2>&1 || true
-          scancel -u slurm -n gpu-smoke-slinky >/dev/null 2>&1 || true
+          scancel -u slurm -n gpu-smoke-all     >/dev/null 2>&1 || true
+          scancel -u slurm -n gpu-smoke-slinky  >/dev/null 2>&1 || true
           squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
         '
     
         echo
         echo "== srun GPU test (default partition=all) [bounded] =="
         kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
-          srun -N1 -n1 --job-name=gpu-smoke-all \
-            --gres=gpu:${GPU_CNT} --time=00:02:00 --immediate=30 \
-            --wrap='hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_all'
+          timeout 90s srun -N1 -n1 --job-name=gpu-smoke-all \
+            --mpi=none \
+            --gres=gpu:${GPU_CNT} --time=00:01:00 --immediate=30 \
+            bash -lc 'hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_all'
         "
     
         echo
         echo "== srun GPU test (partition=slinky) [bounded] =="
         kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
-          srun -p slinky -N1 -n1 --job-name=gpu-smoke-slinky \
-            --gres=gpu:${GPU_CNT} --time=00:02:00 --immediate=30 \
-            --wrap='hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_slinky'
+          timeout 90s srun -p slinky -N1 -n1 --job-name=gpu-smoke-slinky \
+            --mpi=none \
+            --gres=gpu:${GPU_CNT} --time=00:01:00 --immediate=30 \
+            bash -lc 'hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_slinky'
         "
     
         echo
