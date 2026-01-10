@@ -608,6 +608,23 @@
         EOS
       args:
         executable: /bin/bash
+
+          echo "[INFO] Wait slurm-operator webhook ready (avoid TLS not yet valid)..."
+          for i in 1 2 3 4 5 6; do
+            if kubectl -n slinky get deploy slurm-operator-webhook >/dev/null 2>&1; then
+              kubectl -n slinky rollout status deploy/slurm-operator-webhook --timeout=60s && break || true
+            fi
+            sleep 5
+          done
+          sleep 5
+    
+          echo "[INFO] Helm upgrade/install..."
+          helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
+            -n {{ ns_slurm }} --create-namespace \
+            --version {{ slurm_chart_ver }} \
+            -f /tmp/slurm-values.yaml \
+            --wait --timeout=600s
+        '
       changed_when: true
 
     # -----------------------------------------------------------
