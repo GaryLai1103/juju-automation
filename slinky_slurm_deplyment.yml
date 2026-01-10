@@ -201,6 +201,25 @@
           - "ca={{ j.applications['calico']['application-status'].current | default('unknown') }}"
           - "cd={{ j.applications['containerd']['application-status'].current | default('unknown') }}"
 
+    - name: GATE 1.95 - Wait apiserver /readyz (remote exec on machine0)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -euo pipefail
+          echo "[WAIT] apiserver /readyz ..."
+          for i in {1..120}; do
+            if kubectl get --raw="/readyz" >/dev/null 2>&1; then
+              echo "✅ apiserver ready"
+              exit 0
+            fi
+            echo "⏳ apiserver not ready yet ($i/120)"; sleep 5
+          done
+          echo "❌ apiserver not ready (timeout)"
+          kubectl get nodes -o wide || true
+          kubectl -n kube-system get pods -o wide || true
+          exit 1
+        '
+      changed_when: false
+
     - name: GATE 2 - Wait K8s nodes Ready + kube-system core pods Ready (remote exec on machine0)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
@@ -475,93 +494,83 @@
         '
       changed_when: true
 
-    # -----------------------------------------------------------
-    # [新增] 4.5 安裝 NVIDIA Container Toolkit (Host Level)
-    # 這是為了讓 Containerd 知道如何把 GPU 掛進容器
-    # 注意：目標是 machine1 (GPU Node)，不是 machine0
-    # -----------------------------------------------------------
-    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine1 }} -- bash -lc '
-          set -e
-          
-          # 1. 檢查是否已安裝，避免重複執行 (冪等性檢查)
-          if dpkg -l | grep -q nvidia-container-toolkit; then
-            echo "[INFO] Toolkit already installed."
-            # 檢查 config 是否已經修改過
-            if grep -q "nvidia-container-runtime" /etc/containerd/config.toml; then
-               echo "[INFO] Containerd already configured."
-               exit 0
-            fi
-          fi
-
-          echo "[INFO] Installing NVIDIA Container Toolkit..."
-          curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-          
-          curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-            sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
-            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-          sudo apt-get update
-          sudo apt-get install -y nvidia-container-toolkit
-
-          echo "[INFO] Configuring containerd to use NVIDIA runtime..."
-          # 這行指令會自動修改 /etc/containerd/config.toml
-          sudo nvidia-ctk runtime configure --runtime=containerd
-          
-          echo "[INFO] Restarting containerd..."
-          sudo systemctl restart containerd
-          
-          echo "[INFO] Done. GPU Node is ready for passthrough."
-        '
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # [新增] 4.6 Prefer IPv4 on GPU Node (reduce IPv6 flaky pulls to GHCR)
-    # - 針對 containerd image pull 走 IPv6 但路徑不穩 (connection reset by peer)
-    # - 做法：調整 glibc gai.conf 讓 IPv4-mapped 優先；並 restart containerd
-    # -----------------------------------------------------------
-    - name: 4.6 Prefer IPv4 for image pulls on GPU Node (Machine 1)
+    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - robust
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -lc '
           set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
-          # 1) sysctl 檔案（這段不是關 IPv6，只是保留原本 IPv6 enable）
-          sudo tee /etc/sysctl.d/99-prefer-ipv4.conf >/dev/null <<EOF
-          net.ipv6.conf.all.disable_ipv6=0
-          net.ipv6.conf.default.disable_ipv6=0
-          net.ipv6.conf.all.use_tempaddr=0
-          net.ipv6.conf.default.use_tempaddr=0
-          EOF
+          sudo -n true
 
-          # 2) 關鍵：glibc resolver 偏好 IPv4（/etc/gai.conf）
-          #    若檔案不存在也沒關係；存在就把 precedence 那行打開/設值
-          if [ -f /etc/gai.conf ]; then
-            if grep -qE "^[# ]*precedence ::ffff:0:0/96[[:space:]]+100" /etc/gai.conf; then
-              sudo sed -i "s/^[# ]*precedence ::ffff:0:0\/96[[:space:]]\+100/precedence ::ffff:0:0\/96  100/" /etc/gai.conf
-            else
-              # 沒有該行就補上（避免你這台的 gai.conf 是精簡版）
-              echo "precedence ::ffff:0:0/96  100" | sudo tee -a /etc/gai.conf >/dev/null
-            fi
-          else
-            # 極少數系統沒有 gai.conf，直接建立並寫入
-            echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
+          # idempotency quick check
+          if dpkg -l | grep -q "^ii  nvidia-container-toolkit"; then
+            echo "[INFO] nvidia-container-toolkit already installed."
           fi
 
-          # 3) 套用 + restart containerd
-          sudo sysctl --system >/dev/null
+          echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
+          while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            echo "[WAIT] dpkg lock held..."; sleep 5
+          done
 
-          # 印出目前設定，方便你在 log 看到
-          echo "== /etc/gai.conf (effective lines) =="
-          grep -nE "precedence ::ffff:0:0/96" /etc/gai.conf || true
+          echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
+          curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
-          echo "== Restart containerd =="
+          curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+            sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
+            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+
+          echo "[INFO] apt update/install (ForceIPv4 + lock wait)..."
+          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+
+          while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            echo "[WAIT] dpkg lock held..."; sleep 5
+          done
+
+          timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
+
+          echo "[INFO] configure containerd runtime..."
+          sudo nvidia-ctk runtime configure --runtime=containerd
+
+          echo "[INFO] restart containerd + kubelet..."
           sudo systemctl restart containerd
+          sudo systemctl restart kubelet || true
 
-          echo "✅ Prefer IPv4 applied"
+          echo "[INFO] quick verify:"
+          command -v nvidia-ctk || true
+          sudo ctr version || true
+          sudo grep -n "nvidia" /etc/containerd/config.toml | head -n 40 || true
+
+          echo "✅ NVIDIA Container Toolkit ready"
         '
       changed_when: true
 
+
+    - name: 4.6 Prefer IPv4 for image pulls on ALL nodes (Machine 0 + 1)
+      shell: |
+        juju ssh --model {{ test_model }} {{ item }} -- bash -lc '
+          set -euo pipefail
+
+          # 1) glibc resolver prefer IPv4-mapped
+          if [ ! -f /etc/gai.conf ]; then
+            echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
+          else
+            grep -q "precedence ::ffff:0:0/96" /etc/gai.conf || echo "precedence ::ffff:0:0/96  100" | sudo tee -a /etc/gai.conf >/dev/null
+            sudo sed -i "s/^[# ]*precedence ::ffff:0:0\/96.*/precedence ::ffff:0:0\/96  100/" /etc/gai.conf
+          fi
+
+          echo "== /etc/gai.conf (effective) =="
+          grep -nE "precedence ::ffff:0:0/96" /etc/gai.conf || true
+
+          # 2) restart container runtime / kubelet (best-effort)
+          sudo systemctl restart containerd || true
+          sudo systemctl restart kubelet   || true
+
+          echo "✅ Prefer IPv4 applied on node={{ item }}"
+        '
+      loop:
+        - "{{ machine0 }}"
+        - "{{ machine1 }}"
+      changed_when: true
 
     # -----------------------------------------------------------
     # 5) NVIDIA device plugin (A方案：清空 affinity，避免 NFD 依賴)
