@@ -137,26 +137,21 @@
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
-
-          # Fail fast if sudo not ready (avoid hanging forever)
           sudo -n true
 
-          # Avoid apt/needrestart interactive prompts
           export DEBIAN_FRONTEND=noninteractive
           export NEEDRESTART_MODE=a
 
-          # Avoid infinite hang
           timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
           timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-kernel-server
 
           sudo mkdir -p {{ nfs_export_path }}
           sudo chmod 777 {{ nfs_export_path }}
 
-          # Export rule: safer than "*"
+          sudo mkdir -p /etc/exports.d
+
           EXPORT_LINE="{{ nfs_export_path }} 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)"
-          sudo tee /etc/exports.d/k8s.exports >/dev/null <<EOF
-          ${EXPORT_LINE}
-          EOF
+          echo "$EXPORT_LINE" | sudo tee /etc/exports.d/k8s.exports >/dev/null
 
           sudo exportfs -ra
           sudo systemctl enable --now nfs-kernel-server
