@@ -442,6 +442,7 @@
         NS="{{ ns_slurm }}"
         CHART_VER="{{ slurm_chart_ver }}"
     
+        echo "[INFO] write values.yaml..."
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
@@ -505,17 +506,14 @@
           slinky:
             enabled: true
             nodesets: [ALL]
-            configMap: { Default: "NO",  MaxTime: UNLIMITED, State: UP }
+            configMap: { Default: "NO", MaxTime: UNLIMITED, State: UP }
     
         configFiles:
           gres.conf: |
             AutoDetect=nvidia
         EOF
     
-        echo "[INFO] values head:"
-        head -n 80 /tmp/slurm-values.yaml
-    
-        echo "[INFO] fetch yq to /tmp (no sudo)..."
+        echo "[INFO] ensure yq at /tmp (no sudo)..."
         if [ ! -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
@@ -562,21 +560,24 @@
         SH
         chmod +x /tmp/slurm-post-renderer.sh
     
-        echo "[INFO] helm upgrade/install..."
+        echo "[INFO] helm upgrade/install (atomic + reset-values)..."
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
           -n "$NS" --create-namespace \
           --version "$CHART_VER" \
+          --reset-values \
           -f /tmp/slurm-values.yaml \
           --post-renderer /tmp/slurm-post-renderer.sh \
-          --wait --timeout=300s
+          --atomic \
+          --wait --timeout=600s
     
-        echo "[INFO] verify probes + placement:"
-        kubectl -n "$NS" describe pod slurm-controller-0 | egrep -n "Liveness:|Readiness:|Startup:|http-get|tcp-socket" || true
-        kubectl -n "$NS" get pod -o wide
+        echo "[INFO] verify controller probes are tcpSocket now:"
+        kubectl -n "$NS" describe pod slurm-controller-0 | egrep -n "http-get|tcp-socket|Startup|Readiness|Liveness" || true
+        kubectl -n "$NS" get pods -o wide
         EOS
       args:
         executable: /bin/bash
       changed_when: true
+    
 
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device + srun smoke test
