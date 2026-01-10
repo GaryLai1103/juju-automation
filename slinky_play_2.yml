@@ -581,70 +581,40 @@
         '
       changed_when: true
 
-    
-    - name: 8.23 (AWX) Ensure worker probes are tcpSocket:6818 via NodeSet.spec.podSpec.containers (fallback patch)
+    - name: 8.23 (AWX) Force worker slurmd probes to tcpSocket:6818 via NodeSet.spec.podSpec (no python)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
-        set -euo pipefail
-        NS="{{ ns_slurm }}"
-        WRK_POD="slurm-worker-slinky-0"
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -euo pipefail
+          NS="{{ ns_slurm }}"
+          WRK_POD="slurm-worker-slinky-0"
     
-        NODESET="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.metadata.ownerReferences[0].name}')"
-        KIND="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.metadata.ownerReferences[0].kind}')"
-        echo "[8.23] owner kind=$KIND name=$NODESET"
-        test "$KIND" = "NodeSet"
+          NODESET="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath="{.metadata.ownerReferences[0].name}")"
+          KIND="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath="{.metadata.ownerReferences[0].kind}")"
+          echo "[8.23] owner kind=$KIND name=$NODESET"
+          test "$KIND" = "NodeSet"
     
-        # 先看目前 worker pod probes 是不是 httpGet
-        CUR="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}' || true)"
-        echo "[8.23] current slurmd readinessProbe: $CUR"
-    
-        if echo "$CUR" | grep -q "httpGet"; then
-          echo "[8.23] Detected httpGet probe -> patch NodeSet.spec.podSpec.containers[name=slurmd] to tcpSocket"
-    
-          python3 - <<'PY' > /tmp/nodeset_probe_patch.json
-    import json, subprocess
-    
-    ns = "{{ ns_slurm }}"
-    nodeset = subprocess.check_output(["kubectl","-n",ns,"get","pod","slurm-worker-slinky-0","-o","jsonpath={.metadata.ownerReferences[0].name}"]).decode().strip()
-    obj = json.loads(subprocess.check_output(["kubectl","-n",ns,"get","nodeset",nodeset,"-o","json"]))
-    
-    podspec = obj.get("spec", {}).get("podSpec", {})
-    containers = podspec.get("containers", [])
-    
-    def mk_probe(port, ft, ps, ts):
-        return {"tcpSocket":{"port":port},"failureThreshold":ft,"periodSeconds":ps,"timeoutSeconds":ts}
-    
-    slurmd_patch_container = {
-      "name":"slurmd",
-      "startupProbe": mk_probe(6818, 120, 5, 1),
-      "readinessProbe": mk_probe(6818, 12, 5, 1),
-      "livenessProbe": mk_probe(6818, 6, 10, 1),
-    }
-    
-    # 找是否已有 name=slurmd 的 container override
-    idx = next((i for i,c in enumerate(containers) if isinstance(c,dict) and c.get("name")=="slurmd"), None)
-    
-    patch = []
-    # 確保 /spec/podSpec 存在
-    if "podSpec" not in obj.get("spec", {}):
-        patch.append({"op":"add","path":"/spec/podSpec","value":{}})
-    
-    # 確保 /spec/podSpec/containers 存在
-    if "containers" not in podspec:
-        patch.append({"op":"add","path":"/spec/podSpec/containers","value":[slurmd_patch_container]})
-    else:
-        if idx is None:
-            patch.append({"op":"add","path":"/spec/podSpec/containers/-","value":slurmd_patch_container})
-        else:
-            patch.append({"op":"replace","path":f"/spec/podSpec/containers/{idx}","value":slurmd_patch_container})
-    
-    print(json.dumps(patch))
-    PY
-    
-          echo "[8.23] patch json:"
-          cat /tmp/nodeset_probe_patch.json; echo
-    
-          kubectl -n "$NS" patch nodeset "$NODESET" --type=json -p "$(cat /tmp/nodeset_probe_patch.json)"
+          echo "[8.23] patch NodeSet.spec.podSpec.containers[name=slurmd] probes => tcpSocket:6818"
+          kubectl -n "$NS" patch nodeset "$NODESET" --type merge -p "
+    spec:
+      podSpec:
+        containers:
+        - name: slurmd
+          startupProbe:
+            tcpSocket: { port: 6818 }
+            failureThreshold: 120
+            periodSeconds: 5
+            timeoutSeconds: 1
+          readinessProbe:
+            tcpSocket: { port: 6818 }
+            failureThreshold: 12
+            periodSeconds: 5
+            timeoutSeconds: 1
+          livenessProbe:
+            tcpSocket: { port: 6818 }
+            failureThreshold: 6
+            periodSeconds: 10
+            timeoutSeconds: 1
+    "
     
           echo "[8.23] restart worker pod"
           kubectl -n "$NS" delete pod "$WRK_POD" --ignore-not-found=true
@@ -652,19 +622,13 @@
           echo "[8.23] wait Ready"
           kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK_POD" --timeout=300s
     
-        else
-          echo "[8.23] Probe already non-httpGet (OK) -> skip patch"
-        fi
-    
-        echo "[8.23] verify readinessProbe:"
-        kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}{"\n"}'
-        EOS
+          echo "[8.23] verify probes"
+          kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath="{.spec.containers[?(@.name==\"slurmd\")].readinessProbe}{\"\n\"}"
+        '
       args:
         executable: /bin/bash
       changed_when: true
 
-
-    
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device + srun smoke test
     # -----------------------------------------------------------
