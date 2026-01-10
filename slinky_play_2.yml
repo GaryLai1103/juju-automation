@@ -285,53 +285,61 @@
         '
       changed_when: false
 
-    - name: "5.2 Install/upgrade NVIDIA device plugin (Fix: override NFD affinity + reset-values)"
+    - name: "5.2 Install/upgrade NVIDIA device plugin (hostname pin + override default affinity)"
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
+    
           helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
           helm repo update >/dev/null 2>&1
     
-          # values.yaml：用 hostname nodeAffinity 明確覆蓋預設的 NFD affinity
-          # 並保留 nodeSelector + toleration 綁定 GPU node
-          cat <<EOF > /tmp/nvidia-values.yaml
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                    - {{ gpu_node_hostname }}
-          nodeSelector:
-            kubernetes.io/hostname: {{ gpu_node_hostname }}
-          tolerations:
-          - key: {{ gpu_taint_key }}
-            operator: Equal
-            value: "{{ gpu_taint_value }}"
-            effect: NoSchedule
-          EOF
+          f=/tmp/nvidia-values.yaml
+          : > "$f"
+          w(){ printf "%s\n" "$1" >> "$f"; }
     
-          echo "== Generated Values File =="
-          cat /tmp/nvidia-values.yaml
+          # 目的：
+          # 1) 用 hostname nodeAffinity 覆蓋 chart 預設的 feature.node.kubernetes.io/* 規則
+          # 2) 再用 nodeSelector 綁死 gpu-node01
+          # 3) tolerations 可留（即使 node 沒 taint 也不影響）
+          w "affinity:"
+          w "  nodeAffinity:"
+          w "    requiredDuringSchedulingIgnoredDuringExecution:"
+          w "      nodeSelectorTerms:"
+          w "      - matchExpressions:"
+          w "        - key: kubernetes.io/hostname"
+          w "          operator: In"
+          w "          values:"
+          w "          - {{ gpu_node_hostname }}"
+          w "nodeSelector:"
+          w "  kubernetes.io/hostname: {{ gpu_node_hostname }}"
+          w "  kubernetes.io/os: linux"
+          w "tolerations:"
+          w "- key: {{ gpu_taint_key }}"
+          w "  operator: Equal"
+          w "  value: \"{{ gpu_taint_value }}\""
+          w "  effect: NoSchedule"
     
-          # 關鍵：--reset-values 清掉舊 release 殘留的 nodeAffinity（feature.node.kubernetes.io/*）
+          echo "== values.yaml (show with line numbers) =="
+          nl -ba "$f" | sed -n "1,120p"
+    
+          echo "== helm upgrade/install =="
           helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
             -n {{ ns_nvidia }} --create-namespace \
             --reset-values \
-            -f /tmp/nvidia-values.yaml
+            -f "$f"
     
+          echo "== helm status/list =="
+          helm -n {{ ns_nvidia }} status nvidia-device-plugin || true
+          helm list -n {{ ns_nvidia }} || true
+    
+          echo "== rollout + resources =="
           kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
+          kubectl -n {{ ns_nvidia }} get ds,pod -o wide
     
-          echo "== Device Plugin DS status =="
-          kubectl -n {{ ns_nvidia }} get ds -o wide
-    
-          echo "== GPU capacity/allocatable on node =="
-          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A5 || true
+          echo "== node gpu capacity/allocatable =="
+          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A6 || true
         '
       changed_when: true
-
 
     - name: 5.3 Verify nvidia.com/gpu on gpu node
       shell: |
