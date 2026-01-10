@@ -282,6 +282,52 @@
       changed_when: true
 
     # -----------------------------------------------------------
+    # [新增] 4.6 Prefer IPv4 on GPU Node (reduce IPv6 flaky pulls to GHCR)
+    # - 針對 containerd image pull 走 IPv6 但路徑不穩 (connection reset by peer)
+    # - 做法：調整 glibc gai.conf 讓 IPv4-mapped 優先；並 restart containerd
+    # -----------------------------------------------------------
+    - name: 4.6 Prefer IPv4 for image pulls on GPU Node (Machine 1)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine1 }} -- bash -lc '
+          set -euo pipefail
+
+          # 1) sysctl 檔案（這段不是關 IPv6，只是保留原本 IPv6 enable）
+          sudo tee /etc/sysctl.d/99-prefer-ipv4.conf >/dev/null <<EOF
+          net.ipv6.conf.all.disable_ipv6=0
+          net.ipv6.conf.default.disable_ipv6=0
+          net.ipv6.conf.all.use_tempaddr=0
+          net.ipv6.conf.default.use_tempaddr=0
+          EOF
+
+          # 2) 關鍵：glibc resolver 偏好 IPv4（/etc/gai.conf）
+          #    若檔案不存在也沒關係；存在就把 precedence 那行打開/設值
+          if [ -f /etc/gai.conf ]; then
+            if grep -qE "^[# ]*precedence ::ffff:0:0/96[[:space:]]+100" /etc/gai.conf; then
+              sudo sed -i "s/^[# ]*precedence ::ffff:0:0\/96[[:space:]]\+100/precedence ::ffff:0:0\/96  100/" /etc/gai.conf
+            else
+              # 沒有該行就補上（避免你這台的 gai.conf 是精簡版）
+              echo "precedence ::ffff:0:0/96  100" | sudo tee -a /etc/gai.conf >/dev/null
+            fi
+          else
+            # 極少數系統沒有 gai.conf，直接建立並寫入
+            echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
+          fi
+
+          # 3) 套用 + restart containerd
+          sudo sysctl --system >/dev/null
+
+          # 印出目前設定，方便你在 log 看到
+          echo "== /etc/gai.conf (effective lines) =="
+          grep -nE "precedence ::ffff:0:0/96" /etc/gai.conf || true
+
+          echo "== Restart containerd =="
+          sudo systemctl restart containerd
+
+          echo "✅ Prefer IPv4 applied"
+        '
+      changed_when: true
+
+    # -----------------------------------------------------------
     # 5) NVIDIA device plugin (A方案：清空 affinity，避免 NFD 依賴)
     # -----------------------------------------------------------
     - name: 5.0 Precheck gpu node labels/taints
