@@ -539,79 +539,135 @@
             -f "$f" \
             --wait --timeout=300s
         '
-      changed_when: true
-    
+      changed_when: true    
     
     # -----------------------------------------------------------
-    # 8.23 POST-FIX: Patch probes to tcpSocket (repeatable)
-    #   - Controller: patch StatefulSet slurm-controller (replace httpGet -> tcpSocket 6817)
-    #   - Worker: patch NodeSet slurm-worker-slinky (replace httpGet -> tcpSocket 6818)
+    # 8.23 Patch Worker NodeSet probes (slurmd) to tcpSocket:6818
+    #   - Auto-detect container path in NodeSet (schema-agnostic)
+    #   - Patch NodeSet with JSON patch (add/replace)
+    #   - Restart worker pod to pick up new probes
+    #   - Verify readinessProbe is tcpSocket (not httpGet)
     # -----------------------------------------------------------
-    - name: 8.23 Patch probes to tcpSocket (controller sts + worker nodeset)
+    - name: 8.23 Patch worker NodeSet probes to tcpSocket and restart worker pod
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
+    
         NS="{{ ns_slurm }}"
+        NODESET="{{ slurm_worker_nodeset_name | default('slurm-worker-slinky') }}"
+        WRK_POD="{{ slurm_worker_pod_name | default('slurm-worker-slinky-0') }}"
+        PORT=6818
     
-        echo "== [A] controller: replace probes on StatefulSet/slurm-controller =="
-        # slurmctld 通常在 containers[0]，但我們仍用 python 找 index，避免順序變動
-        python3 - <<'PY' > /tmp/ctl_patch.json
-        import json,subprocess,sys
-        ns = "{{ ns_slurm }}"
-        sts = "slurm-controller"
-        j = subprocess.check_output(["kubectl","-n",ns,"get","sts",sts,"-o","json"])
-        obj = json.loads(j)
-        cs = obj["spec"]["template"]["spec"]["containers"]
-        idx = next((i for i,c in enumerate(cs) if c.get("name")=="slurmctld"), 0)
-        patch = [
-          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/startupProbe",
-           "value":{"tcpSocket":{"port":6817},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}},
-          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/readinessProbe",
-           "value":{"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}},
-          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/livenessProbe",
-           "value":{"tcpSocket":{"port":6817},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}},
-        ]
-        print(json.dumps(patch))
-        PY
-        kubectl -n "$NS" patch sts slurm-controller --type=json -p "$(cat /tmp/ctl_patch.json)"
+        echo "== [8.23] Namespace=$NS NodeSet=$NODESET WorkerPod=$WRK_POD Port=$PORT =="
     
-        echo "== [B] worker: replace probes on NodeSet/slurm-worker-slinky =="
-        # 你的 worker ownerReference 已經是 NodeSet: slurm-worker-slinky
+        echo
+        echo "== [A] ensure NodeSet exists =="
+        kubectl -n "$NS" get nodeset "$NODESET" >/dev/null
+    
+        echo
+        echo "== [B] generate JSON patch for NodeSet (schema-agnostic) =="
         python3 - <<'PY' > /tmp/wrk_patch.json
-        import json,subprocess,sys
+        import json, subprocess
+    
         ns = "{{ ns_slurm }}"
-        nodeset = "slurm-worker-slinky"
+        nodeset = "{{ slurm_worker_nodeset_name | default('slurm-worker-slinky') }}"
+        port = 6818
+    
         j = subprocess.check_output(["kubectl","-n",ns,"get","nodeset",nodeset,"-o","json"])
         obj = json.loads(j)
-        # NodeSet template 大多是 PodTemplateSpec: spec.template.spec.containers
-        cs = obj["spec"]["template"]["spec"]["containers"]
-        idx = next((i for i,c in enumerate(cs) if c.get("name")=="slurmd"), 0)
+    
+        found = None  # (path_list_to_containers_key, index, container_dict)
+    
+        def walk(x, path):
+            global found
+            if found is not None:
+                return
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    p2 = path + [k]
+                    if k == "containers" and isinstance(v, list):
+                        for i, c in enumerate(v):
+                            if isinstance(c, dict) and c.get("name") == "slurmd":
+                                found = (p2, i, c)
+                                return
+                    walk(v, p2)
+            elif isinstance(x, list):
+                for i, v in enumerate(x):
+                    walk(v, path + [i])
+    
+        walk(obj, [])
+    
+        if found is None:
+            top = list(obj.keys())
+            raise SystemExit(f"Cannot find containers[] with name=slurmd in NodeSet. top-level keys={top}")
+    
+        path_to_containers, idx, cdict = found
+    
+        def jp(path_list):
+            out = ""
+            for p in path_list:
+                if isinstance(p, int):
+                    out += f"/{p}"
+                else:
+                    out += "/" + p.replace("~", "~0").replace("/", "~1")
+            return out
+    
+        base = jp(path_to_containers) + f"/{idx}"
+    
+        def op_for(field):
+            return "replace" if field in cdict else "add"
+    
         patch = [
-          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/startupProbe",
-           "value":{"tcpSocket":{"port":6818},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}},
-          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/readinessProbe",
-           "value":{"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}},
-          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/livenessProbe",
-           "value":{"tcpSocket":{"port":6818},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}},
+          {"op": op_for("startupProbe"), "path": base + "/startupProbe",
+           "value": {"tcpSocket":{"port":port}, "failureThreshold":120, "periodSeconds":5, "timeoutSeconds":1}},
+          {"op": op_for("readinessProbe"), "path": base + "/readinessProbe",
+           "value": {"tcpSocket":{"port":port}, "failureThreshold":12, "periodSeconds":5, "timeoutSeconds":1}},
+          {"op": op_for("livenessProbe"), "path": base + "/livenessProbe",
+           "value": {"tcpSocket":{"port":port}, "failureThreshold":6, "periodSeconds":10, "timeoutSeconds":1}},
         ]
+    
         print(json.dumps(patch))
         PY
-        kubectl -n "$NS" patch nodeset slurm-worker-slinky --type=json -p "$(cat /tmp/wrk_patch.json)"
     
-        echo "== [C] restart pods to pick up new probes =="
-        kubectl -n "$NS" delete pod slurm-controller-0 --ignore-not-found=true
-        kubectl -n "$NS" delete pod slurm-worker-slinky-0 --ignore-not-found=true
+        echo "[INFO] patch json:"
+        cat /tmp/wrk_patch.json; echo
     
-        echo "== [D] wait Ready =="
-        kubectl -n "$NS" wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
-        kubectl -n "$NS" wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
+        echo
+        echo "== [C] apply patch to NodeSet =="
+        kubectl -n "$NS" patch nodeset "$NODESET" --type=json -p "$(cat /tmp/wrk_patch.json)"
     
-        echo "== [E] verify: probes are tcpSocket (no httpGet) =="
-        kubectl -n "$NS" get pod slurm-controller-0 -o jsonpath='{.spec.containers[?(@.name=="slurmctld")].readinessProbe}{"\n"}'
-        kubectl -n "$NS" get pod slurm-worker-slinky-0 -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}{"\n"}'
+        echo
+        echo "== [D] restart worker pod to pick up new probes =="
+        kubectl -n "$NS" delete pod "$WRK_POD" --ignore-not-found=true
+    
+        echo
+        echo "== [E] wait worker Ready =="
+        kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK_POD" --timeout=300s
+    
+        echo
+        echo "== [F] verify worker probe is tcpSocket (no httpGet) =="
+        kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}{"\n"}'
         EOS
+      args:
+        executable: /bin/bash
+      register: slurm_patch_nodeset_probes
       changed_when: true
+      failed_when: slurm_patch_nodeset_probes.rc != 0
     
+    # ---- optional: failure debug dump ----
+    - name: 8.23 Debug dump NodeSet YAML on failure
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -euo pipefail
+          NS="{{ ns_slurm }}"
+          NODESET="{{ slurm_worker_nodeset_name | default("slurm-worker-slinky") }}"
+          echo "== nodeset yaml dump =="
+          kubectl -n "$NS" get nodeset "$NODESET" -o yaml | sed -n "1,260p"
+        '
+      args:
+        executable: /bin/bash
+      when: slurm_patch_nodeset_probes is failed
+      changed_when: false    
     
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device + srun smoke test
