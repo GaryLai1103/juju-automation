@@ -158,70 +158,82 @@
       debug:
         msg: "Charmed Kubernetes 已成功部署。StorageClass 已透過 Machine 0 內部指令完成配置，未更動 maasjuju 環境。"
 
-
-
 # -----------------------------------------------------------
 # GATE) Wait cluster fully ready (Juju active + K8s nodes/pods ready)
 # - 不動 maasjuju 的 kubeconfig
-# - 全部透過 juju ssh 到 machine0 內部執行
+# - Juju status 用 from_json 解析，不用 jq
+# - kubectl 全部透過 juju ssh 到 machine0 內部執行
 # -----------------------------------------------------------
-- name: GATE - Wait Juju apps active (control-plane/worker/calico/containerd)
-  shell: |
-    set -euo pipefail
-    for i in $(seq 1 240); do
-      j=$(juju status --model {{ test_model }} --format json)
+- name: GATE - Wait cluster fully ready (Juju active + K8s ready)
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    test_model: "slinky-cluster"
+    machine0: "0"
+    controlplane_hostname: "slurmhn"
+    gpu_node_hostname: "gpu-node01"
 
-      cp=$(echo "$j" | jq -r '.applications["kubernetes-control-plane"]["application-status"].current // "unknown"')
-      wk=$(echo "$j" | jq -r '.applications["kubernetes-worker"]["application-status"].current // "unknown"')
-      ca=$(echo "$j" | jq -r '.applications["calico"]["application-status"].current // "unknown"')
-      cd=$(echo "$j" | jq -r '.applications["containerd"]["application-status"].current // "unknown"')
+  tasks:
+    - name: GATE 1 - Wait Juju apps active (control-plane/worker/calico/containerd) [no jq]
+      shell: "juju status --model {{ test_model }} --format json"
+      register: juju_status_gate
+      changed_when: false
+      retries: 240
+      delay: 5
+      until: >
+        (
+          ((juju_status_gate.stdout | from_json).applications["kubernetes-control-plane"]["application-status"].current | default("unknown")) == "active"
+        ) and (
+          ((juju_status_gate.stdout | from_json).applications["kubernetes-worker"]["application-status"].current | default("unknown")) == "active"
+        ) and (
+          ((juju_status_gate.stdout | from_json).applications["calico"]["application-status"].current | default("unknown")) == "active"
+        ) and (
+          ((juju_status_gate.stdout | from_json).applications["containerd"]["application-status"].current | default("unknown")) == "active"
+        )
 
-      echo "[Juju] cp=$cp worker=$wk calico=$ca containerd=$cd (try=$i)"
+    - name: GATE 1.1 - Show final Juju app status (for log)
+      vars:
+        j: "{{ juju_status_gate.stdout | from_json }}"
+      debug:
+        msg:
+          - "cp={{ j.applications['kubernetes-control-plane']['application-status'].current | default('unknown') }}"
+          - "wk={{ j.applications['kubernetes-worker']['application-status'].current | default('unknown') }}"
+          - "ca={{ j.applications['calico']['application-status'].current | default('unknown') }}"
+          - "cd={{ j.applications['containerd']['application-status'].current | default('unknown') }}"
 
-      if [ "$cp" = "active" ] && [ "$wk" = "active" ] && [ "$ca" = "active" ] && [ "$cd" = "active" ]; then
-        echo "✅ Juju layer active"
-        exit 0
-      fi
-      sleep 5
-    done
-    echo "❌ Timeout waiting Juju apps active"
-    juju status --model {{ test_model }} --color || true
-    exit 1
-  args:
-    executable: /bin/bash
-  changed_when: false
+    - name: GATE 2 - Wait K8s nodes Ready + kube-system core pods Ready (remote exec on machine0)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
 
-- name: GATE - Wait K8s nodes Ready + kube-system core pods Ready (remote exec on machine0)
-  shell: |
-    juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
-    set -euo pipefail
+        echo "== nodes =="
+        kubectl get nodes -o wide
 
-    echo "== nodes =="
-    kubectl get nodes -o wide
+        echo
+        echo "[WAIT] nodes Ready..."
+        kubectl wait node/{{ controlplane_hostname }} --for=condition=Ready --timeout=900s
+        kubectl wait node/{{ gpu_node_hostname }}     --for=condition=Ready --timeout=900s
 
-    echo "[WAIT] nodes Ready..."
-    kubectl wait node/{{ controlplane_hostname }} --for=condition=Ready --timeout=900s
-    kubectl wait node/{{ gpu_node_hostname }}     --for=condition=Ready --timeout=900s
+        echo
+        echo "== kube-system pods (non-Running) =="
+        kubectl -n kube-system get pods | egrep -v "Running|Completed" || true
 
-    echo
-    echo "== kube-system pods (non-Running) =="
-    kubectl -n kube-system get pods | egrep -v "Running|Completed" || true
+        echo
+        echo "[WAIT] calico-node Ready..."
+        kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=900s
 
-    echo "[WAIT] calico-node Ready..."
-    kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=900s
+        echo
+        echo "[WAIT] coredns/kube-dns Ready..."
+        kubectl -n kube-system wait pod -l k8s-app=kube-dns --for=condition=Ready --timeout=600s 2>/dev/null || \
+        kubectl -n kube-system wait pod -l k8s-app=coredns  --for=condition=Ready --timeout=600s 2>/dev/null || true
 
-    # coredns label 可能是 k8s-app=kube-dns 或 k8s-app=coredns，兩個都試，避免卡死
-    echo "[WAIT] coredns/kube-dns Ready..."
-    kubectl -n kube-system wait pod -l k8s-app=kube-dns --for=condition=Ready --timeout=600s 2>/dev/null || \
-    kubectl -n kube-system wait pod -l k8s-app=coredns  --for=condition=Ready --timeout=600s 2>/dev/null || true
-
-    echo
-    echo "✅ K8s layer ready"
-    kubectl get nodes -o wide
-    kubectl -n kube-system get pods -o wide
-    EOS
-  changed_when: false
-
+        echo
+        echo "✅ K8s layer ready"
+        kubectl get nodes -o wide
+        kubectl -n kube-system get pods -o wide
+        EOS
+      changed_when: false
+      
 # ========================================================
 # SKU: Slinky-SlurmOnK8s-Standardized (Merged, Repeatable)
 #
