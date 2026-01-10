@@ -134,19 +134,7 @@
     # 3.0 Install NFS client utils on ALL nodes (IMPORTANT)
     # - Fix: mount: bad option ... need /sbin/mount.nfs
     # -----------------------------------------------------------
-    - name: 3.0 Install nfs-common on machine0+machine1
-      shell: |
-        for m in {{ machine0 }} {{ machine1 }}; do
-          juju ssh --model {{ test_model }} $m -- bash -lc '
-            set -e
-            sudo apt-get update -y
-            sudo apt-get install -y nfs-common
-            command -v mount.nfs >/dev/null 2>&1 && echo "[OK] mount.nfs exists" || (echo "[FAIL] mount.nfs missing" && exit 1)
-          '
-        done
-      changed_when: true
-    
-    - name: 3.1 Setup NFS server export on machine0 (optional)
+    - name: 3.0 Setup NFS server export on machine0 (optional)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -e
@@ -170,7 +158,7 @@
       when: nfs_server_setup | bool
       changed_when: true
 
-    - name: 3.9 Install nfs-common on k8s nodes (required for NFS mounts) - robust + wait dpkg lock
+    - name: 3.1 Install nfs-common on k8s nodes (required for NFS mounts) - robust + wait dpkg lock
       shell: |
         juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
         set -euo pipefail
