@@ -434,36 +434,22 @@
         '
       changed_when: false
 
-    # -----------------------------------------------------------
-    # [修正版] 8.2 使用原始 printf 風格生成 values.yaml (已修正縮排)
-    # -----------------------------------------------------------
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller to ControlPlane
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin controller/restapi to slurmhn, worker to gpu-node01
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
-
+    
           f="/tmp/slurm-values.yaml"
           : > $f
-          # 定義寫入函式，維持原本風格
           function w { printf -- "%s\n" "$1" >> $f; }
-
+    
           echo "[INFO] Generating values.yaml..."
-          
-          # --- Controller (slurmctld) ---
+    
+          # -------------------------
+          # Controller (slurmctld)
+          # schema: controller.podSpec.nodeSelector / tolerations
+          # -------------------------
           w "controller:"
-          # [NEW] 指定 Controller 到 Control Plane (注意: YAML縮排要在字串內手動對齊)
-          w "  nodeSelector:"
-          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
-          
-          # [NEW] 加上 Control Plane 的 Tolerations
-          w "  tolerations:"
-          w "  - key: node-role.kubernetes.io/control-plane"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-          w "  - key: node-role.kubernetes.io/master"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-
           w "  persistence:"
           w "    enabled: true"
           w "    storageClassName: \"{{ nfs_storageclass }}\""
@@ -472,46 +458,93 @@
           w "    resources:"
           w "      requests:"
           w "        storage: 10Gi"
-          w "  extraConf: |"
-          w "    GresTypes=gpu"
-          w "  extraConfMap: {}"
-          
-          # --- Telemetry (REST API) ---
-          # [NEW] 確保 REST API 也跑在 Control Plane，不佔用 GPU Node
-          w "telemetry:"
+          w "  extraConfMap:"
+          w "    GresTypes: gpu"
+          w "  podSpec:"
+          w "    nodeSelector:"
+          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "    tolerations:"
+          w "      - key: node-role.kubernetes.io/control-plane"
+          w "        operator: Exists"
+          w "        effect: NoSchedule"
+          w "      - key: node-role.kubernetes.io/master"
+          w "        operator: Exists"
+          w "        effect: NoSchedule"
+          # (可選) 直接把 slurmctld probes 改 tcpSocket，避免 httpGet /livez 抖動
+          w "    containers:"
+          w "      - name: slurmctld"
+          w "        startupProbe:"
+          w "          tcpSocket: { port: 6817 }"
+          w "          failureThreshold: 120"
+          w "          periodSeconds: 5"
+          w "          timeoutSeconds: 1"
+          w "        readinessProbe:"
+          w "          tcpSocket: { port: 6817 }"
+          w "          failureThreshold: 12"
+          w "          periodSeconds: 5"
+          w "          timeoutSeconds: 1"
+          w "        livenessProbe:"
+          w "          tcpSocket: { port: 6817 }"
+          w "          failureThreshold: 6"
+          w "          periodSeconds: 10"
+          w "          timeoutSeconds: 1"
+    
+          # -------------------------
+          # REST API (slurmrestd)
+          # schema: restapi.podSpec.nodeSelector / tolerations
+          # -------------------------
+          w "restapi:"
           w "  enabled: true"
-          w "  nodeSelector:"
-          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
-          w "  tolerations:"
-          w "  - key: node-role.kubernetes.io/control-plane"
-          w "    operator: Exists"
-          w "    effect: NoSchedule"
-
-          # --- NodeSets (Worker) ---
+          w "  podSpec:"
+          w "    nodeSelector:"
+          w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "    tolerations:"
+          w "      - key: node-role.kubernetes.io/control-plane"
+          w "        operator: Exists"
+          w "        effect: NoSchedule"
+    
+          # -------------------------
+          # NodeSets (Worker)
+          # schema: nodesets.<name>.podSpec + extraConfMap(Gres)
+          # -------------------------
           w "nodesets:"
           w "  slinky:"
           w "    enabled: true"
-          w "    partition:"
-          w "      enabled: false"
+          # ✅ 讓 Slurm 真的註冊到 Gres=gpu:1，否則 srun --gres=gpu:1 會找不到資源
+          w "    extraConfMap:"
+          w "      Gres:"
+          w "        - \"gpu:{{ slurm_gpu_count }}\""
+          w "    useResourceLimits: true"
           w "    podSpec:"
           w "      nodeSelector:"
           w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
-          w "        kubernetes.io/os: linux"
           w "      tolerations:"
-          w "      - effect: NoSchedule"
-          w "        key: {{ gpu_taint_key }}"
-          w "        operator: Equal"
-          w "        value: \"{{ gpu_taint_value }}\""
-          w "      useResourceLimits: true"
-          w "      slurmd:"
-          w "        resources:"
-          w "          limits:"
-          w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
-          w "        args:"
-          w "        - --conf"
-          w "        - Gres=gpu:{{ slurm_gpu_count }}"
-
-          # --- Partitions ---
+          w "        - key: {{ gpu_taint_key }}"
+          w "          operator: Equal"
+          w "          value: \"{{ gpu_taint_value }}\""
+          w "          effect: NoSchedule"
+          # (可選) 把 slurmd probes 改 tcpSocket，避免 httpGet /readyz 抖動
+          w "      containers:"
+          w "        - name: slurmd"
+          w "          startupProbe:"
+          w "            tcpSocket: { port: 6818 }"
+          w "            failureThreshold: 120"
+          w "            periodSeconds: 5"
+          w "            timeoutSeconds: 1"
+          w "          readinessProbe:"
+          w "            tcpSocket: { port: 6818 }"
+          w "            failureThreshold: 12"
+          w "            periodSeconds: 5"
+          w "            timeoutSeconds: 1"
+          w "          livenessProbe:"
+          w "            tcpSocket: { port: 6818 }"
+          w "            failureThreshold: 6"
+          w "            periodSeconds: 10"
+          w "            timeoutSeconds: 1"
+    
+          # -------------------------
+          # Partitions
+          # -------------------------
           w "partitions:"
           w "  all:"
           w "    enabled: true"
@@ -527,17 +560,19 @@
           w "      Default: \"NO\""
           w "      MaxTime: UNLIMITED"
           w "      State: UP"
-
-          # --- ConfigFiles ---
+    
+          # -------------------------
+          # ConfigFiles - gres.conf
+          # 建議用 AutoDetect=nvidia，未來多卡比較不會卡死在 /dev/nvidia0
+          # -------------------------
           w "configFiles:"
           w "  gres.conf: |"
-          w "    Name=gpu File=/dev/nvidia0"
-
-          echo "[INFO] Generated values head (Check indentation):"
-          head -n 25 $f
-
+          w "    AutoDetect=nvidia"
+    
+          echo "[INFO] Generated values head:"
+          head -n 80 $f
+    
           echo "[INFO] Executing Helm Upgrade..."
-          # 加上 --force 確保 StatefulSet 欄位衝突時能強制重建
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
@@ -545,119 +580,89 @@
             --wait --timeout=300s
         '
       changed_when: true
+
     
-    # -----------------------------------------------------------
-    # 8.23 Patch Worker NodeSet slurmd probes -> tcpSocket:6818
-    #   - NodeSet 沒有 containers[] 是正常的，所以改找 spec 裡的 slurmd dict
-    #   - patch NodeSet 後刪 worker pod 讓它重建
-    # -----------------------------------------------------------
-    - name: 8.23 Patch worker NodeSet (slurmd) probes to tcpSocket:6818 and restart pod
+    - name: 8.23 (AWX) Ensure worker probes are tcpSocket:6818 via NodeSet.spec.podSpec.containers (fallback patch)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
+        NS="{{ ns_slurm }}"
+        WRK_POD="slurm-worker-slinky-0"
     
-        NS="{{ ns_slurm | default('slurm') }}"
-        WRK_POD="{{ slurm_worker_pod_name | default('slurm-worker-slinky-0') }}"
-        PORT=6818
-    
-        echo "== [8.23] NS=$NS WRK_POD=$WRK_POD PORT=$PORT =="
-    
-        echo
-        echo "== [A] detect NodeSet name from worker pod ownerReferences =="
         NODESET="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.metadata.ownerReferences[0].name}')"
         KIND="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.metadata.ownerReferences[0].kind}')"
-        echo "owner kind=$KIND name=$NODESET"
+        echo "[8.23] owner kind=$KIND name=$NODESET"
         test "$KIND" = "NodeSet"
     
-        echo
-        echo "== [B] generate JSON patch for NodeSet: locate 'slurmd' dict under spec (schema-agnostic) =="
-        python3 - <<'PY' > /tmp/nodeset_slurmd_probe_patch.json
-        import json, subprocess, sys
+        # 先看目前 worker pod probes 是不是 httpGet
+        CUR="$(kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}' || true)"
+        echo "[8.23] current slurmd readinessProbe: $CUR"
     
-        ns = "{{ ns_slurm | default('slurm') }}"
-        nodeset = subprocess.check_output(["bash","-lc", "kubectl -n %s get pod %s -o jsonpath='{.metadata.ownerReferences[0].name}'" % (ns, "{{ slurm_worker_pod_name | default('slurm-worker-slinky-0') }}")]).decode().strip()
-        port = 6818
+        if echo "$CUR" | grep -q "httpGet"; then
+          echo "[8.23] Detected httpGet probe -> patch NodeSet.spec.podSpec.containers[name=slurmd] to tcpSocket"
     
-        obj = json.loads(subprocess.check_output(["kubectl","-n",ns,"get","nodeset",nodeset,"-o","json"]))
+          python3 - <<'PY' > /tmp/nodeset_probe_patch.json
+    import json, subprocess
     
-        found_path = None
-        found_obj = None
+    ns = "{{ ns_slurm }}"
+    nodeset = subprocess.check_output(["kubectl","-n",ns,"get","pod","slurm-worker-slinky-0","-o","jsonpath={.metadata.ownerReferences[0].name}"]).decode().strip()
+    obj = json.loads(subprocess.check_output(["kubectl","-n",ns,"get","nodeset",nodeset,"-o","json"]))
     
-        def walk(x, path):
-            nonlocal_found = False
-            global found_path, found_obj
-            if found_path is not None:
-                return
-            if isinstance(x, dict):
-                # 直接命中 key == "slurmd"
-                if "slurmd" in x and isinstance(x["slurmd"], dict):
-                    found_path = path + ["slurmd"]
-                    found_obj = x["slurmd"]
-                    return
-                for k, v in x.items():
-                    walk(v, path + [k])
-            elif isinstance(x, list):
-                for i, v in enumerate(x):
-                    walk(v, path + [i])
+    podspec = obj.get("spec", {}).get("podSpec", {})
+    containers = podspec.get("containers", [])
     
-        # 只從 spec 開始找，避免 metadata/status 干擾
-        walk(obj.get("spec", {}), ["spec"])
+    def mk_probe(port, ft, ps, ts):
+        return {"tcpSocket":{"port":port},"failureThreshold":ft,"periodSeconds":ps,"timeoutSeconds":ts}
     
-        if found_path is None:
-            # 把 spec keys 印出來幫 debug
-            spec_keys = list(obj.get("spec", {}).keys())
-            raise SystemExit(f"Cannot find a dict keyed 'slurmd' anywhere under NodeSet.spec. spec keys={spec_keys}")
+    slurmd_patch_container = {
+      "name":"slurmd",
+      "startupProbe": mk_probe(6818, 120, 5, 1),
+      "readinessProbe": mk_probe(6818, 12, 5, 1),
+      "livenessProbe": mk_probe(6818, 6, 10, 1),
+    }
     
-        def esc(p):
-            if isinstance(p, int):
-                return f"/{p}"
-            return "/" + p.replace("~","~0").replace("/","~1")
+    # 找是否已有 name=slurmd 的 container override
+    idx = next((i for i,c in enumerate(containers) if isinstance(c,dict) and c.get("name")=="slurmd"), None)
     
-        base = "".join(esc(p) for p in found_path)
+    patch = []
+    # 確保 /spec/podSpec 存在
+    if "podSpec" not in obj.get("spec", {}):
+        patch.append({"op":"add","path":"/spec/podSpec","value":{}})
     
-        # NodeSet 裡的 slurmd dict，通常沒有 probe（我們用 add/replace 皆可）
-        def op_for(field):
-            return "replace" if (isinstance(found_obj, dict) and field in found_obj) else "add"
+    # 確保 /spec/podSpec/containers 存在
+    if "containers" not in podspec:
+        patch.append({"op":"add","path":"/spec/podSpec/containers","value":[slurmd_patch_container]})
+    else:
+        if idx is None:
+            patch.append({"op":"add","path":"/spec/podSpec/containers/-","value":slurmd_patch_container})
+        else:
+            patch.append({"op":"replace","path":f"/spec/podSpec/containers/{idx}","value":slurmd_patch_container})
     
-        probe_common = {
-            "failureThreshold": 120,
-            "periodSeconds": 5,
-            "timeoutSeconds": 1
-        }
+    print(json.dumps(patch))
+    PY
     
-        patch = [
-          {"op": op_for("startupProbe"),  "path": base + "/startupProbe",  "value": {"tcpSocket":{"port":port}, **probe_common}},
-          {"op": op_for("readinessProbe"),"path": base + "/readinessProbe","value": {"tcpSocket":{"port":port}, "failureThreshold":12, "periodSeconds":5, "timeoutSeconds":1}},
-          {"op": op_for("livenessProbe"), "path": base + "/livenessProbe", "value": {"tcpSocket":{"port":port}, "failureThreshold":6, "periodSeconds":10, "timeoutSeconds":1}},
-        ]
+          echo "[8.23] patch json:"
+          cat /tmp/nodeset_probe_patch.json; echo
     
-        print(json.dumps(patch))
-        PY
+          kubectl -n "$NS" patch nodeset "$NODESET" --type=json -p "$(cat /tmp/nodeset_probe_patch.json)"
     
-        echo "[INFO] patch json:"
-        cat /tmp/nodeset_slurmd_probe_patch.json; echo
+          echo "[8.23] restart worker pod"
+          kubectl -n "$NS" delete pod "$WRK_POD" --ignore-not-found=true
     
-        echo
-        echo "== [C] apply patch to NodeSet/$NODESET =="
-        kubectl -n "$NS" patch nodeset "$NODESET" --type=json -p "$(cat /tmp/nodeset_slurmd_probe_patch.json)"
+          echo "[8.23] wait Ready"
+          kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK_POD" --timeout=300s
     
-        echo
-        echo "== [D] restart worker pod to pick up new probes =="
-        kubectl -n "$NS" delete pod "$WRK_POD" --ignore-not-found=true
+        else
+          echo "[8.23] Probe already non-httpGet (OK) -> skip patch"
+        fi
     
-        echo
-        echo "== [E] wait worker Ready =="
-        kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK_POD" --timeout=300s
-    
-        echo
-        echo "== [F] verify: worker pod probe (must NOT be httpGet) =="
+        echo "[8.23] verify readinessProbe:"
         kubectl -n "$NS" get pod "$WRK_POD" -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}{"\n"}'
         EOS
       args:
         executable: /bin/bash
-      register: patch_nodeset_slurmd_probes
       changed_when: true
-      failed_when: patch_nodeset_slurmd_probes.rc != 0
+
 
     
     # -----------------------------------------------------------
