@@ -435,156 +435,217 @@
       changed_when: false
 
     # -----------------------------------------------------------
-    # [修正版] 8.2 強制 Controller/RestAPI 在 slurmhn, Worker 在 gpu-node01
+    # 8.2 Install/upgrade slurm chart (OCI) - Pin Controller/Telemetry/Worker
     # -----------------------------------------------------------
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller/RestAPI/Worker
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Pin Controller to ControlPlane
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set -euo pipefail
+    
+          f="/tmp/slurm-values.yaml"
+          : > "$f"
+          w(){ printf -- "%s\n" "$1" >> "$f"; }
+    
+          echo "[INFO] Generating values.yaml..."
+    
+          # --- Controller (slurmctld) ---
+          w "controller:"
+          w "  nodeSelector:"
+          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "  tolerations:"
+          w "  - key: node-role.kubernetes.io/control-plane"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+          w "  - key: node-role.kubernetes.io/master"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+    
+          w "  persistence:"
+          w "    enabled: true"
+          w "    storageClassName: \"{{ nfs_storageclass }}\""
+          w "    accessModes:"
+          w "      - ReadWriteOnce"
+          w "    resources:"
+          w "      requests:"
+          w "        storage: 10Gi"
+    
+          w "  extraConf: |"
+          w "    GresTypes=gpu"
+          w "  extraConfMap: {}"
+    
+          # --- Telemetry (REST API etc.) ---
+          w "telemetry:"
+          w "  enabled: true"
+          w "  nodeSelector:"
+          w "    kubernetes.io/hostname: {{ controlplane_hostname }}"
+          w "  tolerations:"
+          w "  - key: node-role.kubernetes.io/control-plane"
+          w "    operator: Exists"
+          w "    effect: NoSchedule"
+    
+          # --- NodeSets (Worker) ---
+          w "nodesets:"
+          w "  slinky:"
+          w "    enabled: true"
+          w "    partition:"
+          w "      enabled: false"
+          w "    podSpec:"
+          w "      nodeSelector:"
+          w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
+          w "        kubernetes.io/os: linux"
+          w "      tolerations:"
+          w "      - effect: NoSchedule"
+          w "        key: {{ gpu_taint_key }}"
+          w "        operator: Equal"
+          w "        value: \"{{ gpu_taint_value }}\""
+          w "      useResourceLimits: true"
+          w "      slurmd:"
+          w "        resources:"
+          w "          limits:"
+          w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
+          w "        args:"
+          w "        - --conf"
+          w "        - Gres=gpu:{{ slurm_gpu_count }}"
+    
+          # --- Partitions ---
+          w "partitions:"
+          w "  all:"
+          w "    enabled: true"
+          w "    nodesets: [ALL]"
+          w "    configMap:"
+          w "      Default: \"YES\""
+          w "      MaxTime: UNLIMITED"
+          w "      State: UP"
+          w "  slinky:"
+          w "    enabled: true"
+          w "    nodesets: [ALL]"
+          w "    configMap:"
+          w "      Default: \"NO\""
+          w "      MaxTime: UNLIMITED"
+          w "      State: UP"
+    
+          # --- ConfigFiles ---
+          w "configFiles:"
+          w "  gres.conf: |"
+          w "    Name=gpu File=/dev/nvidia0"
+    
+          echo "[INFO] values head:"
+          head -n 40 "$f"
+    
+          echo "[INFO] Helm upgrade..."
+          helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
+            -n {{ ns_slurm }} --create-namespace \
+            --version {{ slurm_chart_ver }} \
+            -f "$f" \
+            --wait --timeout=300s
+        '
+      changed_when: true
+    
+    
+    # -----------------------------------------------------------
+    # 8.23 POST-FIX: Patch probes to tcpSocket (repeatable)
+    #   - Controller: patch StatefulSet slurm-controller (replace httpGet -> tcpSocket 6817)
+    #   - Worker: patch NodeSet slurm-worker-slinky (replace httpGet -> tcpSocket 6818)
+    # -----------------------------------------------------------
+    - name: 8.23 Patch probes to tcpSocket (controller sts + worker nodeset)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-
         NS="{{ ns_slurm }}"
-        f="/tmp/slurm-values.yaml"
-        : > "$f"
-        w(){ printf -- "%s\n" "$1" >> "$f"; }
-
-        echo "[INFO] Generating values.yaml..."
-
-        # --- Controller (slurmctld) ---
-        w "controller:"
-        w "  podSpec:"
-        w "    nodeSelector:"
-        w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-        w "      kubernetes.io/os: linux"
-        w "    tolerations:"
-        w "    - key: node-role.kubernetes.io/control-plane"
-        w "      operator: Exists"
-        w "      effect: NoSchedule"
-        w "    - key: node-role.kubernetes.io/master"
-        w "      operator: Exists"
-        w "      effect: NoSchedule"
-
-        w "  persistence:"
-        w "    enabled: true"
-        w "    storageClassName: \"{{ nfs_storageclass }}\""
-        w "    accessModes:"
-        w "      - ReadWriteOnce"
-        w "    resources:"
-        w "      requests:"
-        w "        storage: 10Gi"
-        w "  extraConf: |"
-        w "    GresTypes=gpu"
-        w "  extraConfMap: {}"
-
-        # --- REST API ---
-        # 你先前 kubectl 看過 slurm-restapi deployment 能吃 nodeSelector/tolerations
-        # 這裡用常見 key: restapi.podSpec（如果 chart 不是這個 key，下面我也給你驗證方法）
-        w "restapi:"
-        w "  podSpec:"
-        w "    nodeSelector:"
-        w "      kubernetes.io/hostname: {{ controlplane_hostname }}"
-        w "      kubernetes.io/os: linux"
-        w "    tolerations:"
-        w "    - key: node-role.kubernetes.io/control-plane"
-        w "      operator: Exists"
-        w "      effect: NoSchedule"
-        w "    - key: node-role.kubernetes.io/master"
-        w "      operator: Exists"
-        w "      effect: NoSchedule"
-
-        # --- NodeSets (Worker) ---
-        w "nodesets:"
-        w "  slinky:"
-        w "    enabled: true"
-        w "    partition:"
-        w "      enabled: false"
-        w "    podSpec:"
-        w "      nodeSelector:"
-        w "        kubernetes.io/hostname: {{ gpu_node_hostname }}"
-        w "        kubernetes.io/os: linux"
-        w "      tolerations:"
-        w "      - effect: NoSchedule"
-        w "        key: {{ gpu_taint_key }}"
-        w "        operator: Equal"
-        w "        value: \"{{ gpu_taint_value }}\""
-        w "      useResourceLimits: true"
-        w "      slurmd:"
-        w "        resources:"
-        w "          limits:"
-        w "            nvidia.com/gpu: {{ slurm_gpu_count }}"
-        w "        args:"
-        w "        - --conf"
-        w "        - Gres=gpu:{{ slurm_gpu_count }}"
-
-        # --- Partitions ---
-        w "partitions:"
-        w "  all:"
-        w "    enabled: true"
-        w "    nodesets: [ALL]"
-        w "    configMap:"
-        w "      Default: \"YES\""
-        w "      MaxTime: UNLIMITED"
-        w "      State: UP"
-        w "  slinky:"
-        w "    enabled: true"
-        w "    nodesets: [ALL]"
-        w "    configMap:"
-        w "      Default: \"NO\""
-        w "      MaxTime: UNLIMITED"
-        w "      State: UP"
-
-        # --- ConfigFiles ---
-        w "configFiles:"
-        w "  gres.conf: |"
-        w "    Name=gpu File=/dev/nvidia0"
-
-        echo "[INFO] values.yaml head:"
-        head -n 60 "$f"
-
-        echo "[INFO] Helm upgrade..."
-        helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-          -n "$NS" --create-namespace \
-          --version {{ slurm_chart_ver }} \
-          -f "$f" \
-          --wait --timeout=300s
-
-        echo "[INFO] Pods placement:"
-        kubectl -n "$NS" get pods -o wide
+    
+        echo "== [A] controller: replace probes on StatefulSet/slurm-controller =="
+        # slurmctld 通常在 containers[0]，但我們仍用 python 找 index，避免順序變動
+        python3 - <<'PY' > /tmp/ctl_patch.json
+        import json,subprocess,sys
+        ns = "{{ ns_slurm }}"
+        sts = "slurm-controller"
+        j = subprocess.check_output(["kubectl","-n",ns,"get","sts",sts,"-o","json"])
+        obj = json.loads(j)
+        cs = obj["spec"]["template"]["spec"]["containers"]
+        idx = next((i for i,c in enumerate(cs) if c.get("name")=="slurmctld"), 0)
+        patch = [
+          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/startupProbe",
+           "value":{"tcpSocket":{"port":6817},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}},
+          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/readinessProbe",
+           "value":{"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}},
+          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/livenessProbe",
+           "value":{"tcpSocket":{"port":6817},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}},
+        ]
+        print(json.dumps(patch))
+        PY
+        kubectl -n "$NS" patch sts slurm-controller --type=json -p "$(cat /tmp/ctl_patch.json)"
+    
+        echo "== [B] worker: replace probes on NodeSet/slurm-worker-slinky =="
+        # 你的 worker ownerReference 已經是 NodeSet: slurm-worker-slinky
+        python3 - <<'PY' > /tmp/wrk_patch.json
+        import json,subprocess,sys
+        ns = "{{ ns_slurm }}"
+        nodeset = "slurm-worker-slinky"
+        j = subprocess.check_output(["kubectl","-n",ns,"get","nodeset",nodeset,"-o","json"])
+        obj = json.loads(j)
+        # NodeSet template 大多是 PodTemplateSpec: spec.template.spec.containers
+        cs = obj["spec"]["template"]["spec"]["containers"]
+        idx = next((i for i,c in enumerate(cs) if c.get("name")=="slurmd"), 0)
+        patch = [
+          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/startupProbe",
+           "value":{"tcpSocket":{"port":6818},"failureThreshold":120,"periodSeconds":5,"timeoutSeconds":1}},
+          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/readinessProbe",
+           "value":{"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":5,"timeoutSeconds":1}},
+          {"op":"replace","path":f"/spec/template/spec/containers/{idx}/livenessProbe",
+           "value":{"tcpSocket":{"port":6818},"failureThreshold":6,"periodSeconds":10,"timeoutSeconds":1}},
+        ]
+        print(json.dumps(patch))
+        PY
+        kubectl -n "$NS" patch nodeset slurm-worker-slinky --type=json -p "$(cat /tmp/wrk_patch.json)"
+    
+        echo "== [C] restart pods to pick up new probes =="
+        kubectl -n "$NS" delete pod slurm-controller-0 --ignore-not-found=true
+        kubectl -n "$NS" delete pod slurm-worker-slinky-0 --ignore-not-found=true
+    
+        echo "== [D] wait Ready =="
+        kubectl -n "$NS" wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
+        kubectl -n "$NS" wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
+    
+        echo "== [E] verify: probes are tcpSocket (no httpGet) =="
+        kubectl -n "$NS" get pod slurm-controller-0 -o jsonpath='{.spec.containers[?(@.name=="slurmctld")].readinessProbe}{"\n"}'
+        kubectl -n "$NS" get pod slurm-worker-slinky-0 -o jsonpath='{.spec.containers[?(@.name=="slurmd")].readinessProbe}{"\n"}'
         EOS
       changed_when: true
-
-    - name: 8.25 Verify worker got correct gres.conf and GPU device (wait ready) - no nvidia-smi dependency
+    
+    
+    # -----------------------------------------------------------
+    # 8.25 Verify worker got correct gres.conf and GPU device + srun smoke test
+    # -----------------------------------------------------------
+    - name: 8.25 Verify worker gres.conf + /dev/nvidia0 + srun GPU smoke test
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         NS="{{ ns_slurm }}"
         WRK="slurm-worker-slinky-0"
-        C="slurmd"
         CTL="slurm-controller-0"
     
-        echo "[INFO] wait worker pod ready..."
+        echo "[INFO] wait worker Ready..."
         kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK" --timeout=300s
     
-        echo "[CHECK] container names:"
-        kubectl -n "$NS" get pod "$WRK" -o jsonpath='{.spec.containers[*].name}{"\n"}'
-    
         echo "[CHECK] gres.conf:"
-        kubectl -n "$NS" exec "$WRK" -c "$C" -- cat /run/slurm/conf/gres.conf
+        kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf
     
         echo "[CHECK] /dev/nvidia0:"
-        kubectl -n "$NS" exec "$WRK" -c "$C" -- ls -l /dev/nvidia0
+        kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0
     
-        echo "[CHECK] nvidia-smi -L (optional in slurmd image):"
-        kubectl -n "$NS" exec "$WRK" -c "$C" -- sh -lc '
-          if command -v nvidia-smi >/dev/null 2>&1; then
-            nvidia-smi -L
-          else
-            echo "[SKIP] nvidia-smi not installed in slurmd container (OK)."
-          fi
-        '
+        echo
+        echo "== sinfo =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- sinfo -o "%P %a %D %t %N" || true
     
+        echo
+        echo "== scontrol show nodes (brief) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc 'scontrol show nodes | egrep -i "NodeName=|State=|Gres=|CfgTRES=" | head -n 120' || true
+    
+        echo
         echo "[CHECK] srun GPU smoke test (authoritative):"
+        # 如果你的 partition 不是預設，請把 -p slinky 或 -p all 打開其中一個
         kubectl -n "$NS" exec "$CTL" -c slurmctld -- sh -lc \
-          'srun -N1 -n1 --gres=gpu:{{ slurm_gpu_count }} bash -lc "ls -l /dev/nvidia0 && echo GPU_OK"'
+          'timeout 60s srun --immediate=10 -N1 -n1 --gres=gpu:1 bash -lc "hostname; ls -l /dev/nvidia0; echo GPU_OK"'
         EOS
       changed_when: false
 
