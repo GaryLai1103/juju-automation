@@ -569,8 +569,9 @@
         EOF
     
         echo "[INFO] values head:"
-        head -n 200 /tmp/slurm-values.yaml
+        head -n 220 /tmp/slurm-values.yaml
     
+        echo
         echo "[INFO] Ensure yq in /tmp (no root needed)..."
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
@@ -578,7 +579,8 @@
         fi
         /tmp/yq --version
     
-        echo "[INFO] Write helm post-renderer to force probes tcpSocket..."
+        echo
+        echo "[INFO] Write helm post-renderer (move initContainers->containers + force probes tcpSocket)..."
         cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
         set -euo pipefail
@@ -590,7 +592,26 @@
     
         cat > "$in"
     
-        "$YQ" eval-all -i '
+        # -----------------------------
+        # FIX #1: slurm-controller initContainers 永遠跑不完
+        # => 必須搬到 containers (sidecar) 才能讓 slurmctld 啟動
+        # -----------------------------
+        "$YQ" eval -i '
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers
+          ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.initContainers
+          )
+          |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.initContainers
+          ) = []
+        ' "$in"
+    
+        # -----------------------------
+        # FIX #2: probes 強制改 tcpSocket，避免 httpGet 卡住
+        # -----------------------------
+        "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers[] | select(.name=="slurmctld")
           ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
@@ -617,19 +638,18 @@
         SH
         chmod +x /tmp/slurm-post-renderer.sh
     
+        echo
         echo "[INFO] Wait slurm-operator webhook ready (avoid TLS not yet valid)..."
-        # 先等 webhook deployment ready
         for i in 1 2 3 4 5 6; do
           if kubectl -n slinky get deploy slurm-operator-webhook >/dev/null 2>&1; then
             kubectl -n slinky rollout status deploy/slurm-operator-webhook --timeout=60s && break || true
           fi
           sleep 5
         done
-        # 你遇到的是 notBefore 差幾秒，額外再等一下跨過它
         sleep 5
     
+        echo
         echo "[INFO] Helm upgrade/install (with post-renderer)..."
-        # notBefore 仍可能差幾秒，做 retry 最保險
         for try in 1 2 3 4 5; do
           set +e
           helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
@@ -641,15 +661,22 @@
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
+            echo "[INFO] helm success"
             break
           fi
           echo "[WARN] helm failed (try=$try rc=$rc), sleep 5s then retry..."
           sleep 5
         done
     
+        echo
         echo "[INFO] Verify probes rendered in manifest:"
         helm -n "$NS" get manifest slurm | egrep -n "kind: StatefulSet|name: slurm-controller|startupProbe:|readinessProbe:|livenessProbe:|httpGet:|tcpSocket:" | head -n 260
     
+        echo
+        echo "[INFO] Verify slurm-controller has NO initContainers (must be empty):"
+        kubectl -n "$NS" get sts slurm-controller -o jsonpath='init={.spec.template.spec.initContainers[*].name}{"\n"}containers={.spec.template.spec.containers[*].name}{"\n"}'
+    
+        echo
         echo "[INFO] Pods:"
         kubectl -n "$NS" get pods -o wide
         EOS
