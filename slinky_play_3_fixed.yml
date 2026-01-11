@@ -101,18 +101,18 @@
     # -----------------------------------------------------------
     # 0) Reset (two-mode)
     # -----------------------------------------------------------
-    - name: 2.2 Fix kubeconfig API server endpoint (force IPv4, avoid [::1])
+    - name: 0.0 Fix kubeconfig API server endpoint (force IPv4, avoid [::1])
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set -euo pipefail
-    
+
           # Ensure a usable kubeconfig exists for helm/kubectl on machine0
           mkdir -p ~/.kube
           if [ -f /etc/kubernetes/admin.conf ]; then
             sudo cp /etc/kubernetes/admin.conf ~/.kube/config
             sudo chown $(id -u):$(id -g) ~/.kube/config
           fi
-    
+
           # Replace IPv6 loopback / localhost with IPv4 loopback
           for f in /etc/kubernetes/admin.conf ~/.kube/config; do
             [ -f "$f" ] || continue
@@ -121,9 +121,9 @@
               -e "s#server: https://localhost:6443#server: https://127.0.0.1:6443#g" \
               "$f" || true
           done
-    
+
           echo "[INFO] kubectl server:"
-          kubectl config view --minify -o jsonpath="{{.clusters[0].cluster.server}}{{\"\\n\"}}" || true
+          kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}{\"\\n\"}" || true
         '
       changed_when: false
 
