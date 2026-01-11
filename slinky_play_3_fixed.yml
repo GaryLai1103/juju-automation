@@ -262,50 +262,37 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix Recursive Permissions)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Force Helm Config)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
         # --- [CRITICAL FIX START] ---
         echo "[FIX] Ensuring ~/.kube directory ownership & IPv4 endpoint..."
-
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
 
+        # 1. 修復檔案權限與內容 (這部分已經驗證成功)
         if [ -d "$KUBE_DIR" ]; then
-            # 1. 搶回整個目錄的擁有權 (Fix Directory Permission Denied)
-            # 這是解決 "sed: couldn't open temporary file" 的關鍵
             sudo chown -R $(id -u):$(id -g) "$KUBE_DIR"
-            
             if [ -f "$USER_CONF" ]; then
-                echo " -> Found user config: $USER_CONF"
                 sudo chmod 600 "$USER_CONF"
-
-                # 2. 修改內容 (Fix IPv6 -> IPv4)
                 sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
                 sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
             fi
-        else
-             echo " [WARN] ~/.kube directory not found."
-        fi
-
-        # 3. 如果系統層級的 admin.conf 存在，順便修補它
-        SYS_CONF="/etc/kubernetes/admin.conf"
-        if [ -f "$SYS_CONF" ]; then
-            echo " -> Found system config: $SYS_CONF"
-            sudo sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$SYS_CONF"
-            sudo sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$SYS_CONF"
         fi
         
-        # 驗證一下
-        echo "[INFO] Current Cluster Server endpoint:"
-        kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}" || echo "Error reading config"
+        # 2. 為了確保 Helm 吃到正確設定，我們明確匯出變數
+        export KUBECONFIG="$USER_CONF"
+        
+        echo "[INFO] Current Cluster Server endpoint (via kubectl):"
+        kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}"
         echo
         # --- [CRITICAL FIX END] ---
 
-        helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
-        helm repo update >/dev/null 2>&1
+        # 3. 強制 Helm 使用該 Config
+        helm --kubeconfig "$USER_CONF" repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
+        helm --kubeconfig "$USER_CONF" repo update >/dev/null 2>&1
 
         f=/tmp/nfs-values.yaml
         cat > "$f" <<EOF
@@ -320,7 +307,8 @@
         EOF
 
         echo "[INFO] Helm install NFS provisioner..."
-        helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+        # 這裡也加上 --kubeconfig 確保萬無一失
+        helm --kubeconfig "$USER_CONF" upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
           -n {{ ns_nfs }} --create-namespace \
           -f "$f"
 
