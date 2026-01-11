@@ -253,31 +253,53 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm (values file via printf)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm (values file via printf) [force IPv4 kubeconfig + no bash -lc quoting]
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
-          helm repo update >/dev/null 2>&1
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
 
-          f=/tmp/nfs-values.yaml
-          : > $f
-          printf "nfs:\n" >> $f
-          printf "  server: %s\n" "{{ nfs_server_ip }}" >> $f
-          printf "  path: %s\n" "{{ nfs_export_path }}" >> $f
-          printf "storageClass:\n" >> $f
-          printf "  name: %s\n" "{{ nfs_storageclass }}" >> $f
-          printf "  defaultClass: %s\n" "{{ (nfs_make_default_sc | bool) | lower }}" >> $f
-          printf "  reclaimPolicy: Delete\n" >> $f
-          printf "  archiveOnDelete: true\n" >> $f
+        # --- Force kubeconfig to use IPv4 loopback (avoid [::1]) ---
+        mkdir -p ~/.kube
+        if [ -f /etc/kubernetes/admin.conf ]; then
+          sudo cp /etc/kubernetes/admin.conf ~/.kube/config
+          sudo chown $(id -u):$(id -g) ~/.kube/config
+        fi
 
-          helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-            -n {{ ns_nfs }} --create-namespace \
-            -f $f
+        # Replace IPv6 loopback / localhost with IPv4 loopback
+        for f in /etc/kubernetes/admin.conf ~/.kube/config; do
+          [ -f "$f" ] || continue
+          sudo sed -i \
+            -e "s#server: https://\\[::1\\]:6443#server: https://127.0.0.1:6443#g" \
+            -e "s#server: https://localhost:6443#server: https://127.0.0.1:6443#g" \
+            "$f" || true
+        done
 
-          echo "[INFO] storageclass:"
-          kubectl get sc | sed -n "1,120p"
-        '
+        export KUBECONFIG="$HOME/.kube/config"
+        echo "[INFO] kubeconfig server => $(kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}")"
+
+        # --- Original logic (unchanged) ---
+        helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
+
+        f=/tmp/nfs-values.yaml
+        : > "$f"
+        printf "nfs:\n" >> "$f"
+        printf "  server: %s\n" "{{ nfs_server_ip }}" >> "$f"
+        printf "  path: %s\n" "{{ nfs_export_path }}" >> "$f"
+        printf "storageClass:\n" >> "$f"
+        printf "  name: %s\n" "{{ nfs_storageclass }}" >> "$f"
+        printf "  defaultClass: %s\n" "{{ (nfs_make_default_sc | bool) | lower }}" >> "$f"
+        printf "  reclaimPolicy: Delete\n" >> "$f"
+        printf "  archiveOnDelete: true\n" >> "$f"
+
+        # Use explicit kubeconfig to avoid picking wrong context
+        helm --kubeconfig "$KUBECONFIG" upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+          -n {{ ns_nfs }} --create-namespace \
+          -f "$f"
+
+        echo "[INFO] storageclass:"
+        kubectl --kubeconfig "$KUBECONFIG" get sc | sed -n "1,120p"
+        EOS
       changed_when: true
 
     - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - robust
