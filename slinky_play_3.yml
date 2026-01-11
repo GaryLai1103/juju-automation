@@ -129,13 +129,15 @@
       when: reset_before_install | bool
       changed_when: true
 
-    - name: 0.3 Reset (cluster-scoped webhooks for slurm-operator only)
+    - name: 0.3 Reset (cluster-scoped MUTATING webhooks for slurm-operator only) - keep validating
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
           set +e
+          echo "[RESET] delete MUTATING webhook configs for slurm-operator (keep validating)..."
           kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
-          kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
+          echo "== mutatingwebhookconfigurations (filtered) =="
           kubectl get mutatingwebhookconfigurations | egrep -i "slurm|slinky|operator|webhook" || true
+          echo "== validatingwebhookconfigurations (filtered) =="
           kubectl get validatingwebhookconfigurations | egrep -i "slurm|slinky|operator|webhook" || true
         '
       when: reset_before_install | bool
@@ -541,59 +543,62 @@
         NS="{{ ns_slurm_operator }}"
         VER="{{ slurm_operator_chart_ver }}"
         CP="{{ controlplane_hostname }}"
-    
+
         cat > /tmp/slurm-operator-values.yaml <<EOF
-    operator:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/hostname
-                operator: In
-                values:
-                - ${CP}
-      tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
-      - key: node-role.kubernetes.io/master
-        operator: Exists
-        effect: NoSchedule
-    
-    webhook:
-      enabled: true
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/hostname
-                operator: In
-                values:
-                - ${CP}
-      tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
-      - key: node-role.kubernetes.io/master
-        operator: Exists
-        effect: NoSchedule
-    EOF
-    
+operator:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - ${CP}
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: node-role.kubernetes.io/master
+    operator: Exists
+    effect: NoSchedule
+
+webhook:
+  enabled: true
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - ${CP}
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: node-role.kubernetes.io/master
+    operator: Exists
+    effect: NoSchedule
+EOF
+
+        echo "== /tmp/slurm-operator-values.yaml =="
+        sed -n "1,200p" /tmp/slurm-operator-values.yaml
+
         helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
           -n "$NS" --create-namespace \
           --version "$VER" \
           -f /tmp/slurm-operator-values.yaml
-    
-        # 你剛剛 240s timeout，其實拉長就穩了
+
         kubectl -n "$NS" rollout status deploy/slurm-operator --timeout=600s
-        kubectl -n "$NS" rollout status deploy/slurm-operator-webhook --timeout=600s || true
-    
+        kubectl -n "$NS" rollout status deploy/slurm-operator-webhook --timeout=600s
+
         echo "== operator pods =="
         kubectl -n "$NS" get pod -o wide
         EOS
       changed_when: true
+
 
     - name: 7.4 Wait for Slurm Operator Webhook endpoints (robust)
       shell: |
@@ -641,161 +646,185 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Operator Alive + Webhook Disabled (Helm-managed) + Robust Wait
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Version A (Webhook required + Endpoints gate + REMOVE mutating webhooks) + Robust Wait
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-    
+
         NS="{{ ns_slurm }}"
         OPNS="{{ ns_slurm_operator }}"
         CHART_VER="{{ slurm_chart_ver }}"
-        OP_VER="{{ slurm_operator_chart_ver }}"
-    
+
         # --- [STEP 1] values.yaml (保持不變) ---
         echo "[INFO] Write values.yaml ..."
         cat > /tmp/slurm-values.yaml <<EOF
-        controller:
-          persistence:
-            enabled: true
-            storageClassName: "{{ nfs_storageclass }}"
-            accessModes:
-              - ReadWriteOnce
-            resources:
-              requests:
-                storage: 10Gi
-          extraConf: |
-            GresTypes=gpu
-          podSpec:
-            nodeSelector:
-              kubernetes.io/hostname: {{ controlplane_hostname }}
-              kubernetes.io/os: linux
-            tolerations:
-              - key: node-role.kubernetes.io/control-plane
-                operator: Exists
-                effect: NoSchedule
-              - key: node-role.kubernetes.io/master
-                operator: Exists
-                effect: NoSchedule
-        restapi:
-          replicas: 1
-          podSpec:
-            nodeSelector:
-              kubernetes.io/hostname: {{ controlplane_hostname }}
-              kubernetes.io/os: linux
-            tolerations:
-              - key: node-role.kubernetes.io/control-plane
-                operator: Exists
-                effect: NoSchedule
-        nodesets:
-          slinky:
-            enabled: true
-            partition:
-              enabled: false
-            useResourceLimits: true
-            podSpec:
-              nodeSelector:
-                kubernetes.io/hostname: {{ gpu_node_hostname }}
-                kubernetes.io/os: linux
-              tolerations:
-                - key: {{ gpu_taint_key }}
-                  operator: Equal
-                  value: "{{ gpu_taint_value }}"
-                  effect: NoSchedule
-            slurmd:
-              resources:
-                limits:
-                  nvidia.com/gpu: {{ slurm_gpu_count }}
-              args:
-                - --conf
-                - Gres=gpu:{{ slurm_gpu_count }}
-        partitions:
-          all:
-            enabled: true
-            nodesets: [ALL]
-            configMap:
-              Default: "YES"
-              MaxTime: UNLIMITED
-              State: UP
-          slinky:
-            enabled: true
-            nodesets: [ALL]
-            configMap:
-              Default: "NO"
-              MaxTime: UNLIMITED
-              State: UP
-        configFiles:
-          gres.conf: |
-            AutoDetect=nvidia
-        EOF
-    
-        # --- [STEP 2] tools + post-renderer (保留：即使 CR-only 也安全 no-op) ---
+controller:
+  persistence:
+    enabled: true
+    storageClassName: "{{ nfs_storageclass }}"
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+  extraConf: |
+    GresTypes=gpu
+  podSpec:
+    nodeSelector:
+      kubernetes.io/hostname: {{ controlplane_hostname }}
+      kubernetes.io/os: linux
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+restapi:
+  replicas: 1
+  podSpec:
+    nodeSelector:
+      kubernetes.io/hostname: {{ controlplane_hostname }}
+      kubernetes.io/os: linux
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+nodesets:
+  slinky:
+    enabled: true
+    partition:
+      enabled: false
+    useResourceLimits: true
+    podSpec:
+      nodeSelector:
+        kubernetes.io/hostname: {{ gpu_node_hostname }}
+        kubernetes.io/os: linux
+      tolerations:
+        - key: {{ gpu_taint_key }}
+          operator: Equal
+          value: "{{ gpu_taint_value }}"
+          effect: NoSchedule
+    slurmd:
+      resources:
+        limits:
+          nvidia.com/gpu: {{ slurm_gpu_count }}
+      args:
+        - --conf
+        - Gres=gpu:{{ slurm_gpu_count }}
+partitions:
+  all:
+    enabled: true
+    nodesets: [ALL]
+    configMap:
+      Default: "YES"
+      MaxTime: UNLIMITED
+      State: UP
+  slinky:
+    enabled: true
+    nodesets: [ALL]
+    configMap:
+      Default: "NO"
+      MaxTime: UNLIMITED
+      State: UP
+configFiles:
+  gres.conf: |
+    AutoDetect=nvidia
+EOF
+
+        # --- [STEP 2] post-renderer (保留：即使 CR-only 也安全 no-op) ---
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
         fi
-        
+
         cat > /tmp/slurm-post-renderer.sh <<'SH'
-        #!/usr/bin/env bash
-        set -euo pipefail
-        YQ="/tmp/yq"
-        tmpdir="$(mktemp -d)"
-        trap 'rm -rf "$tmpdir"' EXIT
-        in="$tmpdir/in.yaml"
-        cat > "$in"
-        
-        "$YQ" eval -i '
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers
-          ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.initContainers
-          )
-          |
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.initContainers
-          ) = []
-        ' "$in" || true
-        
-        "$YQ" eval -i '
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers[] | select(.name=="slurmctld")
-          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
-          |
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers[] | select(.name=="slurmctld")
-          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1}
-          |
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers[] | select(.name=="slurmctld")
-          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
-        ' "$in" || true
-        
-        cat "$in"
-        SH
+#!/usr/bin/env bash
+set -euo pipefail
+YQ="/tmp/yq"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+in="$tmpdir/in.yaml"
+cat > "$in"
+
+# Move initContainers into containers (best-effort)
+"$YQ" eval -i '
+  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+    .spec.template.spec.containers
+  ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+    .spec.template.spec.initContainers
+  )
+  |
+  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+    .spec.template.spec.initContainers
+  ) = []
+' "$in" || true
+
+# Add probes (best-effort)
+"$YQ" eval -i '
+  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+    .spec.template.spec.containers[] | select(.name=="slurmctld")
+  ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
+  |
+  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+    .spec.template.spec.containers[] | select(.name=="slurmctld")
+  ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1}
+  |
+  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+    .spec.template.spec.containers[] | select(.name=="slurmctld")
+  ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
+' "$in" || true
+
+cat "$in"
+SH
         chmod +x /tmp/slurm-post-renderer.sh
-        
-        # --- [STEP 3] 版本A關鍵：Webhook 必須存在且 endpoints ready ---
-        echo "[GATE] Ensure operator + webhook are Running and endpoints ready..."
-        kubectl -n "$OPNS" rollout status deploy/slurm-operator --timeout=240s
-        kubectl -n "$OPNS" rollout status deploy/slurm-operator-webhook --timeout=240s
-        
+
+        # --- [STEP 3] Gate: operator + webhook 必須 ready，且 webhook endpoints 必須 ready（fail-fast）---
+        echo "[GATE] Ensure operator + webhook are Ready..."
+        kubectl -n "$OPNS" rollout status deploy/slurm-operator --timeout=600s
+        kubectl -n "$OPNS" rollout status deploy/slurm-operator-webhook --timeout=600s
+
+        echo "[GATE] Discover webhook service..."
         SVC=$(kubectl -n "$OPNS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2 || true)
         if [ -z "$SVC" ]; then
           echo "❌ webhook service not found in ns=$OPNS"
           kubectl -n "$OPNS" get svc -o wide || true
           exit 1
         fi
-        
+        echo "[GATE] webhook svc=$SVC"
+
+        READY_EP=""
         for i in {1..60}; do
           EP=$(kubectl -n "$OPNS" get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
           if [ -n "$EP" ]; then
+            READY_EP="$EP"
             echo "✅ webhook endpoints ready: $EP"
             break
           fi
           echo "⏳ waiting webhook endpoints... ($i/60)"
           sleep 5
         done
-        
-        # --- [STEP 4] Helm 安裝 slurm chart (operator/webhook 都活著的情況) ---
+
+        if [ -z "$READY_EP" ]; then
+          echo "❌ webhook endpoints NOT ready, stop here."
+          kubectl -n "$OPNS" get pods,svc,ep -o wide || true
+          kubectl -n "$OPNS" get events --sort-by=.lastTimestamp | tail -n 80 || true
+          exit 1
+        fi
+
+        # --- [STEP 3.5] Version A 核心：保留 webhook pod/service/endpoints，但移除 MutatingWebhookConfiguration ---
+        echo "[PATCH] Remove mutating webhooks (keep webhook pod/service alive)..."
+
+        echo "== mutatingwebhookconfigurations (before) =="
+        kubectl get mutatingwebhookconfigurations | egrep -i "slurm|slinky|operator|webhook" || true
+
+        kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
+        kubectl get mutatingwebhookconfigurations -o name | egrep -i "slurm|slinky|operator|webhook" | xargs -r kubectl delete --ignore-not-found=true
+
+        echo "== mutatingwebhookconfigurations (after) =="
+        kubectl get mutatingwebhookconfigurations | egrep -i "slurm|slinky|operator|webhook" || true
+
+        # --- [STEP 4] Helm 安裝 slurm chart ---
         echo "[INFO] Helm upgrade/install slurm ..."
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
           -n "$NS" --create-namespace \
@@ -803,14 +832,14 @@
           -f /tmp/slurm-values.yaml \
           --post-renderer /tmp/slurm-post-renderer.sh \
           --wait --timeout=600s
-        
+
         echo "[INFO] Helm success."
-        
-        # --- [STEP 5] 等待 operator 產生 workloads，並在卡 init 時輸出關鍵 log ---
+
+        # --- [STEP 5] 等待 controller pod 出現；若卡 init 直接吐 init logs ---
         echo
         echo "== slurm ns objects =="
         kubectl -n "$NS" get all 2>/dev/null || true
-        
+
         echo
         echo "[WAIT] wait controller pod to appear..."
         for i in {1..120}; do
@@ -821,11 +850,11 @@
           echo "⏳ waiting controller pod... ($i/120)"
           sleep 5
         done
-        
+
         echo
         echo "== pods =="
         kubectl -n "$NS" get pods -o wide || true
-        
+
         CTL_POD=$(kubectl -n "$NS" get pod -o name | grep -E "slurm-controller" | head -n1 | cut -d/ -f2 || true)
         if [ -z "$CTL_POD" ]; then
           echo "❌ controller pod not found; show events + operator logs"
@@ -833,22 +862,23 @@
           kubectl -n "$OPNS" logs deploy/slurm-operator --tail=200 || true
           exit 1
         fi
-        
+
         echo
         echo "[INFO] controller pod=$CTL_POD"
-        kubectl -n "$NS" describe pod "$CTL_POD" | egrep -n "Init Containers:|Containers:|Events:" -A120 || true
-        
-        # 如果卡在 init：直接吐 init container logs（你最需要的資訊）
+        kubectl -n "$NS" describe pod "$CTL_POD" | egrep -n "Init Containers:|Containers:|Events:" -A160 || true
+
+        # 如果 init container 有在跑（常見卡住），直接吐 log
         if kubectl -n "$NS" get pod "$CTL_POD" -o jsonpath='{.status.initContainerStatuses[*].state.running.startedAt}' 2>/dev/null | grep -q .; then
           echo
           echo "⚠️ init containers are running (may be stuck). Dump init logs:"
           kubectl -n "$NS" logs "$CTL_POD" -c reconfigure --tail=200 || true
           kubectl -n "$NS" logs "$CTL_POD" -c logfile     --tail=200 || true
         fi
-        
+
         echo "[DONE] 8.2 (Version A) finished."
         EOS
       changed_when: true
+
       
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
