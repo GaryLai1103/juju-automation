@@ -262,32 +262,35 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix Permissions & IPv4)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix Recursive Permissions)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
         # --- [CRITICAL FIX START] ---
-        echo "[FIX] Ensuring ~/.kube/config ownership & IPv4 endpoint..."
+        echo "[FIX] Ensuring ~/.kube directory ownership & IPv4 endpoint..."
 
-        USER_CONF="$HOME/.kube/config"
+        KUBE_DIR="$HOME/.kube"
+        USER_CONF="$KUBE_DIR/config"
 
-        if [ -f "$USER_CONF" ]; then
-            echo " -> Found user config: $USER_CONF"
+        if [ -d "$KUBE_DIR" ]; then
+            # 1. 搶回整個目錄的擁有權 (Fix Directory Permission Denied)
+            # 這是解決 "sed: couldn't open temporary file" 的關鍵
+            sudo chown -R $(id -u):$(id -g) "$KUBE_DIR"
             
-            # 1. 搶回擁有權 (Fix Permission Denied)
-            # 確保檔案屬於當前 user:group，而不是 root
-            sudo chown $(id -u):$(id -g) "$USER_CONF"
-            sudo chmod 600 "$USER_CONF"
+            if [ -f "$USER_CONF" ]; then
+                echo " -> Found user config: $USER_CONF"
+                sudo chmod 600 "$USER_CONF"
 
-            # 2. 修改內容 (Fix IPv6 -> IPv4)
-            sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
-            sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+                # 2. 修改內容 (Fix IPv6 -> IPv4)
+                sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+                sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+            fi
         else
-            echo " [WARN] User kubeconfig not found at $USER_CONF"
+             echo " [WARN] ~/.kube directory not found."
         fi
 
-        # 3. 如果系統層級的 admin.conf 存在，順便修補它 (需要 sudo)
+        # 3. 如果系統層級的 admin.conf 存在，順便修補它
         SYS_CONF="/etc/kubernetes/admin.conf"
         if [ -f "$SYS_CONF" ]; then
             echo " -> Found system config: $SYS_CONF"
