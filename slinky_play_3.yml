@@ -840,7 +840,55 @@
         # --- Install slurm chart ---
         echo "[INFO] Helm upgrade/install slurm ..."
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-          -n "$NS" --create-namespace
+          -n "$NS" --create-namespace \
+          --version "$CHART_VER" \
+          -f /tmp/slurm-values.yaml \
+          --post-renderer /tmp/slurm-post-renderer.sh \
+          --wait --timeout=600s
+    
+        echo "[INFO] Helm success."
+    
+        echo
+        echo "== slurm ns objects =="
+        kubectl -n "$NS" get all -o wide || true
+    
+        echo
+        echo "[WAIT] wait controller pod to appear..."
+        for i in {1..120}; do
+          if kubectl -n "$NS" get pod -o name 2>/dev/null | grep -q "slurm-controller"; then
+            echo "✅ controller pod appeared"
+            break
+          fi
+          echo "⏳ waiting controller pod... ($i/120)"
+          sleep 5
+        done
+    
+        echo
+        echo "== pods =="
+        kubectl -n "$NS" get pods -o wide || true
+    
+        CTL_POD=$(kubectl -n "$NS" get pod -o name | grep -E "slurm-controller" | head -n1 | cut -d/ -f2 || true)
+        if [ -z "$CTL_POD" ]; then
+          echo "❌ controller pod not found; show events + operator logs"
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 80 || true
+          kubectl -n "$OPNS" logs deploy/slurm-operator --tail=200 || true
+          exit 1
+        fi
+    
+        echo
+        echo "[INFO] controller pod=$CTL_POD"
+        kubectl -n "$NS" describe pod "$CTL_POD" | egrep -n "Init Containers:|Containers:|Events:" -A160 || true
+    
+        if kubectl -n "$NS" get pod "$CTL_POD" -o jsonpath='{.status.initContainerStatuses[*].state.running.startedAt}' 2>/dev/null | grep -q .; then
+          echo
+          echo "⚠️ init containers are running (may be stuck). Dump init logs:"
+          kubectl -n "$NS" logs "$CTL_POD" -c reconfigure --tail=200 || true
+          kubectl -n "$NS" logs "$CTL_POD" -c logfile     --tail=200 || true
+        fi
+    
+        echo "[DONE] 8.2 (Version A) finished."
+        EOS
+      changed_when: true
 
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
