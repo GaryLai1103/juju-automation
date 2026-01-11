@@ -508,16 +508,31 @@
         '
       changed_when: true
 
-    - name: 7.3 Install/upgrade slurm-operator (OCI)
+    - name: 7.3 Install/upgrade slurm-operator (OCI) - Extended Timeout
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
-            -n {{ ns_slurm_operator }} --create-namespace \
-            --version {{ slurm_operator_chart_ver }}
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        
+        NS="{{ ns_slurm_operator }}"
+        VER="{{ slurm_operator_chart_ver }}"
+        
+        echo "[INFO] Helm upgrade/install slurm-operator..."
+        # 注意：這裡將 --timeout 增加到 600s 以容忍 IPv6 fallback 的延遲
+        helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
+            -n "$NS" --create-namespace \
+            --version "$VER"
 
-          kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator --timeout=240s
-        '
+        echo "[INFO] Waiting for rollout to finish (timeout=600s)..."
+        if ! kubectl -n "$NS" rollout status deploy/slurm-operator --timeout=600s; then
+            echo
+            echo "❌ Rollout Failed! Debugging Info:"
+            kubectl -n "$NS" get pods -o wide
+            kubectl -n "$NS" get events --sort-by='.lastTimestamp' | tail -n 20
+            exit 1
+        fi
+        
+        echo "✅ Slurm Operator is Ready"
+        EOS
       changed_when: true
 
     - name: 7.4 Wait for Slurm Operator Webhook endpoints (robust)
