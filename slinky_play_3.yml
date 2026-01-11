@@ -16,7 +16,6 @@
 #   - Partitions do NOT depend on Feature
 #   - Device-plugin MUST toleration + nodeSelector; also clear affinity to avoid NFD dependency
 # ========================================================
-
 - name: Application Layer - Deploy Slinky Slurm on K8s (Standardized Merged)
   hosts: maasjuju
   gather_facts: yes
