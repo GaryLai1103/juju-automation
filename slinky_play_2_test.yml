@@ -285,13 +285,20 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5. NVIDIA Plugin
+    # 5. NVIDIA Plugin (Fixed: Zombie Webhook Cleanup)
     # -----------------------------------------------------------
-    - name: 5.2 Install NVIDIA Device Plugin
+    - name: 5.2 Install NVIDIA Device Plugin (Zombie Webhook Cleanup)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
+        
+        # [CRITICAL FIX] 暴力搜尋並刪除所有 NVIDIA 相關的 Webhooks
+        # 因為殘留的 Webhook 會導致 API Server 在建立資源時卡死 30 秒然後超時
+        echo "[FIX] Hunting down zombie NVIDIA webhooks..."
+        kubectl get validatingwebhookconfigurations -o name | grep -i "nvidia" | xargs -r kubectl delete
+        kubectl get mutatingwebhookconfigurations -o name   | grep -i "nvidia" | xargs -r kubectl delete
+
+        # 標準 Helm 安裝流程
         helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
@@ -314,6 +321,7 @@
           effect: NoSchedule
         EOF
 
+        echo "[INFO] Installing NVIDIA Device Plugin..."
         helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
           -n {{ ns_nvidia }} --create-namespace \
           --reset-values -f /tmp/nvidia-values.yaml \
