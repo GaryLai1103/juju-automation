@@ -560,7 +560,7 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - With Webhook Bypass
+    - name: 8.2 Install/upgrade slurm chart (OCI) - With Webhook Bypass (Fixed Validating)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -568,10 +568,7 @@
         NS="{{ ns_slurm }}"
         CHART_VER="{{ slurm_chart_ver }}"
         
-        # --- [STEP 1~3] 保持不變 (values.yaml, yq, post-renderer) ---
-        # (這裡省略 STEP 1~3 的程式碼，請直接保留你原本的內容)
-        # ...
-        
+        # --- [STEP 1] 準備 values.yaml ---
         echo "[INFO] Write values.yaml ..."
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
@@ -648,11 +645,13 @@
             AutoDetect=nvidia
         EOF
         
+        # --- [STEP 2] 準備工具 ---
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
         fi
         
+        # --- [STEP 3] 準備 Post-Renderer ---
         cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
         set -euo pipefail
@@ -661,6 +660,8 @@
         trap 'rm -rf "$tmpdir"' EXIT
         in="$tmpdir/in.yaml"
         cat > "$in"
+        
+        # 1. Move Init to Sidecar
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers
@@ -672,6 +673,8 @@
             .spec.template.spec.initContainers
           ) = []
         ' "$in"
+        
+        # 2. Fix Probes
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers[] | select(.name=="slurmctld")
@@ -685,10 +688,11 @@
             .spec.template.spec.containers[] | select(.name=="slurmctld")
           ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
         ' "$in"
+        
         cat "$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
-
+        
         # --- [STEP 4] 關鍵修正：刺殺 Webhook (Bypass Admission Controller) ---
         echo "[KILL] Stopping Webhook & Operator to prevent interference..."
         kubectl -n slinky scale deploy slurm-operator --replicas=0
@@ -700,7 +704,7 @@
         kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
         kubectl delete mutatingwebhookconfigurations slurm-operator-webhook --ignore-not-found=true
         
-        # 2. [新增] 刪除 Validating (驗證型) - 這就是剛剛報錯的元兇
+        # 2. [新增] 刪除 Validating (驗證型) - 這就是你剛才缺少的關鍵！
         kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
         kubectl delete validatingwebhookconfigurations slurm-operator-webhook --ignore-not-found=true
         
@@ -708,6 +712,7 @@
         
         # --- [STEP 5] 執行 Helm 安裝 (現在沒有人會攔截我們了) ---
         echo "[INFO] Helm upgrade/install (Bypassing Webhook)..."
+        # 這裡不需要迴圈重試了，因為干擾源已經沒了
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n "$NS" --create-namespace \
             --version "$CHART_VER" \
@@ -727,7 +732,7 @@
         kubectl -n "$NS" get pods -o wide
         
         # --- [STEP 7] (選擇性) 恢復 Operator ---
-        # 這裡只恢復 Operator，千萬不要恢復 Webhook，不然 ValidatingWebhookConfiguration 又會被建立起來
+        # 建議先不要恢復 webhook，只恢復 operator 即可
         echo "[RESTORE] Scaling up Operator only..."
         kubectl -n slinky scale deploy slurm-operator --replicas=1
         EOS
