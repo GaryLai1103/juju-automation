@@ -20,7 +20,7 @@
 - name: Application Layer - Deploy Slinky Slurm on K8s (Standardized Merged)
   hosts: maasjuju
   gather_facts: yes
-  vars:
+  vars:
     # ---- Mode ----
     reset_before_install: true
 
