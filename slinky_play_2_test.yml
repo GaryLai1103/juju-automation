@@ -521,9 +521,25 @@
           echo "[INFO] Restarting pods..."
           kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true --wait=true
           kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true --wait=true
-          sleep 10
+          
+          echo "[INFO] Waiting for Controller to be Ready..."
+          # Controller 通常比較快，直接等 Ready
           kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
+
+          echo "[INFO] Waiting for Worker to be Created..."
+          # [FIX] 先循環等待 Worker Pod 出現，避免 "NotFound" 錯誤
+          for i in {1..60}; do
+             if kubectl -n {{ ns_slurm }} get pod slurm-worker-slinky-0 >/dev/null 2>&1; then
+                echo " -> Worker Pod created!"
+                break
+             fi
+             echo " -> Waiting for worker creation..."
+             sleep 3
+          done
+          
+          echo "[INFO] Waiting for Worker to be Ready..."
           kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
+          
           echo "🎉 All Pods Ready!"
         EOS
       changed_when: true
