@@ -1,208 +1,16 @@
 ---
-# ==========================================
-# SKU: Slinky-K8s-v1.7-AWX-Optimized
-# 特點：
-#   1. AWX 友善：使用 Bash Loop 取代 Ansible Retries，大幅減少 Log 雜訊
-#   2. 零干擾：完全不動 maasjuju 本機環境 (kubectl 都在遠端跑)
-#   3. 黃金版：包含 IPv6 Disable、Repo Fix、Process Kill 等所有修復
-# ==========================================
-
-- name: 1. Infrastructure - Deploy Modern Charmed Kubernetes
-  hosts: maasjuju
-  gather_facts: yes
-  vars:
-    test_model: "slinky-cluster"
-    k8s_channel: "1.31/stable"
-    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-modern.yaml"
-
-  tasks:
-    # -----------------------------------------------------------
-    # 1. 環境清理與建立
-    # -----------------------------------------------------------
-    - name: 1.0 強制清理舊模型
-      command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
-      register: destroy_result
-      failed_when: 
-        - destroy_result.rc != 0 
-        - '"not found" not in destroy_result.stderr'
-      ignore_errors: yes
-
-    - name: 1.1 等待模型釋放
-      pause:
-        seconds: 15
-
-    - name: 1.2 建立全新 Juju Model
-      shell: juju add-model {{ test_model }}
-
-    # -----------------------------------------------------------
-    # 2. 製作藍圖 & 部署
-    # -----------------------------------------------------------
-    - name: 2.1 產生本地 Bundle 檔案
-      copy:
-        dest: "{{ bundle_path }}"
-        mode: '0644'
-        content: |
-          description: Slinky Modern K8s Cluster
-          base: ubuntu@22.04
-          machines:
-            "0":
-              constraints: tags=virtual
-            "1":
-              constraints: tags=slurm-node
-          applications:
-            easyrsa:
-              charm: easyrsa
-              channel: latest/stable
-              num_units: 1
-              to: ["0"]
-            etcd:
-              charm: etcd
-              channel: latest/stable
-              num_units: 1
-              to: ["0"]
-            kubernetes-control-plane:
-              charm: kubernetes-control-plane
-              channel: {{ k8s_channel }}
-              num_units: 1
-              to: ["0"]
-              options:
-                allow-privileged: "true"
-            kubernetes-worker:
-              charm: kubernetes-worker
-              channel: {{ k8s_channel }}
-              num_units: 1
-              to: ["1"]
-              expose: true
-            calico:
-              charm: calico
-              channel: latest/stable
-            containerd:
-              charm: containerd
-              channel: latest/stable
-          relations:
-            - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
-            - ["kubernetes-control-plane:certificates", "easyrsa:client"]
-            - ["etcd:certificates", "easyrsa:client"]
-            - ["kubernetes-control-plane:etcd", "etcd:db"]
-            - ["kubernetes-worker:certificates", "easyrsa:client"]
-            - ["calico:etcd", "etcd:db"]
-            - ["calico:cni", "kubernetes-control-plane:cni"]
-            - ["calico:cni", "kubernetes-worker:cni"]
-            - ["containerd:containerd", "kubernetes-worker:container-runtime"]
-            - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
-
-    - name: 2.2 部署 Bundle
-      shell: |
-        juju deploy {{ bundle_path }} --model {{ test_model }} --trust
-      register: deploy_out
-      until: deploy_out.rc == 0
-      retries: 3
-      delay: 10
-
-    # -----------------------------------------------------------
-    # 3. 基礎設施監控 (AWX 靜音版)
-    # -----------------------------------------------------------
-    - name: 3.1 等待 Juju 應用程式 Active (Bash Loop, AWX Quiet)
-      shell: |
-        echo "⏳ 開始監控 Juju 部署狀態 (Timeout: 45min)..."
-        # 迴圈 540 次 * 5秒 = 45分鐘
-        for i in {1..540}; do
-          # 抓取狀態 JSON
-          JSON=$(juju status --model {{ test_model }} --format json)
-          
-          # 解析各組件狀態
-          CP=$(echo "$JSON" | jq -r '.applications["kubernetes-control-plane"]["application-status"].current // "unknown"')
-          WK=$(echo "$JSON" | jq -r '.applications["kubernetes-worker"]["application-status"].current // "unknown"')
-          CA=$(echo "$JSON" | jq -r '.applications["calico"]["application-status"].current // "unknown"')
-          CD=$(echo "$JSON" | jq -r '.applications["containerd"]["application-status"].current // "unknown"')
-          
-          # 判斷是否全部 Ready
-          if [[ "$CP" == "active" && "$WK" == "active" && "$CA" == "active" && "$CD" == "active" ]]; then
-            echo "✅ All Juju Apps are Active!"
-            echo "   CP=$CP, WK=$WK, CA=$CA, CD=$CD"
-            exit 0
-          fi
-          
-          # 每 12 次迴圈 (約1分鐘) 印一次 Log，避免完全沒輸出讓使用者以為卡死
-          if (( i % 12 == 0 )); then
-             echo "   [$i/540] Waiting... (CP=$CP, WK=$WK, CA=$CA, CD=$CD)"
-          fi
-          
-          sleep 5
-        done
-        
-        echo "❌ Timeout waiting for Juju apps."
-        exit 1
-      args:
-        executable: /bin/bash
-      register: juju_wait
-      changed_when: false
-
-    # -----------------------------------------------------------
-    # 4. Local Path Provisioner (遠端執行)
-    # -----------------------------------------------------------
-    - name: 4.1 安裝 Local Path Provisioner
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
-      register: install_sc
-      changed_when: "'created' in install_sc.stdout or 'configured' in install_sc.stdout"
-
-    - name: 4.2 設定為預設 StorageClass
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
-      register: patch_sc
-      changed_when: "'patched' in patch_sc.stdout"
-
-    # -----------------------------------------------------------
-    # 5. K8s 內部狀態檢查 (AWX 靜音版)
-    # -----------------------------------------------------------
-    - name: 5.1 等待 K8s Nodes & System Pods Ready
-      shell: |
-        juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
-        set -e
-        echo "⏳ Waiting for K8s Nodes & System Pods (Timeout: 15min)..."
-        
-        # 定義等待函數
-        wait_for_condition() {
-            local resource=$1
-            local condition=$2
-            local timeout=$3
-            echo "   -> Waiting for $resource to be $condition..."
-            if ! kubectl wait "$resource" --for=condition="$condition" --timeout="${timeout}s" >/dev/null 2>&1; then
-                echo "   ❌ Timeout waiting for $resource"
-                return 1
-            fi
-            return 0
-        }
-
-        # 1. Wait for Nodes
-        wait_for_condition "node/slurmhn" "Ready" 900
-        wait_for_condition "node/gpu-node01" "Ready" 900
-
-        # 2. Wait for Calico
-        # 使用迴圈檢查 Pod 是否存在，避免 kubectl wait 報錯
-        echo "   -> Waiting for calico-node pods creation..."
-        for i in {1..60}; do
-           if kubectl -n kube-system get pod -l k8s-app=calico-node | grep -q "Running"; then break; fi
-           sleep 2
-        done
-        kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=600s
-
-        # 3. Wait for CoreDNS
-        echo "   -> Waiting for DNS..."
-        kubectl -n kube-system wait pod -l k8s-app=kube-dns --for=condition=Ready --timeout=600s 2>/dev/null || \
-        kubectl -n kube-system wait pod -l k8s-app=coredns --for=condition=Ready --timeout=600s 2>/dev/null || true
-
-        echo "✅ K8s Infrastructure is Fully Ready."
-        EOS
-      changed_when: false
-
 # ========================================================
-# 2. Application Layer (The Golden Edition)
+# SKU: Slinky-SlurmOnK8s-Golden (IPv6-Disabled, Robust)
+#
+# Fixes applied:
+#   1. Nuclear cleanup of conflicting NVIDIA APT repos.
+#   2. System-wide IPv6 Disable (Kernel level).
+#   3. Force-kill K8s processes to refresh /etc/hosts (fix ::1 resolution).
+#   4. Aggressive Kube-Cache cleaning to fix Helm connection errors.
+#   5. Robust Bash syntax (HereDoc) to avoid quoting errors.
 # ========================================================
-- name: 2. Application Layer - Deploy Slinky Slurm on K8s
+
+- name: Application Layer - Deploy Slinky Slurm on K8s (Golden Standard)
   hosts: maasjuju
   gather_facts: yes
 
@@ -212,8 +20,8 @@
 
     # ---- Juju / machines ----
     test_model: "slinky-cluster"
-    machine0: "0"
-    machine1: "1"
+    machine0: "0"                 # control-plane node (slurmhn)
+    machine1: "1"                 # gpu worker node (gpu-node01)
 
     # ---- K8s nodes ----
     controlplane_hostname: "slurmhn"
@@ -226,14 +34,14 @@
     ns_slurm_operator: "slinky"
     ns_slurm: "slurm"
 
-    # ---- NFS ----
+    # ---- NFS (server on machine0) ----
     nfs_server_setup: true
-    nfs_server: ""
+    nfs_server: ""                # leave empty => use machine0_ip
     nfs_export_path: "/srv/nfs/k8s"
     nfs_storageclass: "nfs-rwx"
     nfs_make_default_sc: false
 
-    # ---- NVIDIA ----
+    # ---- NVIDIA device plugin ----
     gpu_taint_key: "node-role.anxpert/gpu"
     gpu_taint_value: "true"
     slurm_gpu_count: 1
@@ -244,30 +52,53 @@
     slurm_chart_ver: "1.0.1"
 
   tasks:
-    - name: 1.1 IP Discovery
+    # -----------------------------------------------------------
+    # 1) Discover machine IPs from Juju
+    # -----------------------------------------------------------
+    - name: 1.1 Get Juju model status (json)
       shell: "juju status --model {{ test_model }} --format json"
       register: juju_status_raw
       changed_when: false
 
-    - name: 1.2 Parse IPs
+    - name: 1.2 Parse machine0/machine1 IPv4
       set_fact:
         machine0_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine0]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
         machine1_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine1]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
-        nfs_server_ip: "{{ machine0_ip }}" # Default to machine0
 
-    - name: 2.1 Ensure Helm
+    - name: 1.3 Show discovered IPs
+      debug:
+        msg:
+          - "Machine0 (control-plane) IP: {{ machine0_ip }}"
+          - "Machine1 (gpu worker)    IP: {{ machine1_ip }}"
+
+    - name: 1.4 Decide NFS server IP
+      set_fact:
+        nfs_server_ip: "{{ (nfs_server | trim) if (nfs_server | trim != '') else machine0_ip }}"
+
+    # -----------------------------------------------------------
+    # 2) Ensure Helm exists on machine0
+    # -----------------------------------------------------------
+    - name: 2.1 Install Helm on machine0 if missing
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          set -e
           if ! command -v helm >/dev/null 2>&1; then
+            echo "[INFO] Installing Helm..."
             curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          else
+            echo "[INFO] Helm already installed"
           fi
         EOS
       changed_when: false
 
-    # --- Reset ---
-    - name: 0.1 Reset Releases
+    # -----------------------------------------------------------
+    # 0) Reset (two-mode)
+    # -----------------------------------------------------------
+    - name: 0.1 Reset (helm uninstall releases)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          set +e
+          echo "[RESET] uninstall releases..."
           helm -n {{ ns_slurm }} uninstall slurm 2>/dev/null || true
           helm -n {{ ns_slurm_operator }} uninstall slurm-operator 2>/dev/null || true
           helm -n default uninstall slurm-operator-crds 2>/dev/null || true
@@ -278,33 +109,46 @@
       when: reset_before_install | bool
       changed_when: true
 
-    - name: 0.2 Reset Namespaces & Webhooks
+    - name: 0.2 Reset (delete namespaces)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          set +e
+          echo "[RESET] delete namespaces..."
           kubectl delete ns {{ ns_slurm }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_slurm_operator }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_certmgr }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_nvidia }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_nfs }} --ignore-not-found=true --wait=true || true
+        EOS
+      when: reset_before_install | bool
+      changed_when: true
+
+    - name: 0.3 Reset (webhooks cleanup)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          set +e
+          echo "[RESET] Cleaning up all Webhooks..."
           kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
           kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
         EOS
       when: reset_before_install | bool
       changed_when: true
 
-    # --- NFS Setup ---
-    - name: 3.0 Setup NFS Server (Machine 0)
+    # -----------------------------------------------------------
+    # 3) Install NFS Utils (With Repo Cleanup First)
+    # -----------------------------------------------------------
+    - name: 3.0 Setup NFS server export on machine0
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        export DEBIAN_FRONTEND=noninteractive
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
         sudo -n true
-        
-        # Pre-clean bad repos
-        sudo rm -f /etc/apt/sources.list.d/nvidia-*.list 2>/dev/null || true
 
-        # Wait apt lock
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+        echo "[INFO] wait dpkg lock..."
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do echo "[WAIT]"; sleep 5; done
+        
+        # Cleanup potential bad repos first
+        sudo rm -f /etc/apt/sources.list.d/nvidia-*.list 2>/dev/null || true
         
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-kernel-server
@@ -313,57 +157,72 @@
         sudo chmod 777 {{ nfs_export_path }}
         sudo mkdir -p /etc/exports.d
         sudo touch /etc/exports
-        echo "{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)" | sudo tee /etc/exports.d/k8s.exports >/dev/null
+        
+        EXPORT_LINE="{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)"
+        echo "$EXPORT_LINE" | sudo tee /etc/exports.d/k8s.exports >/dev/null
         sudo exportfs -ra
         sudo systemctl enable --now nfs-server
         EOS
       when: nfs_server_setup | bool
       changed_when: true
 
-    - name: 3.1 Setup NFS Client (All Nodes) - WITH REPO CLEANUP
+    - name: 3.1 Install nfs-common on k8s nodes (CLEANUP BROKEN REPOS FIRST)
       shell: |
         juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
         set -euo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        
-        # Critical cleanup
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+        sudo -n true
+
+        # --- [CRITICAL FIX] ---
+        echo "[FIX] Cleaning up conflicting NVIDIA repo lists to unblock apt..."
         sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
         sudo rm -f /etc/apt/sources.list.d/nvidia-docker.list
         sudo rm -f /etc/apt/sources.list.d/libnvidia-container.list
+        # ----------------------
 
+        echo "[INFO] wait dpkg lock..."
         while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-common
+        command -v mount.nfs || ls -l /sbin/mount.nfs* || true
         EOS
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
       changed_when: true
 
-    # --- NFS Provisioner ---
-    - name: 4.1 NFS Namespace
+    # -----------------------------------------------------------
+    # 4) Environment Fixes & NFS Provisioner
+    # -----------------------------------------------------------
+    - name: 4.1 Create namespace for NFS provisioner
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           kubectl create ns {{ ns_nfs }} --dry-run=client -o yaml | kubectl apply -f -
         EOS
       changed_when: false
 
-    - name: 4.2 Install NFS Provisioner (PROCESS KILL FIX)
+    - name: 4.2 Install NFS Provisioner (Force Process Restart + Hosts Fix)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
-        # 1. Hosts Fix
-        if grep -q "^::1" /etc/hosts; then sudo sed -i 's/^::1/#::1/g' /etc/hosts; fi
+        echo "[FIX] Ensuring /etc/hosts has NO ::1 ..."
+        if grep -q "^::1" /etc/hosts; then
+            sudo sed -i 's/^::1/#::1/g' /etc/hosts
+        fi
 
-        # 2. Kill Processes
+        # 1. [絕招] 直接殺掉進程，強迫重啟 (不管是 Snap 還是 Apt 版)
+        echo "[FIX] Force killing K8s processes to refresh hosts..."
         sudo pkill -f kube-apiserver || true
         sudo pkill -f kubelet || true
         
-        # 3. Wait & Config Fix
-        echo "Waiting for API respawn..."
+        # 2. 等待復活
+        echo "[WAIT] Waiting for API Server to respawn (max 120s)..."
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
+        
+        # 確保 Config 是 IPv4
         if [ -f "$USER_CONF" ]; then
              sudo chown $(id -u):$(id -g) "$USER_CONF"
              sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
@@ -371,21 +230,28 @@
         fi
         
         export KUBECONFIG="$USER_CONF"
-        for i in {1..60}; do
-            if kubectl get nodes >/dev/null 2>&1; then break; fi
+        for i in {1..40}; do
+            if kubectl get nodes >/dev/null 2>&1; then
+                echo " -> API Server is UP!"
+                break
+            fi
             sleep 3
         done
 
-        # 4. Clean Webhooks & Cache
+        # 3. [關鍵] 刪除所有 Webhook
+        echo "[FIX] Cleaning up potential zombie Webhooks..."
         kubectl delete validatingwebhookconfigurations --all --ignore-not-found=true
         kubectl delete mutatingwebhookconfigurations --all --ignore-not-found=true
+
+        # 4. 清除 Client Cache
         rm -rf "$KUBE_DIR/cache" "$KUBE_DIR/http-cache"
 
-        # 5. Helm
+        # --- Helm Execution ---
         helm --kubeconfig "$USER_CONF" repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
         helm --kubeconfig "$USER_CONF" repo update >/dev/null 2>&1
 
-        cat > /tmp/nfs-values.yaml <<EOF
+        f=/tmp/nfs-values.yaml
+        cat > "$f" <<EOF
         nfs:
           server: {{ nfs_server_ip }}
           path: {{ nfs_export_path }}
@@ -396,19 +262,25 @@
           archiveOnDelete: true
         EOF
 
+        echo "[INFO] Helm install NFS provisioner..."
         helm --kubeconfig "$USER_CONF" upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-          -n {{ ns_nfs }} --create-namespace -f /tmp/nfs-values.yaml
+          -n {{ ns_nfs }} --create-namespace \
+          -f "$f"
         EOS
       changed_when: true
 
-    # --- NVIDIA Setup ---
-    - name: 4.3 Install NVIDIA Toolkit (NUCLEAR CLEANUP)
+    - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Nuclear Cleanup Fixed)
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
         set -euo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        
-        # Nuclear Cleanup
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+        sudo -n true
+
+        echo "[INFO] wait dpkg/apt lock..."
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+
+        # --- [NUCLEAR FIX START] ---
+        echo "[FIX] Hunting down ALL references to nvidia-container repositories..."
         sudo rm -f /etc/apt/sources.list.d/nvidia-*.list
         sudo rm -f /etc/apt/sources.list.d/libnvidia-*.list
         sudo rm -f /etc/apt/sources.list.d/cuda*.list
@@ -416,34 +288,44 @@
         if grep -q "nvidia.github.io/libnvidia-container" /etc/apt/sources.list; then
             sudo sed -i '/nvidia.github.io\/libnvidia-container/d' /etc/apt/sources.list
         fi
+        # --- [NUCLEAR FIX END] ---
 
-        # Install
+        echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
         curl -4 --retry 6 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
         curl -4 --retry 6 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
           sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
 
+        echo "[INFO] apt update/install..."
         sudo apt-get clean
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
 
+        echo "[INFO] configure containerd runtime..."
         sudo nvidia-ctk runtime configure --runtime=containerd
         sudo systemctl restart containerd
         sudo systemctl restart kubelet || true
         EOS
       changed_when: true
 
-    - name: 4.4 Disable IPv6 (System Wide)
+    - name: 4.4 Disable IPv6 Completely on ALL nodes
       shell: |
         juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
         set -euo pipefail
+        echo "[INFO] Disabling IPv6 system-wide on {{ item }}..."
         cat <<EOF | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
         net.ipv6.conf.all.disable_ipv6 = 1
         net.ipv6.conf.default.disable_ipv6 = 1
         net.ipv6.conf.lo.disable_ipv6 = 1
         EOF
         sudo sysctl --system >/dev/null
+        
+        # 檢查
+        if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "1" ]; then
+            echo "✅ IPv6 is DISABLED."
+        fi
+        
+        # Restart to flush connections
         sudo systemctl restart containerd
         sudo systemctl restart kubelet || true
         EOS
@@ -452,174 +334,273 @@
         - "{{ machine1 }}"
       changed_when: true
 
-    - name: 5.2 Install NVIDIA Device Plugin
+    # -----------------------------------------------------------
+    # 5) NVIDIA device plugin
+    # -----------------------------------------------------------
+    - name: "5.2 Install/upgrade NVIDIA device plugin (Robust + Webhook cleanup)"
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
+        
+        # Cleanup again to be safe
         kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
+        kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
+
         helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
-        cat > /tmp/nvidia-values.yaml <<EOF
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                - key: kubernetes.io/hostname
-                  operator: In
-                  values: ["{{ gpu_node_hostname }}"]
-        nodeSelector:
-          kubernetes.io/hostname: {{ gpu_node_hostname }}
-          kubernetes.io/os: linux
-        tolerations:
-        - key: {{ gpu_taint_key }}
-          operator: Equal
-          value: "{{ gpu_taint_value }}"
-          effect: NoSchedule
-        EOF
+        f=/tmp/nvidia-values.yaml
+        : > "$f"
+        w(){ printf "%s\n" "$1" >> "$f"; }
+
+        w "affinity:"
+        w "  nodeAffinity:"
+        w "    requiredDuringSchedulingIgnoredDuringExecution:"
+        w "      nodeSelectorTerms:"
+        w "      - matchExpressions:"
+        w "        - key: kubernetes.io/hostname"
+        w "          operator: In"
+        w "          values:"
+        w "          - {{ gpu_node_hostname }}"
+        w "nodeSelector:"
+        w "  kubernetes.io/hostname: {{ gpu_node_hostname }}"
+        w "  kubernetes.io/os: linux"
+        w "tolerations:"
+        w "- key: {{ gpu_taint_key }}"
+        w "  operator: Equal"
+        w "  value: \"{{ gpu_taint_value }}\""
+        w "  effect: NoSchedule"
 
         helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
           -n {{ ns_nvidia }} --create-namespace \
-          --reset-values -f /tmp/nvidia-values.yaml \
+          --reset-values \
+          -f "$f" \
           --wait --timeout=600s
         EOS
       changed_when: true
 
-    # --- Cert Manager ---
-    - name: 6.2 Install Cert Manager
+    # -----------------------------------------------------------
+    # 6) cert-manager
+    # -----------------------------------------------------------
+    - name: 6.2 Install/upgrade cert-manager via Helm
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
+
         helm upgrade --install cert-manager jetstack/cert-manager \
           -n {{ ns_certmgr }} --create-namespace \
           --version {{ cert_manager_chart_version }} \
-          --set crds.enabled=true --wait --timeout=600s
+          --set crds.enabled=true \
+          --wait --timeout=600s
         EOS
       changed_when: true
 
-    # --- Slurm Operator ---
-    - name: 7.2 Install Slurm Operator
+    # -----------------------------------------------------------
+    # 7) slurm-operator
+    # -----------------------------------------------------------
+    - name: 7.2 Install/upgrade slurm-operator-crds (OCI)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
-        set -euo pipefail
-        helm upgrade --install slurm-operator-crds oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
-          -n default --create-namespace --version {{ slurm_operator_chart_ver }}
-          
-        helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
-            -n {{ ns_slurm_operator }} --create-namespace \
+          set -euo pipefail
+          helm upgrade --install slurm-operator-crds oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+            -n default --create-namespace \
             --version {{ slurm_operator_chart_ver }}
-        
-        kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator --timeout=600s
         EOS
       changed_when: true
 
-    - name: 7.4 Wait for Operator Webhook
+    - name: 7.3 Install/upgrade slurm-operator (OCI) - Extended Timeout
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator-webhook --timeout=300s || true
-        SVC=$(kubectl -n {{ ns_slurm_operator }} get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2)
+        NS="{{ ns_slurm_operator }}"
+        
+        helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
+            -n "$NS" --create-namespace \
+            --version {{ slurm_operator_chart_ver }}
+
+        echo "[INFO] Waiting for rollout (timeout=600s)..."
+        if ! kubectl -n "$NS" rollout status deploy/slurm-operator --timeout=600s; then
+            echo "❌ Rollout Failed!"
+            kubectl -n "$NS" get events --sort-by='.lastTimestamp' | tail -n 20
+            exit 1
+        fi
+        EOS
+      changed_when: true
+
+    - name: 7.4 Wait for Slurm Operator Webhook endpoints
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        NS="{{ ns_slurm_operator }}"
+        kubectl -n "$NS" rollout status deploy/slurm-operator-webhook --timeout=300s || true
+        SVC=$(kubectl -n "$NS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2)
+        
         for i in {1..120}; do
-          EP=$(kubectl -n {{ ns_slurm_operator }} get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
-          if [ -n "$EP" ]; then echo "✅ Webhook ready"; exit 0; fi
+          EP=$(kubectl -n "$NS" get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
+          if [ -n "$EP" ]; then
+            echo "✅ Webhook endpoints ready: $EP"
+            exit 0
+          fi
           sleep 5
         done
         exit 1
         EOS
       changed_when: false
 
-    # --- Slurm Cluster ---
-    - name: 8.2 Install Slurm Cluster (Post-Renderer)
+    # -----------------------------------------------------------
+    # 8) slurm chart (OCI)
+    # -----------------------------------------------------------
+    - name: 8.2 Install/upgrade slurm chart (OCI)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        
+        NS="{{ ns_slurm }}"
+        CHART_VER="{{ slurm_chart_ver }}"
+
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
             enabled: true
             storageClassName: "{{ nfs_storageclass }}"
             accessModes: [ReadWriteOnce]
-            resources: { requests: { storage: 10Gi } }
+            resources:
+              requests:
+                storage: 10Gi
           extraConf: |
             GresTypes=gpu
           podSpec:
-            nodeSelector: { kubernetes.io/hostname: {{ controlplane_hostname }} }
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
             tolerations:
-              - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
-              - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+                effect: NoSchedule
         restapi:
           replicas: 1
           podSpec:
-            nodeSelector: { kubernetes.io/hostname: {{ controlplane_hostname }} }
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
             tolerations:
-              - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
         nodesets:
           slinky:
             enabled: true
-            partition: { enabled: false }
+            partition:
+              enabled: false
             useResourceLimits: true
             podSpec:
-              nodeSelector: { kubernetes.io/hostname: {{ gpu_node_hostname }} }
+              nodeSelector:
+                kubernetes.io/hostname: {{ gpu_node_hostname }}
+                kubernetes.io/os: linux
               tolerations:
-                - { key: {{ gpu_taint_key }}, operator: Equal, value: "{{ gpu_taint_value }}", effect: NoSchedule }
+                - key: {{ gpu_taint_key }}
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+                  effect: NoSchedule
             slurmd:
-              resources: { limits: { nvidia.com/gpu: {{ slurm_gpu_count }} } }
-              args: [ "--conf", "Gres=gpu:{{ slurm_gpu_count }}" ]
+              resources:
+                limits:
+                  nvidia.com/gpu: {{ slurm_gpu_count }}
+              args:
+                - --conf
+                - Gres=gpu:{{ slurm_gpu_count }}
         partitions:
           all:
             enabled: true
             nodesets: [ALL]
-            configMap: { Default: "YES", MaxTime: UNLIMITED, State: UP }
+            configMap:
+              Default: "YES"
+              MaxTime: UNLIMITED
+              State: UP
           slinky:
             enabled: true
             nodesets: [ALL]
-            configMap: { Default: "NO", MaxTime: UNLIMITED, State: UP }
+            configMap:
+              Default: "NO"
+              MaxTime: UNLIMITED
+              State: UP
         configFiles:
-          gres.conf: "AutoDetect=nvidia"
+          gres.conf: |
+            AutoDetect=nvidia
         EOF
 
-        # Post-renderer for InitContainer & Probes
+        # Ensure yq
+        if ! [ -x /tmp/yq ]; then
+          curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /tmp/yq
+        fi
+
+        # Post-renderer
         cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
+        set -euo pipefail
         YQ="/tmp/yq"
-        [ ! -x "$YQ" ] && curl -fsSL -o "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 && chmod +x "$YQ"
         in="$(mktemp)"
         cat > "$in"
+        # 1. Move initContainers to containers
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers) += 
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) |
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) = []
         ' "$in"
-        # ... (Probes fix omitted for brevity, keeping existing logic is fine) ...
+        # 2. Force tcpSocket probes
+        "$YQ" eval -i '
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).startupProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).readinessProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).livenessProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
+        ' "$in"
         cat "$in"
         rm "$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
 
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-            -n {{ ns_slurm }} --create-namespace \
-            --version {{ slurm_chart_ver }} \
+            -n "$NS" --create-namespace \
+            --version "$CHART_VER" \
             -f /tmp/slurm-values.yaml \
             --post-renderer /tmp/slurm-post-renderer.sh \
             --wait --timeout=600s
         EOS
       changed_when: true
 
-    - name: 9.1 Restart & Wait
+    # -----------------------------------------------------------
+    # 9) Restart controller + worker (Robust check)
+    # -----------------------------------------------------------
+    - name: 9.1 Restart slurm pods and Wait for Ready
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          set -e
+          echo "[INFO] Restarting pods..."
           kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true --wait=true
           kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true --wait=true
           sleep 10
           kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
           kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
+          echo "🎉 All Pods Ready!"
         EOS
       changed_when: true
 
     - name: Done
       debug:
-        msg: "🎉 Slinky Slurm on K8s (Golden + AWX Quiet) Deployed Successfully!"
+        msg:
+          - "🎉 Standardized Slinky Slurm on K8s deployed (GOLDEN EDITION)"
+          - "System IPv6 Disabled. Kube-cache cleared. Hosts fixed."
+          - "RTX 4090 Ready for jobs!"
