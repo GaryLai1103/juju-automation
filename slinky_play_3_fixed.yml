@@ -262,29 +262,37 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix Kubeconfig IPv6 & Syntax)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix Kubeconfig Smartly)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
         # --- [CRITICAL FIX START] ---
-        # 因為我們停用了系統 IPv6，但 kubeconfig 可能還指著 [::1]。
-        # 這會導致 "dial tcp [::1]:6443: connect: cannot assign requested address"
-        # 我們必須強制將其改回 127.0.0.1
-        echo "[FIX] Patching kubeconfig to use IPv4 (127.0.0.1)..."
-        
-        # 修改 admin.conf
-        sudo sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' /etc/kubernetes/admin.conf
-        sudo sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' /etc/kubernetes/admin.conf
-        
-        # 更新目前使用者的 kubeconfig
-        mkdir -p ~/.kube
-        sudo cp /etc/kubernetes/admin.conf ~/.kube/config
-        sudo chown $(id -u):$(id -g) ~/.kube/config
+        echo "[FIX] Patching kubeconfig to force IPv4 (127.0.0.1)..."
+
+        # 1. 優先修補目前使用者的 config (這是 Helm 真正讀取的檔案)
+        USER_CONF="$HOME/.kube/config"
+        if [ -f "$USER_CONF" ]; then
+            echo " -> Found user config: $USER_CONF"
+            # 替換 [::1] -> 127.0.0.1
+            sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+            # 替換 localhost -> 127.0.0.1 (有些系統 localhost 會解析成 ::1)
+            sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+        else
+            echo " [WARN] User kubeconfig not found at $USER_CONF"
+        fi
+
+        # 2. 如果系統層級的 admin.conf 存在，順便修補它 (但不強求)
+        SYS_CONF="/etc/kubernetes/admin.conf"
+        if [ -f "$SYS_CONF" ]; then
+            echo " -> Found system config: $SYS_CONF"
+            sudo sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$SYS_CONF"
+            sudo sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$SYS_CONF"
+        fi
         
         # 驗證一下
         echo "[INFO] Current Cluster Server endpoint:"
-        kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}"
+        kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}" || echo "Error reading config"
         echo
         # --- [CRITICAL FIX END] ---
 
