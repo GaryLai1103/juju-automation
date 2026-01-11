@@ -532,11 +532,12 @@
       changed_when: false
 
     # --- Slurm Cluster ---
-    - name: 8.2 Install Slurm Cluster (Post-Renderer)
+    - name: 8.2 Install Slurm Cluster (Post-Renderer FULL VERSION)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         
+        # 1. Generate Values
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
@@ -582,24 +583,49 @@
           gres.conf: "AutoDetect=nvidia"
         EOF
 
-        # Post-renderer for InitContainer & Probes
-        cat > /tmp/slurm-post-renderer.sh <<'SH'
+        # 2. Ensure yq
+        YQ="/tmp/yq"
+        if [ ! -x "$YQ" ]; then
+           curl -fsSL -o "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+           chmod +x "$YQ"
+        fi
+
+        # 3. Create Post-Renderer Script (包含 InitContainer 移除 + Probes 修正)
+        cat > /tmp/slurm-post-renderer.sh <<SH
         #!/usr/bin/env bash
         YQ="/tmp/yq"
-        [ ! -x "$YQ" ] && curl -fsSL -o "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 && chmod +x "$YQ"
-        in="$(mktemp)"
-        cat > "$in"
-        "$YQ" eval -i '
+        in="\$(mktemp)"
+        cat > "\$in"
+        
+        # FIX A: Move initContainers to containers (解決 init 卡死)
+        "\$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers) += 
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) |
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) = []
-        ' "$in"
-        # ... (Probes fix omitted for brevity, keeping existing logic is fine) ...
-        cat "$in"
-        rm "$in"
+        ' "\$in"
+
+        # FIX B: Force tcpSocket probes (解決 httpGet 卡死) - 這裡是之前缺少的關鍵部分
+        "\$YQ" eval -i '
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).startupProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).readinessProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).livenessProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
+        ' "\$in"
+        
+        cat "\$in"
+        rm "\$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
 
+        # 4. Helm Install
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n {{ ns_slurm }} --create-namespace \
             --version {{ slurm_chart_ver }} \
