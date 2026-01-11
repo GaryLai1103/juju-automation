@@ -257,16 +257,24 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Nuke Kube Cache)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix /etc/hosts & Restart API)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
-        echo "[FIX] Ensuring ~/.kube directory ownership & IPv4 endpoint..."
+        echo "[FIX] correcting /etc/hosts to prevent localhost -> ::1 resolution..."
+        # 1. 將 /etc/hosts 裡的 ::1 註解掉
+        # 這能防止 K8s 內部元件將 localhost 解析為 IPv6
+        if grep -q "^::1" /etc/hosts; then
+            echo " -> Commenting out ::1 in /etc/hosts"
+            sudo sed -i 's/^::1/#::1/g' /etc/hosts
+        else
+            echo " -> /etc/hosts seems clean of ::1"
+        fi
+
+        # 2. 再次確保 .kube/config 正確 (為了 Helm Client)
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
-
-        # 1. 修復檔案權限與內容
         if [ -d "$KUBE_DIR" ]; then
             sudo chown -R $(id -u):$(id -g) "$KUBE_DIR"
             if [ -f "$USER_CONF" ]; then
@@ -275,23 +283,29 @@
                 sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
             fi
         fi
-
-        # 2. [關鍵步驟] 清除 Kubernetes Client 快取
-        # Helm/Client-go 會快取 API Discovery 資訊，如果不刪除，它會一直去連舊的 IPv6 地址
-        echo "[FIX] Nuking Kubernetes Discovery Cache..."
-        rm -rf "$KUBE_DIR/cache"
-        rm -rf "$KUBE_DIR/http-cache"
-
-        # 3. 確保環境變數
-        export KUBECONFIG="$USER_CONF"
         
-        # 4. 雙重驗證：直接 grep 檔案內容給你看，確保沒有 [::1]
-        echo "[DEBUG] Grepping 'server:' in kubeconfig:"
-        grep "server:" "$USER_CONF" || true
-        echo
+        # 3. [關鍵步驟] 重啟 Kubelet 以觸發 API Server 重啟
+        # 因為修改了 hosts 和 sysctl，必須讓 API Server 重啟才能吃到新環境
+        echo "[FIX] Restarting Kubelet to refresh Static Pods (API Server)..."
+        sudo systemctl restart kubelet
+        
+        echo "[WAIT] Waiting for API Server to come back online (max 60s)..."
+        # 迴圈等待 API Server 回應
+        export KUBECONFIG="$USER_CONF"
+        for i in {1..20}; do
+            if kubectl get nodes >/dev/null 2>&1; then
+                echo " -> API Server is UP!"
+                break
+            fi
+            echo " ... waiting for API Server ($i/20)"
+            sleep 3
+        done
+
+        # 4. 清除 Cache (再次確保)
+        rm -rf "$KUBE_DIR/cache" "$KUBE_DIR/http-cache"
 
         # --- Helm Execution ---
-
+        
         helm --kubeconfig "$USER_CONF" repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
         helm --kubeconfig "$USER_CONF" repo update >/dev/null 2>&1
 
