@@ -253,7 +253,10 @@
       set_fact:
         machine0_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine0]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
         machine1_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine1]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
-        nfs_server_ip: "{{ machine0_ip }}" # Default to machine0
+
+    - name: 1.3 Set NFS Server IP
+      set_fact:
+        nfs_server_ip: "{{ machine0_ip }}"
 
     - name: 2.1 Ensure Helm
       shell: |
