@@ -346,7 +346,7 @@
         EOS
       changed_when: false
 
-    - name: 4.2 Install NFS Provisioner (PROCESS KILL FIX)
+    - name: 4.2 Install NFS Provisioner (PROCESS KILL FIX & PERM FIX)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -362,10 +362,18 @@
         echo "Waiting for API respawn..."
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
+        
+        # [關鍵修正]：先把整個資料夾權限拿過來，讓 sed 可以寫入暫存檔
+        if [ -d "$KUBE_DIR" ]; then
+             sudo chown -R $(id -u):$(id -g) "$KUBE_DIR"
+        fi
+
         if [ -f "$USER_CONF" ]; then
+             # [雙重保險]：用 sudo 執行 sed，確保絕對有權限修改
+             sudo sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+             sudo sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+             # 改完後再把擁有者改回 ubuntu，讓後面的 helm 可以讀
              sudo chown $(id -u):$(id -g) "$USER_CONF"
-             sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
-             sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
         fi
         
         export KUBECONFIG="$USER_CONF"
@@ -398,7 +406,6 @@
           -n {{ ns_nfs }} --create-namespace -f /tmp/nfs-values.yaml
         EOS
       changed_when: true
-
     # -----------------------------------------------------------
     # 4.3 - 4.4 NVIDIA Env Prep
     # -----------------------------------------------------------
