@@ -215,13 +215,22 @@
       when: nfs_server_setup | bool
       changed_when: true
 
-    - name: 3.1 Install nfs-common on k8s nodes (required for NFS mounts) - robust + wait dpkg lock
+    - name: 3.1 Install nfs-common on k8s nodes (CLEANUP BROKEN REPOS FIRST)
       shell: |
         juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
         sudo -n true
+
+        # --- [CRITICAL FIX START] ---
+        # 由於機器上可能有壞掉的 repo 定義，導致 apt update 完全無法運作。
+        # 我們必須先清理掉這些衝突檔，才能讓 NFS 安裝順利進行。
+        echo "[FIX] Cleaning up conflicting NVIDIA repo lists to unblock apt..."
+        sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        sudo rm -f /etc/apt/sources.list.d/nvidia-docker.list
+        sudo rm -f /etc/apt/sources.list.d/libnvidia-container.list
+        # --- [CRITICAL FIX END] ---
 
         echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
         while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
@@ -280,7 +289,7 @@
         '
       changed_when: true
 
-    - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - robust (Fix conflicting signed-by)
+    - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - robust
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -288,49 +297,33 @@
 
         sudo -n true
 
-        echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
+        echo "[INFO] wait dpkg/apt lock..."
         while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
           echo "[WAIT] dpkg lock held..."; sleep 5
         done
 
-        # --- [FIX START] Clean up potential conflicting repo definitions ---
-        echo "[INFO] Cleaning up old NVIDIA source lists to avoid conflicts..."
+        # 再次確保乾淨 (雖然 3.1 做過了，但為了 Robustness 再做一次無妨)
         sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
         sudo rm -f /etc/apt/sources.list.d/nvidia-docker.list
         sudo rm -f /etc/apt/sources.list.d/libnvidia-container.list
-        # --- [FIX END] ---
 
         echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
         curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
-        # 注意：這裡使用 tee 直接覆寫，且確保 signed-by 語法正確
+        # 使用 [signed-by=...] 避免 GPG 衝突
         curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
           sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
 
-        echo "[INFO] apt update/install (ForceIPv4 + lock wait)..."
-        # 先做一次 clean 確保 metadata 重抓
+        echo "[INFO] apt update/install..."
         sudo apt-get clean
-        
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
-
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-          echo "[WAIT] dpkg lock held..."; sleep 5
-        done
-
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
 
         echo "[INFO] configure containerd runtime..."
         sudo nvidia-ctk runtime configure --runtime=containerd
-
-        echo "[INFO] restart containerd + kubelet..."
         sudo systemctl restart containerd
         sudo systemctl restart kubelet || true
-
-        echo "[INFO] quick verify:"
-        command -v nvidia-ctk || true
-        sudo ctr version || true
-        sudo grep -n "nvidia" /etc/containerd/config.toml | head -n 40 || true
 
         echo "✅ NVIDIA Container Toolkit ready"
         EOS
