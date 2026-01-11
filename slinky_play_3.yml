@@ -81,32 +81,47 @@
       set_fact:
         nfs_server_ip: "{{ (nfs_server | trim) if (nfs_server | trim != '') else machine0_ip }}"
 
-    # -----------------------------------------------------------
-    # 1.5 Disable IPv6 on nodes to avoid GHCR IPv6 timeout (YAML-safe)
-    # -----------------------------------------------------------
-    - name: 1.5 Disable IPv6 (sysctl.d) on machine0 & machine1 (YAML-safe)
+    - name: 1.5 Disable IPv6 (sysctl.d) on machine0 & machine1 (FORCE IPv4, no juju ssh)
       shell: |
-        juju ssh --model {{ test_model }} {{ item }} -- bash -lc '
-          set -euo pipefail
-          sudo -n true
+        set -euo pipefail
 
-          echo "[NET] disable IPv6 via sysctl.d ..."
-          sudo install -d -m 0755 /etc/sysctl.d
+        # Juju 在 maasjuju 上通常會放一把 ssh key，可用來直連 machine IP
+        KEY="$(ls -1 ~/.local/share/juju/ssh/*id_rsa 2>/dev/null | head -n1 || true)"
+        if [ -z "$KEY" ]; then
+          echo "❌ Cannot find Juju SSH private key under ~/.local/share/juju/ssh/"
+          echo "Try: ls -al ~/.local/share/juju/ssh/"
+          exit 1
+        fi
+        echo "[INFO] Using key: $KEY"
 
-          printf "%s\n" \
-            "net.ipv6.conf.all.disable_ipv6 = 1" \
-            "net.ipv6.conf.default.disable_ipv6 = 1" \
-            "net.ipv6.conf.lo.disable_ipv6 = 1" | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
 
-          sudo sysctl --system >/dev/null || true
+        host_ip="{{ item }}"
+        echo "[INFO] Target IP: ${host_ip}"
 
-          echo "[NET] verify:"
-          cat /proc/sys/net/ipv6/conf/all/disable_ipv6 || true
-          (ip -6 addr || true) | sed -n "1,80p"
-        '
+        # 直接用 IPv4 連，不讓 juju 去挑 IPv6
+        timeout 180s ssh -i "$KEY" $SSH_OPTS ubuntu@"$host_ip" 'bash -s' <<'EOS'
+        set -euo pipefail
+        sudo -n true
+
+        echo "[NET] disable IPv6 via sysctl.d ..."
+        sudo install -d -m 0755 /etc/sysctl.d
+
+        printf "%s\n" \
+          "net.ipv6.conf.all.disable_ipv6 = 1" \
+          "net.ipv6.conf.default.disable_ipv6 = 1" \
+          "net.ipv6.conf.lo.disable_ipv6 = 1" | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+
+        # 吃掉 sysctl --system 可能噴的無關 stderr（你看到的 Invalid argument 就是這類）
+        sudo sysctl --system >/dev/null 2>&1 || true
+
+        echo "[NET] verify:"
+        cat /proc/sys/net/ipv6/conf/all/disable_ipv6 || true
+        (ip -6 addr || true) | sed -n "1,80p"
+        EOS
       loop:
-        - "{{ machine0 }}"
-        - "{{ machine1 }}"
+        - "{{ machine0_ip }}"
+        - "{{ machine1_ip }}"
       when: (disable_ipv6 | default(true)) | bool
       changed_when: true
 
