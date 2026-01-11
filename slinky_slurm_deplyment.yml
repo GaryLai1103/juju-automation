@@ -554,11 +554,11 @@
 
         echo "[INFO] restart containerd + kubelet..."
         sudo systemctl restart containerd 2>/dev/null || true
-        sudo systemctl restart kubelet   2>/dev/null || true
+        sudo systemctl restart kubelet    2>/dev/null || true
         sudo systemctl restart snap.containerd.daemon 2>/dev/null || true
         sudo systemctl restart snap.kubelet.daemon    2>/dev/null || true
         sudo snap restart containerd 2>/dev/null || true
-        sudo snap restart kubelet   2>/dev/null || true
+        sudo snap restart kubelet    2>/dev/null || true
 
         echo "[INFO] quick verify:"
         echo "== ${LIST} =="; sudo cat "${LIST}" || true
