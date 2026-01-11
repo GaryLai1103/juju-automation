@@ -532,80 +532,108 @@
       changed_when: false
 
     # --- Slurm Cluster ---
-    - name: 8.2 Install Slurm Cluster (Post-Renderer FULL VERSION)
+    - name: 8.2 Install/upgrade slurm chart (OCI)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        
-        # 1. Generate Values
+        NS="{{ ns_slurm }}"
+        CHART_VER="{{ slurm_chart_ver }}"
+
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
             enabled: true
             storageClassName: "{{ nfs_storageclass }}"
             accessModes: [ReadWriteOnce]
-            resources: { requests: { storage: 10Gi } }
+            resources:
+              requests:
+                storage: 10Gi
           extraConf: |
             GresTypes=gpu
           podSpec:
-            nodeSelector: { kubernetes.io/hostname: {{ controlplane_hostname }} }
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
             tolerations:
-              - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
-              - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+                effect: NoSchedule
         restapi:
           replicas: 1
           podSpec:
-            nodeSelector: { kubernetes.io/hostname: {{ controlplane_hostname }} }
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
             tolerations:
-              - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
         nodesets:
           slinky:
             enabled: true
-            partition: { enabled: false }
+            partition:
+              enabled: false
             useResourceLimits: true
             podSpec:
-              nodeSelector: { kubernetes.io/hostname: {{ gpu_node_hostname }} }
+              nodeSelector:
+                kubernetes.io/hostname: {{ gpu_node_hostname }}
+                kubernetes.io/os: linux
               tolerations:
-                - { key: {{ gpu_taint_key }}, operator: Equal, value: "{{ gpu_taint_value }}", effect: NoSchedule }
+                - key: {{ gpu_taint_key }}
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+                  effect: NoSchedule
             slurmd:
-              resources: { limits: { nvidia.com/gpu: {{ slurm_gpu_count }} } }
-              args: [ "--conf", "Gres=gpu:{{ slurm_gpu_count }}" ]
+              resources:
+                limits:
+                  nvidia.com/gpu: {{ slurm_gpu_count }}
+              args:
+                - --conf
+                - Gres=gpu:{{ slurm_gpu_count }}
         partitions:
           all:
             enabled: true
             nodesets: [ALL]
-            configMap: { Default: "YES", MaxTime: UNLIMITED, State: UP }
+            configMap:
+              Default: "YES"
+              MaxTime: UNLIMITED
+              State: UP
           slinky:
             enabled: true
             nodesets: [ALL]
-            configMap: { Default: "NO", MaxTime: UNLIMITED, State: UP }
+            configMap:
+              Default: "NO"
+              MaxTime: UNLIMITED
+              State: UP
         configFiles:
-          gres.conf: "AutoDetect=nvidia"
+          gres.conf: |
+            AutoDetect=nvidia
         EOF
 
-        # 2. Ensure yq
-        YQ="/tmp/yq"
-        if [ ! -x "$YQ" ]; then
-           curl -fsSL -o "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-           chmod +x "$YQ"
+        # Ensure yq
+        if ! [ -x /tmp/yq ]; then
+          curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /tmp/yq
         fi
 
-        # 3. Create Post-Renderer Script (包含 InitContainer 移除 + Probes 修正)
-        cat > /tmp/slurm-post-renderer.sh <<SH
+        # Post-renderer
+        cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
+        set -euo pipefail
         YQ="/tmp/yq"
-        in="\$(mktemp)"
-        cat > "\$in"
-        
-        # FIX A: Move initContainers to containers (解決 init 卡死)
-        "\$YQ" eval -i '
+        in="$(mktemp)"
+        cat > "$in"
+        # 1. Move initContainers to containers
+        "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers) += 
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) |
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) = []
-        ' "\$in"
-
-        # FIX B: Force tcpSocket probes (解決 httpGet 卡死) - 這裡是之前缺少的關鍵部分
-        "\$YQ" eval -i '
+        ' "$in"
+        # 2. Force tcpSocket probes
+        "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
           ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
@@ -618,17 +646,15 @@
             {"tcpSocket":{"port":6818},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
           (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).livenessProbe =
             {"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
-        ' "\$in"
-        
-        cat "\$in"
-        rm "\$in"
+        ' "$in"
+        cat "$in"
+        rm "$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
 
-        # 4. Helm Install
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-            -n {{ ns_slurm }} --create-namespace \
-            --version {{ slurm_chart_ver }} \
+            -n "$NS" --create-namespace \
+            --version "$CHART_VER" \
             -f /tmp/slurm-values.yaml \
             --post-renderer /tmp/slurm-post-renderer.sh \
             --wait --timeout=600s
