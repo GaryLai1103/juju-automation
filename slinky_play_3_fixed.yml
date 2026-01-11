@@ -262,31 +262,55 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm (values file via printf)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix Kubeconfig IPv6 & Syntax)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
-          helm repo update >/dev/null 2>&1
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
 
-          f=/tmp/nfs-values.yaml
-          : > $f
-          printf "nfs:\n" >> $f
-          printf "  server: %s\n" "{{ nfs_server_ip }}" >> $f
-          printf "  path: %s\n" "{{ nfs_export_path }}" >> $f
-          printf "storageClass:\n" >> $f
-          printf "  name: %s\n" "{{ nfs_storageclass }}" >> $f
-          printf "  defaultClass: %s\n" "{{ (nfs_make_default_sc | bool) | lower }}" >> $f
-          printf "  reclaimPolicy: Delete\n" >> $f
-          printf "  archiveOnDelete: true\n" >> $f
+        # --- [CRITICAL FIX START] ---
+        # 因為我們停用了系統 IPv6，但 kubeconfig 可能還指著 [::1]。
+        # 這會導致 "dial tcp [::1]:6443: connect: cannot assign requested address"
+        # 我們必須強制將其改回 127.0.0.1
+        echo "[FIX] Patching kubeconfig to use IPv4 (127.0.0.1)..."
+        
+        # 修改 admin.conf
+        sudo sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' /etc/kubernetes/admin.conf
+        sudo sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' /etc/kubernetes/admin.conf
+        
+        # 更新目前使用者的 kubeconfig
+        mkdir -p ~/.kube
+        sudo cp /etc/kubernetes/admin.conf ~/.kube/config
+        sudo chown $(id -u):$(id -g) ~/.kube/config
+        
+        # 驗證一下
+        echo "[INFO] Current Cluster Server endpoint:"
+        kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}"
+        echo
+        # --- [CRITICAL FIX END] ---
 
-          helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-            -n {{ ns_nfs }} --create-namespace \
-            -f $f
+        helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
 
-          echo "[INFO] storageclass:"
-          kubectl get sc | sed -n "1,120p"
-        '
+        f=/tmp/nfs-values.yaml
+        cat > "$f" <<EOF
+        nfs:
+          server: {{ nfs_server_ip }}
+          path: {{ nfs_export_path }}
+        storageClass:
+          name: {{ nfs_storageclass }}
+          defaultClass: {{ nfs_make_default_sc | bool | lower }}
+          reclaimPolicy: Delete
+          archiveOnDelete: true
+        EOF
+
+        echo "[INFO] Helm install NFS provisioner..."
+        helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+          -n {{ ns_nfs }} --create-namespace \
+          -f "$f"
+
+        echo "[INFO] storageclass:"
+        kubectl get sc | sed -n "1,120p"
+        EOS
       changed_when: true
 
     - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - Nuclear Cleanup (Fixed)
