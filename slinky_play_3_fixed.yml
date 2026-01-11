@@ -9,12 +9,7 @@
 # Includes:
 #   1) NFS server (machine0) + nfs-subdir-external-provisioner + StorageClass
 #   2) NVIDIA k8s-device-plugin (Helm) with tolerations + nodeSelector + affinity={}
-#   3) cert-manager + slurm-operator-crds + slurm-operator + slurm (OCI chart)
-#
-# Pitfalls avoided:
-#   - NEVER kubectl patch Controller.extraConf (Helm conflict)
-#   - Partitions do NOT depend on Feature
-#   - Device-plugin MUST toleration + nodeSelector; also clear affinity to avoid NFD dependency
+#   3) cert-manager + slurm-operator-crds + slurm-operator + slurm (OCI chart)#
 # ========================================================
 
 - name: Application Layer - Deploy Slinky Slurm on K8s (Standardized Merged)
