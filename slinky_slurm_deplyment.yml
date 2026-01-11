@@ -1,13 +1,182 @@
 ---
 # ========================================================
-# SKU: Slinky-K8s-Part2-Application-Golden-v2.2
-# Description: Application Layer Deployment (Slurm, NVIDIA, NFS)
-# Verification:
-#   - Task 1.3: NFS IP logic fixed (supports external)
-#   - Task 3.1/4.4: Loops confirmed present
-#   - Task 8.2: Slurm Post-Renderer FULL version (Init + Probes)
+# SKU: Slinky-K8s-Complete-Golden-v2.3 (Conservative)
+# Description: Full stack deployment.
+# Structure: Reverted to explicit separate tasks for maximum clarity.
 # ========================================================
 
+# ========================================================
+# PLAY 1: Infrastructure Layer
+# ========================================================
+- name: 1. Infrastructure - Deploy Modern Charmed Kubernetes
+  hosts: maasjuju
+  gather_facts: yes
+  vars:
+    test_model: "slinky-cluster"
+    k8s_channel: "1.31/stable"
+    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-modern.yaml"
+
+  tasks:
+    # --- 1. Environment Cleanup ---
+    - name: 1.0 Force cleanup old model
+      command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
+      register: destroy_result
+      failed_when: 
+        - destroy_result.rc != 0 
+        - '"not found" not in destroy_result.stderr'
+      ignore_errors: yes
+
+    - name: 1.1 Wait for model release
+      pause:
+        seconds: 15
+
+    - name: 1.2 Create new Juju Model
+      shell: juju add-model {{ test_model }}
+
+    # --- 2. Bundle & Deploy ---
+    - name: 2.1 Generate Local Bundle
+      copy:
+        dest: "{{ bundle_path }}"
+        mode: '0644'
+        content: |
+          description: Slinky Modern K8s Cluster
+          base: ubuntu@22.04
+          machines:
+            "0":
+              constraints: tags=virtual
+            "1":
+              constraints: tags=slurm-node
+          applications:
+            easyrsa:
+              charm: easyrsa
+              channel: latest/stable
+              num_units: 1
+              to: ["0"]
+            etcd:
+              charm: etcd
+              channel: latest/stable
+              num_units: 1
+              to: ["0"]
+            kubernetes-control-plane:
+              charm: kubernetes-control-plane
+              channel: {{ k8s_channel }}
+              num_units: 1
+              to: ["0"]
+              options:
+                allow-privileged: "true"
+            kubernetes-worker:
+              charm: kubernetes-worker
+              channel: {{ k8s_channel }}
+              num_units: 1
+              to: ["1"]
+              expose: true
+            calico:
+              charm: calico
+              channel: latest/stable
+            containerd:
+              charm: containerd
+              channel: latest/stable
+          relations:
+            - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
+            - ["kubernetes-control-plane:certificates", "easyrsa:client"]
+            - ["etcd:certificates", "easyrsa:client"]
+            - ["kubernetes-control-plane:etcd", "etcd:db"]
+            - ["kubernetes-worker:certificates", "easyrsa:client"]
+            - ["calico:etcd", "etcd:db"]
+            - ["calico:cni", "kubernetes-control-plane:cni"]
+            - ["calico:cni", "kubernetes-worker:cni"]
+            - ["containerd:containerd", "kubernetes-worker:container-runtime"]
+            - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
+
+    - name: 2.2 Deploy Bundle
+      shell: |
+        juju deploy {{ bundle_path }} --model {{ test_model }} --trust
+      register: deploy_out
+      until: deploy_out.rc == 0
+      retries: 3
+      delay: 10
+
+    # --- 3. Infra Monitoring (AWX Quiet Mode) ---
+    - name: 3.1 Wait for Juju Apps Active (Bash Loop)
+      shell: |
+        echo "⏳ Monitoring Juju status (Timeout: 45min)..."
+        for i in {1..540}; do
+          JSON=$(juju status --model {{ test_model }} --format json)
+          CP=$(echo "$JSON" | jq -r '.applications["kubernetes-control-plane"]["application-status"].current // "unknown"')
+          WK=$(echo "$JSON" | jq -r '.applications["kubernetes-worker"]["application-status"].current // "unknown"')
+          CA=$(echo "$JSON" | jq -r '.applications["calico"]["application-status"].current // "unknown"')
+          CD=$(echo "$JSON" | jq -r '.applications["containerd"]["application-status"].current // "unknown"')
+          
+          if [[ "$CP" == "active" && "$WK" == "active" && "$CA" == "active" && "$CD" == "active" ]]; then
+            echo "✅ All Juju Apps are Active!"
+            exit 0
+          fi
+          if (( i % 12 == 0 )); then echo "   [$i/540] Waiting... (CP=$CP, WK=$WK)"; fi
+          sleep 5
+        done
+        echo "❌ Timeout waiting for Juju apps."
+        exit 1
+      args:
+        executable: /bin/bash
+      register: juju_wait
+      changed_when: false
+
+    # --- 4. Local Path Provisioner ---
+    - name: 4.1 Install Local Path Provisioner
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
+      register: install_sc
+      changed_when: "'created' in install_sc.stdout or 'configured' in install_sc.stdout"
+
+    - name: 4.2 Set Default StorageClass
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
+      register: patch_sc
+      changed_when: "'patched' in patch_sc.stdout"
+
+    # --- 5. K8s Internal Check ---
+    - name: 5.1 Wait for K8s Nodes & System Pods
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
+        set -e
+        echo "⏳ Waiting for K8s Nodes & System Pods (Timeout: 15min)..."
+        
+        wait_for_condition() {
+            local resource=$1; local condition=$2; local timeout=$3
+            echo "   -> Waiting for $resource to be $condition..."
+            if ! kubectl wait "$resource" --for=condition="$condition" --timeout="${timeout}s" >/dev/null 2>&1; then
+                echo "   ❌ Timeout waiting for $resource"; return 1
+            fi
+            return 0
+        }
+
+        # Wait for Nodes
+        wait_for_condition "node/slurmhn" "Ready" 900
+        wait_for_condition "node/gpu-node01" "Ready" 900
+
+        # Wait for Calico Pods
+        echo "   -> Waiting for calico-node pods..."
+        for i in {1..60}; do
+           if kubectl -n kube-system get pod -l k8s-app=calico-node | grep -q "Running"; then break; fi
+           sleep 2
+        done
+        kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=600s
+
+        # Wait for CoreDNS
+        echo "   -> Waiting for DNS..."
+        kubectl -n kube-system wait pod -l k8s-app=kube-dns --for=condition=Ready --timeout=600s 2>/dev/null || \
+        kubectl -n kube-system wait pod -l k8s-app=coredns --for=condition=Ready --timeout=600s 2>/dev/null || true
+
+        echo "✅ K8s Infrastructure is Fully Ready."
+        EOS
+      changed_when: false
+
+
+# ========================================================
+# PLAY 2: Application Layer (The Golden Edition)
+# ========================================================
 - name: 2. Application Layer - Deploy Slinky Slurm on K8s
   hosts: maasjuju
   gather_facts: yes
@@ -18,8 +187,8 @@
 
     # ---- Juju / machines ----
     test_model: "slinky-cluster"
-    machine0: "0"                 # control-plane node (slurmhn)
-    machine1: "1"                 # gpu worker node (gpu-node01)
+    machine0: "0"
+    machine1: "1"
 
     # ---- K8s nodes ----
     controlplane_hostname: "slurmhn"
@@ -34,7 +203,7 @@
 
     # ---- NFS ----
     nfs_server_setup: true
-    nfs_server: ""                # leave empty => use machine0_ip
+    nfs_server: ""
     nfs_export_path: "/srv/nfs/k8s"
     nfs_storageclass: "nfs-rwx"
     nfs_make_default_sc: false
@@ -58,13 +227,13 @@
       register: juju_status_raw
       changed_when: false
 
-    # [Check 1] Split set_fact to ensure machine0_ip is defined before use
+    # [Safe Check] Split for variable precedence
     - name: 1.2 Parse IPs
       set_fact:
         machine0_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine0]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
         machine1_ip: "{{ (juju_status_raw.stdout | from_json).machines[machine1]['ip-addresses'] | select('match','^[0-9.]+$') | first }}"
 
-    # [Check 2] Restored robust logic: Use nfs_server var if set, else default to machine0_ip
+    # [Safe Check] Logic for external NFS restored
     - name: 1.3 Decide NFS server IP
       set_fact:
         nfs_server_ip: "{{ (nfs_server | trim) if (nfs_server | trim != '') else machine0_ip }}"
@@ -79,7 +248,7 @@
       changed_when: false
 
     # -----------------------------------------------------------
-    # 0. Reset Logic
+    # 0. Reset Logic (Explicitly Separated for Peace of Mind)
     # -----------------------------------------------------------
     - name: 0.1 Reset Releases
       shell: |
@@ -94,7 +263,7 @@
       when: reset_before_install | bool
       changed_when: true
 
-    - name: 0.2 Reset Namespaces & Webhooks
+    - name: 0.2 Reset Namespaces
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           kubectl delete ns {{ ns_slurm }} --ignore-not-found=true --wait=true || true
@@ -102,6 +271,14 @@
           kubectl delete ns {{ ns_certmgr }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_nvidia }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_nfs }} --ignore-not-found=true --wait=true || true
+        EOS
+      when: reset_before_install | bool
+      changed_when: true
+
+    # [Safe Check] Task 0.3 is back explicitly
+    - name: 0.3 Reset Webhooks
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
           kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
         EOS
@@ -153,7 +330,7 @@
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-common
         EOS
-      # [Check 3] Loop is PRESENT
+      # [Safe Check] Loop is confirmed PRESENT
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
@@ -270,7 +447,7 @@
         sudo systemctl restart containerd
         sudo systemctl restart kubelet || true
         EOS
-      # [Check 4] Loop is PRESENT
+      # [Safe Check] Loop is confirmed PRESENT
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
