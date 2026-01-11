@@ -257,22 +257,18 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Fix /etc/hosts & Restart API)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Smart Restart)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
         echo "[FIX] correcting /etc/hosts to prevent localhost -> ::1 resolution..."
-        # 1. 將 /etc/hosts 裡的 ::1 註解掉
-        # 這能防止 K8s 內部元件將 localhost 解析為 IPv6
         if grep -q "^::1" /etc/hosts; then
             echo " -> Commenting out ::1 in /etc/hosts"
             sudo sed -i 's/^::1/#::1/g' /etc/hosts
-        else
-            echo " -> /etc/hosts seems clean of ::1"
         fi
 
-        # 2. 再次確保 .kube/config 正確 (為了 Helm Client)
+        # 2. 再次確保 .kube/config 正確
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
         if [ -d "$KUBE_DIR" ]; then
@@ -283,14 +279,28 @@
                 sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
             fi
         fi
+
+        # 3. [關鍵步驟] 智慧偵測並重啟 K8s 服務
+        echo "[FIX] Detecting and restarting K8s services..."
         
-        # 3. [關鍵步驟] 重啟 Kubelet 以觸發 API Server 重啟
-        # 因為修改了 hosts 和 sysctl，必須讓 API Server 重啟才能吃到新環境
-        echo "[FIX] Restarting Kubelet to refresh Static Pods (API Server)..."
-        sudo systemctl restart kubelet
+        # 嘗試重啟 Kubelet (Worker/Node Agent)
+        if systemctl list-units --full -all | grep -q "snap.kubelet.daemon.service"; then
+            echo " -> Detected Snap Kubelet (Charmed K8s), restarting..."
+            sudo systemctl restart snap.kubelet.daemon
+        elif systemctl list-units --full -all | grep -q "kubelet.service"; then
+            echo " -> Detected Standard Kubelet, restarting..."
+            sudo systemctl restart kubelet
+        else
+            echo " -> [WARN] Could not find kubelet service name. Skipping restart."
+        fi
+
+        # 嘗試重啟 API Server (如果是 Control Plane)
+        if systemctl list-units --full -all | grep -q "snap.kube-apiserver.daemon.service"; then
+             echo " -> Detected Snap API Server, restarting to flush DNS cache..."
+             sudo systemctl restart snap.kube-apiserver.daemon
+        fi
         
         echo "[WAIT] Waiting for API Server to come back online (max 60s)..."
-        # 迴圈等待 API Server 回應
         export KUBECONFIG="$USER_CONF"
         for i in {1..20}; do
             if kubectl get nodes >/dev/null 2>&1; then
@@ -301,7 +311,7 @@
             sleep 3
         done
 
-        # 4. 清除 Cache (再次確保)
+        # 4. 清除 Cache
         rm -rf "$KUBE_DIR/cache" "$KUBE_DIR/http-cache"
 
         # --- Helm Execution ---
