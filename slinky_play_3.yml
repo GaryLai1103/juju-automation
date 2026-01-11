@@ -129,6 +129,20 @@
       when: reset_before_install | bool
       changed_when: true
 
+    - name: 0.3 Reset (cluster-scoped MUTATING webhooks for slurm-operator only) - keep validating
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+          set +e
+          echo "[RESET] delete MUTATING webhook configs for slurm-operator (keep validating)..."
+          kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
+          echo "== mutatingwebhookconfigurations (filtered) =="
+          kubectl get mutatingwebhookconfigurations | egrep -i "slurm|slinky|operator|webhook" || true
+          echo "== validatingwebhookconfigurations (filtered) =="
+          kubectl get validatingwebhookconfigurations | egrep -i "slurm|slinky|operator|webhook" || true
+        '
+      when: reset_before_install | bool
+      changed_when: true
+
     # -----------------------------------------------------------
     # 3.0 Install NFS client utils on ALL nodes (IMPORTANT)
     # - Fix: mount: bad option ... need /sbin/mount.nfs
