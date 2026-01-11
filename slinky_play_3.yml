@@ -757,13 +757,12 @@
     print(values)
     PY
     
-        # yq 用來 post-renderer；沒有就抓
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
         fi
     
-        echo "[INFO] Write /tmp/slurm-post-renderer.sh (python, no heredoc)..."
+        echo "[INFO] Write /tmp/slurm-post-renderer.sh ..."
         python3 - <<'PY'
     import os, textwrap
     post = textwrap.dedent(r"""\
@@ -805,16 +804,13 @@
     """)
     open("/tmp/slurm-post-renderer.sh","w",encoding="utf-8").write(post)
     os.chmod("/tmp/slurm-post-renderer.sh",0o755)
-    print("== /tmp/slurm-post-renderer.sh ==")
-    print(post[:400] + "\n... (truncated) ...")
+    print("renderer ready")
     PY
     
-        # --- Gate: operator + webhook 必須 ready + endpoints ready ---
         echo "[GATE] Ensure operator + webhook are Ready..."
         kubectl -n "$OPNS" rollout status deploy/slurm-operator --timeout=600s
         kubectl -n "$OPNS" rollout status deploy/slurm-operator-webhook --timeout=600s
     
-        echo "[GATE] Discover webhook service..."
         SVC=$(kubectl -n "$OPNS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2 || true)
         [ -n "$SVC" ] || { echo "❌ webhook service not found"; kubectl -n "$OPNS" get svc -o wide; exit 1; }
     
@@ -826,14 +822,12 @@
         done
         [ -n "$READY_EP" ] || { echo "❌ webhook endpoints NOT ready"; kubectl -n "$OPNS" get pods,svc,ep -o wide; exit 1; }
     
-        # --- SAFE：只刪 slurm-operator 的 mutatingwebhookconfiguration，絕不碰 cert-manager ---
         echo "[PATCH] Remove ONLY slurm-operator mutatingwebhookconfigurations..."
         for m in $(kubectl get mutatingwebhookconfigurations -o name | grep -E 'slurm-operator' || true); do
           echo "[DELETE] $m"
           kubectl delete "$m" --ignore-not-found=true
         done
     
-        # --- Install slurm chart ---
         echo "[INFO] Helm upgrade/install slurm ..."
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
           -n "$NS" --create-namespace \
@@ -842,11 +836,9 @@
           --post-renderer /tmp/slurm-post-renderer.sh \
           --wait --timeout=600s
     
-        echo "[INFO] Helm done. Show pods:"
         kubectl -n "$NS" get pods -o wide || true
         EOS
       changed_when: true
-
 
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
