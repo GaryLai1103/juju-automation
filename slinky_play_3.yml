@@ -82,6 +82,58 @@
         nfs_server_ip: "{{ (nfs_server | trim) if (nfs_server | trim != '') else machine0_ip }}"
 
     # -----------------------------------------------------------
+    # 1.5 Disable IPv6 on nodes to avoid GHCR IPv6 timeout (YAML-safe)
+    # -----------------------------------------------------------
+    - name: 1.5 Disable IPv6 (sysctl.d) on machine0 & machine1 (YAML-safe)
+      shell: |
+        juju ssh --model {{ test_model }} {{ item }} -- bash -lc '
+          set -euo pipefail
+          sudo -n true
+
+          echo "[NET] disable IPv6 via sysctl.d ..."
+          sudo install -d -m 0755 /etc/sysctl.d
+
+          # YAML-safe: use printf instead of heredoc
+          printf "%s\n" \
+            "net.ipv6.conf.all.disable_ipv6 = 1" \
+            "net.ipv6.conf.default.disable_ipv6 = 1" \
+            "net.ipv6.conf.lo.disable_ipv6 = 1" | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+
+          sudo sysctl --system >/dev/null || true
+
+          echo "[NET] verify:"
+          cat /proc/sys/net/ipv6/conf/all/disable_ipv6 || true
+          (ip -6 addr || true) | sed -n "1,80p"
+        '
+      loop:
+        - "{{ machine0 }}"
+        - "{{ machine1 }}"
+      when: disable_ipv6 | bool
+      changed_when: true
+
+    - name: 1.6 Restart containerd/kubelet after network change (systemd + snap best-effort)
+      shell: |
+        juju ssh --model {{ test_model }} {{ item }} -- bash -lc '
+          set -euo pipefail
+          sudo -n true
+
+          echo "[NET] restart containerd/kubelet (best-effort)..."
+          sudo systemctl restart containerd 2>/dev/null || true
+          sudo systemctl restart kubelet   2>/dev/null || true
+          sudo systemctl restart snap.containerd.daemon 2>/dev/null || true
+          sudo systemctl restart snap.kubelet.daemon    2>/dev/null || true
+          sudo snap restart containerd 2>/dev/null || true
+          sudo snap restart kubelet   2>/dev/null || true
+
+          echo "[NET] done"
+        '
+      loop:
+        - "{{ machine0 }}"
+        - "{{ machine1 }}"
+      when: (disable_ipv6 | bool) and (restart_runtime_after_net_change | bool)
+      changed_when: true
+
+    # -----------------------------------------------------------
     # 2) Ensure Helm exists on machine0
     # -----------------------------------------------------------
     - name: 2.1 Install Helm on machine0 if missing
