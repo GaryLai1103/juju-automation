@@ -647,27 +647,29 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Version A (Webhook required + Endpoints gate + remove ONLY slurm-operator mutatingwebhooks) - YAML-safe
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Version A (YAML-safe, no heredoc in renderer)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-    
+
         NS="{{ ns_slurm }}"
         OPNS="{{ ns_slurm_operator }}"
         CHART_VER="{{ slurm_chart_ver }}"
-    
+
         SC="{{ nfs_storageclass }}"
         CP="{{ controlplane_hostname }}"
         GPU_NODE="{{ gpu_node_hostname }}"
         GPU_TAINT_KEY="{{ gpu_taint_key }}"
         GPU_TAINT_VAL="{{ gpu_taint_value }}"
         GPU_CNT="{{ slurm_gpu_count }}"
-    
-        # --- STEP 1) write values.yaml (printf, YAML-safe) ---
+
+        # -----------------------------
+        # 1) values.yaml (printf, YAML-safe)
+        # -----------------------------
         f=/tmp/slurm-values.yaml
         : > "$f"
         w(){ printf "%s\n" "$1" >> "$f"; }
-    
+
         w "controller:"
         w "  persistence:"
         w "    enabled: true"
@@ -744,62 +746,19 @@
         w "configFiles:"
         w "  gres.conf: |"
         w "    AutoDetect=nvidia"
-    
+
         echo "== /tmp/slurm-values.yaml =="
         sed -n '1,220p' "$f"
-    
-        # --- STEP 2) post-renderer (keep your yq logic) ---
-        if ! [ -x /tmp/yq ]; then
-          curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-          chmod +x /tmp/yq
-        fi
-    
-        cat > /tmp/slurm-post-renderer.sh <<'SH'
-    #!/usr/bin/env bash
-    set -euo pipefail
-    YQ="/tmp/yq"
-    tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
-    in="$tmpdir/in.yaml"
-    cat > "$in"
-    
-    "$YQ" eval -i '
-      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-        .spec.template.spec.containers
-      ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-        .spec.template.spec.initContainers
-      )
-      |
-      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-        .spec.template.spec.initContainers
-      ) = []
-    ' "$in" || true
-    
-    "$YQ" eval -i '
-      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-        .spec.template.spec.containers[] | select(.name=="slurmctld")
-      ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
-      |
-      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-        .spec.template.spec.containers[] | select(.name=="slurmctld")
-      ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1}
-      |
-      (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-        .spec.template.spec.containers[] | select(.name=="slurmctld")
-      ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
-    ' "$in" || true
-    
-    cat "$in"
-    SH
-        chmod +x /tmp/slurm-post-renderer.sh
-    
-        # --- STEP 3) gate operator + webhook endpoints ---
+
+        # -----------------------------
+        # 2) Gate operator + webhook endpoints
+        # -----------------------------
         kubectl -n "$OPNS" rollout status deploy/slurm-operator --timeout=600s
         kubectl -n "$OPNS" rollout status deploy/slurm-operator-webhook --timeout=600s
-    
+
         SVC=$(kubectl -n "$OPNS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2 || true)
         [ -n "$SVC" ] || { echo "❌ webhook service not found"; kubectl -n "$OPNS" get svc -o wide; exit 1; }
-    
+
         READY_EP=""
         for i in {1..60}; do
           EP=$(kubectl -n "$OPNS" get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
@@ -807,31 +766,27 @@
           echo "⏳ waiting webhook endpoints... ($i/60)"; sleep 5
         done
         [ -n "$READY_EP" ] || { echo "❌ webhook endpoints NOT ready"; kubectl -n "$OPNS" get pods,svc,ep -o wide; exit 1; }
-    
-        # --- STEP 3.5) remove ONLY slurm-operator mutating webhook configs (DO NOT touch cert-manager) ---
-        echo "== mutatingwebhookconfigurations (before) =="
-        kubectl get mutatingwebhookconfigurations | sed -n '1,200p' || true
-    
+
+        # -----------------------------
+        # 3) Remove ONLY slurm-operator mutating webhook configs (DO NOT touch cert-manager)
+        # -----------------------------
         for m in $(kubectl get mutatingwebhookconfigurations -o name | grep -E 'slurm-operator' || true); do
           echo "[DELETE] $m"
           kubectl delete "$m" --ignore-not-found=true
         done
-    
-        echo "== mutatingwebhookconfigurations (after) =="
-        kubectl get mutatingwebhookconfigurations | sed -n '1,200p' || true
-    
-        # --- STEP 4) install slurm chart ---
+
+        # -----------------------------
+        # 4) Install slurm chart (no post-renderer first; keep it stable)
+        # -----------------------------
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
           -n "$NS" --create-namespace \
           --version "$CHART_VER" \
           -f /tmp/slurm-values.yaml \
-          --post-renderer /tmp/slurm-post-renderer.sh \
           --wait --timeout=600s
-    
+
         kubectl -n "$NS" get pods -o wide || true
         EOS
       changed_when: true
-
 
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
