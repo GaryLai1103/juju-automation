@@ -289,7 +289,7 @@
         '
       changed_when: true
 
-    - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - robust
+    - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - Nuclear Cleanup
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -302,22 +302,40 @@
           echo "[WAIT] dpkg lock held..."; sleep 5
         done
 
-        # 再次確保乾淨 (雖然 3.1 做過了，但為了 Robustness 再做一次無妨)
-        sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
-        sudo rm -f /etc/apt/sources.list.d/nvidia-docker.list
-        sudo rm -f /etc/apt/sources.list.d/libnvidia-container.list
+        # --- [NUCLEAR FIX START] ---
+        echo "[FIX] Hunting down ALL references to nvidia-container repositories..."
+
+        # 1. 清理常見的 list 檔名
+        sudo rm -f /etc/apt/sources.list.d/nvidia-*.list
+        sudo rm -f /etc/apt/sources.list.d/libnvidia-*.list
+        sudo rm -f /etc/apt/sources.list.d/cuda*.list
+
+        # 2. 搜尋 /etc/apt/sources.list.d/ 下所有包含 nvidia 網址的檔案並刪除
+        # (避免它躲在一些怪名字的檔案裡)
+        grep -l "nvidia.github.io/libnvidia-container" /etc/apt/sources.list.d/* 2>/dev/null | xargs -r sudo rm -f
+
+        # 3. 清理主設定檔 /etc/apt/sources.list (這是最容易漏掉的地方)
+        if grep -q "nvidia.github.io/libnvidia-container" /etc/apt/sources.list; then
+            echo "[FIX] Found nvidia repo in /etc/apt/sources.list, removing..."
+            sudo sed -i '/nvidia.github.io\/libnvidia-container/d' /etc/apt/sources.list
+        fi
+        # --- [NUCLEAR FIX END] ---
 
         echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
+        # 下載 Keyring
         curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
-        # 使用 [signed-by=...] 避免 GPG 衝突
+        # 寫入新的 List (指定 signed-by)
         curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
           sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
 
         echo "[INFO] apt update/install..."
         sudo apt-get clean
+        
+        # 這裡應該不會再報錯了
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
 
         echo "[INFO] configure containerd runtime..."
