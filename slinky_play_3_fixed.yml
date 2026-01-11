@@ -253,29 +253,6 @@
         '
       changed_when: false
 
-    - name: 4.1.5 Fix kubeconfig server endpoint (force IPv4, avoid ::1)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          mkdir -p ~/.kube
-          if [ -f /etc/kubernetes/admin.conf ]; then
-            sudo sed -i \
-              -e "s#server: https://\\[::1\\]:6443#server: https://127.0.0.1:6443#g" \
-              -e "s#server: https://localhost:6443#server: https://127.0.0.1:6443#g" \
-              /etc/kubernetes/admin.conf || true
-            sudo cp /etc/kubernetes/admin.conf ~/.kube/config
-            sudo chown $(id -u):$(id -g) ~/.kube/config
-          fi
-          if [ -f ~/.kube/config ]; then
-            sed -i \
-              -e "s#server: https://\\[::1\\]:6443#server: https://127.0.0.1:6443#g" \
-              -e "s#server: https://localhost:6443#server: https://127.0.0.1:6443#g" \
-              ~/.kube/config || true
-          fi
-          kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}{\"\n\"}" || true
-        '
-      changed_when: false
-
     - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm (values file via printf)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
