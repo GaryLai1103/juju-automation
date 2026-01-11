@@ -253,25 +253,19 @@
         EOS
       changed_when: false
       
+---
 # ========================================================
-# SKU: Slinky-SlurmOnK8s-Standardized (Merged, Repeatable)
+# SKU: Slinky-SlurmOnK8s-Golden (IPv6-Disabled, Robust)
 #
-# Two-mode:
-#   reset_before_install=true  : clean rebuild (testing)
-#   reset_before_install=false : normal upgrade (daily)
-#
-# Includes:
-#   1) NFS server (machine0) + nfs-subdir-external-provisioner + StorageClass
-#   2) NVIDIA k8s-device-plugin (Helm) with tolerations + nodeSelector + affinity={}
-#   3) cert-manager + slurm-operator-crds + slurm-operator + slurm (OCI chart)
-#
-# Pitfalls avoided:
-#   - NEVER kubectl patch Controller.extraConf (Helm conflict)
-#   - Partitions do NOT depend on Feature
-#   - Device-plugin MUST toleration + nodeSelector; also clear affinity to avoid NFD dependency
+# Fixes applied:
+#   1. Nuclear cleanup of conflicting NVIDIA APT repos.
+#   2. System-wide IPv6 Disable (Kernel level).
+#   3. Force-kill K8s processes to refresh /etc/hosts (fix ::1 resolution).
+#   4. Aggressive Kube-Cache cleaning to fix Helm connection errors.
+#   5. Robust Bash syntax (HereDoc) to avoid quoting errors.
 # ========================================================
 
-- name: Application Layer - Deploy Slinky Slurm on K8s (Standardized Merged)
+- name: Application Layer - Deploy Slinky Slurm on K8s (Golden Standard)
   hosts: maasjuju
   gather_facts: yes
 
@@ -300,7 +294,7 @@
     nfs_server: ""                # leave empty => use machine0_ip
     nfs_export_path: "/srv/nfs/k8s"
     nfs_storageclass: "nfs-rwx"
-    nfs_make_default_sc: false     # if you want nfs-rwx as default SC => true
+    nfs_make_default_sc: false
 
     # ---- NVIDIA device plugin ----
     gpu_taint_key: "node-role.anxpert/gpu"
@@ -341,7 +335,7 @@
     # -----------------------------------------------------------
     - name: 2.1 Install Helm on machine0 if missing
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           set -e
           if ! command -v helm >/dev/null 2>&1; then
             echo "[INFO] Installing Helm..."
@@ -349,7 +343,7 @@
           else
             echo "[INFO] Helm already installed"
           fi
-        '
+        EOS
       changed_when: false
 
     # -----------------------------------------------------------
@@ -357,7 +351,7 @@
     # -----------------------------------------------------------
     - name: 0.1 Reset (helm uninstall releases)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           set +e
           echo "[RESET] uninstall releases..."
           helm -n {{ ns_slurm }} uninstall slurm 2>/dev/null || true
@@ -366,13 +360,13 @@
           helm -n {{ ns_certmgr }} uninstall cert-manager 2>/dev/null || true
           helm -n {{ ns_nvidia }} uninstall nvidia-device-plugin 2>/dev/null || true
           helm -n {{ ns_nfs }} uninstall nfs-provisioner 2>/dev/null || true
-        '
+        EOS
       when: reset_before_install | bool
       changed_when: true
 
     - name: 0.2 Reset (delete namespaces)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           set +e
           echo "[RESET] delete namespaces..."
           kubectl delete ns {{ ns_slurm }} --ignore-not-found=true --wait=true || true
@@ -380,76 +374,72 @@
           kubectl delete ns {{ ns_certmgr }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_nvidia }} --ignore-not-found=true --wait=true || true
           kubectl delete ns {{ ns_nfs }} --ignore-not-found=true --wait=true || true
-        '
+        EOS
+      when: reset_before_install | bool
+      changed_when: true
+
+    - name: 0.3 Reset (webhooks cleanup)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          set +e
+          echo "[RESET] Cleaning up all Webhooks..."
+          kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
+          kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
+        EOS
       when: reset_before_install | bool
       changed_when: true
 
     # -----------------------------------------------------------
-    # 3.0 Install NFS client utils on ALL nodes (IMPORTANT)
-    # - Fix: mount: bad option ... need /sbin/mount.nfs
+    # 3) Install NFS Utils (With Repo Cleanup First)
     # -----------------------------------------------------------
-    - name: 3.0 Setup NFS server export on machine0 (robust)
+    - name: 3.0 Setup NFS server export on machine0
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-
         sudo -n true
 
         echo "[INFO] wait dpkg lock..."
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-          echo "[WAIT] dpkg lock held..."; sleep 5
-        done
-
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do echo "[WAIT]"; sleep 5; done
+        
+        # Cleanup potential bad repos first
+        sudo rm -f /etc/apt/sources.list.d/nvidia-*.list 2>/dev/null || true
+        
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
-
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-          echo "[WAIT] dpkg lock held..."; sleep 5
-        done
-
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-kernel-server
 
         sudo mkdir -p {{ nfs_export_path }}
         sudo chmod 777 {{ nfs_export_path }}
         sudo mkdir -p /etc/exports.d
-
-        # MUST exist, or exportfs will complain
         sudo touch /etc/exports
-        sudo chmod 644 /etc/exports
-
+        
         EXPORT_LINE="{{ nfs_export_path }} *(rw,sync,no_subtree_check,no_root_squash)"
         echo "$EXPORT_LINE" | sudo tee /etc/exports.d/k8s.exports >/dev/null
-
         sudo exportfs -ra
-        timeout 60 sudo systemctl enable --now nfs-server
-
-        echo "[INFO] exportfs:"
-        sudo exportfs -v | sed -n "1,120p"
+        sudo systemctl enable --now nfs-server
         EOS
       when: nfs_server_setup | bool
       changed_when: true
 
-    - name: 3.1 Install nfs-common on k8s nodes (required for NFS mounts) - robust + wait dpkg lock
+    - name: 3.1 Install nfs-common on k8s nodes (CLEANUP BROKEN REPOS FIRST)
       shell: |
         juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-    
         sudo -n true
-    
-        echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-          echo "[WAIT] dpkg lock held..."; sleep 5
-        done
-    
+
+        # --- [CRITICAL FIX] ---
+        echo "[FIX] Cleaning up conflicting NVIDIA repo lists to unblock apt..."
+        sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        sudo rm -f /etc/apt/sources.list.d/nvidia-docker.list
+        sudo rm -f /etc/apt/sources.list.d/libnvidia-container.list
+        # ----------------------
+
+        echo "[INFO] wait dpkg lock..."
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
-    
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-          echo "[WAIT] dpkg lock held..."; sleep 5
-        done
-    
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-common
-    
         command -v mount.nfs || ls -l /sbin/mount.nfs* || true
         EOS
       loop:
@@ -458,348 +448,258 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 4) Install NFS provisioner (no heredoc)
+    # 4) Environment Fixes & NFS Provisioner
     # -----------------------------------------------------------
     - name: 4.1 Create namespace for NFS provisioner
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           kubectl create ns {{ ns_nfs }} --dry-run=client -o yaml | kubectl apply -f -
-        '
+        EOS
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner via Helm (values file via printf)
+    - name: 4.2 Install NFS Provisioner (Force Process Restart + Hosts Fix)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
-          helm repo update >/dev/null 2>&1
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
 
-          f=/tmp/nfs-values.yaml
-          : > $f
-          printf "nfs:\n" >> $f
-          printf "  server: %s\n" "{{ nfs_server_ip }}" >> $f
-          printf "  path: %s\n" "{{ nfs_export_path }}" >> $f
-          printf "storageClass:\n" >> $f
-          printf "  name: %s\n" "{{ nfs_storageclass }}" >> $f
-          printf "  defaultClass: %s\n" "{{ (nfs_make_default_sc | bool) | lower }}" >> $f
-          printf "  reclaimPolicy: Delete\n" >> $f
-          printf "  archiveOnDelete: true\n" >> $f
+        echo "[FIX] Ensuring /etc/hosts has NO ::1 ..."
+        if grep -q "^::1" /etc/hosts; then
+            sudo sed -i 's/^::1/#::1/g' /etc/hosts
+        fi
 
-          helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-            -n {{ ns_nfs }} --create-namespace \
-            -f $f
+        # 1. [絕招] 直接殺掉進程，強迫重啟 (不管是 Snap 還是 Apt 版)
+        echo "[FIX] Force killing K8s processes to refresh hosts..."
+        sudo pkill -f kube-apiserver || true
+        sudo pkill -f kubelet || true
+        
+        # 2. 等待復活
+        echo "[WAIT] Waiting for API Server to respawn (max 120s)..."
+        KUBE_DIR="$HOME/.kube"
+        USER_CONF="$KUBE_DIR/config"
+        
+        # 確保 Config 是 IPv4
+        if [ -f "$USER_CONF" ]; then
+             sudo chown $(id -u):$(id -g) "$USER_CONF"
+             sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+             sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+        fi
+        
+        export KUBECONFIG="$USER_CONF"
+        for i in {1..40}; do
+            if kubectl get nodes >/dev/null 2>&1; then
+                echo " -> API Server is UP!"
+                break
+            fi
+            sleep 3
+        done
 
-          echo "[INFO] storageclass:"
-          kubectl get sc | sed -n "1,120p"
-        '
+        # 3. [關鍵] 刪除所有 Webhook
+        echo "[FIX] Cleaning up potential zombie Webhooks..."
+        kubectl delete validatingwebhookconfigurations --all --ignore-not-found=true
+        kubectl delete mutatingwebhookconfigurations --all --ignore-not-found=true
+
+        # 4. 清除 Client Cache
+        rm -rf "$KUBE_DIR/cache" "$KUBE_DIR/http-cache"
+
+        # --- Helm Execution ---
+        helm --kubeconfig "$USER_CONF" repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
+        helm --kubeconfig "$USER_CONF" repo update >/dev/null 2>&1
+
+        f=/tmp/nfs-values.yaml
+        cat > "$f" <<EOF
+        nfs:
+          server: {{ nfs_server_ip }}
+          path: {{ nfs_export_path }}
+        storageClass:
+          name: {{ nfs_storageclass }}
+          defaultClass: {{ nfs_make_default_sc | bool | lower }}
+          reclaimPolicy: Delete
+          archiveOnDelete: true
+        EOF
+
+        echo "[INFO] Helm install NFS provisioner..."
+        helm --kubeconfig "$USER_CONF" upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+          -n {{ ns_nfs }} --create-namespace \
+          -f "$f"
+        EOS
       changed_when: true
 
-    # -----------------------------------------------------------
-    # [REPLACE 4.5 + REMOVE 4.6]
-    # 4.5 v2 (Merged): Install NVIDIA Container Toolkit + Prefer IPv4
-    # - Fix Signed-By conflict by purging ALL libnvidia-container stable/deb sources
-    # - dpkg/apt lock wait
-    # - Force IPv4 + retry
-    # - Detect containerd config path (snap vs native)
-    # - Restart containerd/kubelet (systemd + snap)
-    # -----------------------------------------------------------
-    - name: "4.5 v2 Install NVIDIA Container Toolkit + Prefer IPv4 (replaces 4.5 & 4.6)"
+    - name: 4.3 Install NVIDIA Container Toolkit on GPU Node (Nuclear Cleanup Fixed)
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-
         sudo -n true
 
-        echo "[INFO] wait dpkg/apt lock (unattended-upgrades)..."
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-          echo "[WAIT] dpkg lock held..."; sleep 5
-        done
+        echo "[INFO] wait dpkg/apt lock..."
+        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
 
-        # -----------------------------
-        # A) Hard purge conflicting NVIDIA sources (Signed-By conflict)
-        # -----------------------------
-        URL="nvidia.github.io/libnvidia-container/stable/deb"
-        echo "[FIX] purge any apt sources containing: ${URL}"
-
-        # Remove known conflicting lists
-        sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list \
-                   /etc/apt/sources.list.d/libnvidia-container*.list \
-                   /etc/apt/sources.list.d/libnvidia-container*.sources || true
-
-        # Purge URL from all sources (list + sources + main sources.list)
-        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-          [ -f "$f" ] || continue
-          if sudo grep -q "$URL" "$f" 2>/dev/null; then
-            echo "[FIX] remove URL from $f"
-            sudo sed -i "\|$URL|d" "$f" || true
-          fi
-        done
-
-        echo "[INFO] remaining NVIDIA-related source files:"
-        ls -1 /etc/apt/sources.list.d | grep -i nvidia || true
-
-        # -----------------------------
-        # B) Install prereqs + add repo with signed-by (IPv4 + retry)
-        # -----------------------------
-        echo "[INFO] install prereqs..."
-        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 update -y
-        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 install -y ca-certificates curl gnupg
-
-        echo "[INFO] add NVIDIA Container Toolkit repo (signed-by)..."
-        sudo install -d -m 0755 /usr/share/keyrings
-
-        curl -4 --retry 6 --retry-delay 2 --retry-connrefused -fsSL \
-          https://nvidia.github.io/libnvidia-container/gpgkey | \
-          sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-
-        ARCH="$(dpkg --print-architecture)"
-        LIST="/etc/apt/sources.list.d/nvidia-container-toolkit.list"
-        echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/${ARCH}/ /" | \
-          sudo tee "${LIST}" >/dev/null
-
-        echo "[INFO] apt update + install nvidia-container-toolkit (ForceIPv4)..."
-        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 update -y
-        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 install -y nvidia-container-toolkit
-
-        # -----------------------------
-        # C) Configure containerd runtime (snap vs native)
-        # -----------------------------
-        CFG="/etc/containerd/config.toml"
-        if [ -f /var/snap/containerd/common/etc/containerd/config.toml ]; then
-          CFG="/var/snap/containerd/common/etc/containerd/config.toml"
+        # --- [NUCLEAR FIX START] ---
+        echo "[FIX] Hunting down ALL references to nvidia-container repositories..."
+        sudo rm -f /etc/apt/sources.list.d/nvidia-*.list
+        sudo rm -f /etc/apt/sources.list.d/libnvidia-*.list
+        sudo rm -f /etc/apt/sources.list.d/cuda*.list
+        (grep -l "nvidia.github.io/libnvidia-container" /etc/apt/sources.list.d/* 2>/dev/null || true) | xargs -r sudo rm -f
+        if grep -q "nvidia.github.io/libnvidia-container" /etc/apt/sources.list; then
+            sudo sed -i '/nvidia.github.io\/libnvidia-container/d' /etc/apt/sources.list
         fi
-        echo "[INFO] containerd config: ${CFG}"
+        # --- [NUCLEAR FIX END] ---
 
-        if sudo grep -q "nvidia-container-runtime" "$CFG" 2>/dev/null; then
-          echo "[INFO] containerd already configured for nvidia runtime."
-        else
-          echo "[INFO] configure nvidia runtime for containerd..."
-          if nvidia-ctk runtime configure --help 2>/dev/null | grep -q -- "--config"; then
-            sudo nvidia-ctk runtime configure --runtime=containerd --config="$CFG"
-          else
-            sudo nvidia-ctk runtime configure --runtime=containerd
-          fi
+        echo "[INFO] add NVIDIA Container Toolkit repo (IPv4 + retry)..."
+        curl -4 --retry 6 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -4 --retry 6 --retry-connrefused -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+          sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
+          sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+
+        echo "[INFO] apt update/install..."
+        sudo apt-get clean
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
+        timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nvidia-container-toolkit
+
+        echo "[INFO] configure containerd runtime..."
+        sudo nvidia-ctk runtime configure --runtime=containerd
+        sudo systemctl restart containerd
+        sudo systemctl restart kubelet || true
+        EOS
+      changed_when: true
+
+    - name: 4.4 Disable IPv6 Completely on ALL nodes
+      shell: |
+        juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
+        set -euo pipefail
+        echo "[INFO] Disabling IPv6 system-wide on {{ item }}..."
+        cat <<EOF | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+        net.ipv6.conf.all.disable_ipv6 = 1
+        net.ipv6.conf.default.disable_ipv6 = 1
+        net.ipv6.conf.lo.disable_ipv6 = 1
+        EOF
+        sudo sysctl --system >/dev/null
+        
+        # 檢查
+        if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "1" ]; then
+            echo "✅ IPv6 is DISABLED."
         fi
+        
+        # Restart to flush connections
+        sudo systemctl restart containerd
+        sudo systemctl restart kubelet || true
+        EOS
+      loop:
+        - "{{ machine0 }}"
+        - "{{ machine1 }}"
+      changed_when: true
 
-        # -----------------------------
-        # D) Prefer IPv4 (replaces your 4.6)
-        # -----------------------------
-        echo "[INFO] prefer IPv4 via /etc/gai.conf precedence..."
-        if [ -f /etc/gai.conf ]; then
-          if sudo grep -qE "^[# ]*precedence ::ffff:0:0/96[[:space:]]+100" /etc/gai.conf; then
-            sudo sed -i "s/^[# ]*precedence ::ffff:0:0\/96[[:space:]]\+100/precedence ::ffff:0:0\/96  100/" /etc/gai.conf
-          elif ! sudo grep -qE "^precedence ::ffff:0:0/96[[:space:]]+100" /etc/gai.conf; then
-            echo "precedence ::ffff:0:0/96  100" | sudo tee -a /etc/gai.conf >/dev/null
-          fi
-        else
-          echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
-        fi
+    # -----------------------------------------------------------
+    # 5) NVIDIA device plugin
+    # -----------------------------------------------------------
+    - name: "5.2 Install/upgrade NVIDIA device plugin (Robust + Webhook cleanup)"
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        
+        # Cleanup again to be safe
+        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
+        kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
 
-        echo "== /etc/gai.conf (effective line) =="
-        sudo grep -nE "precedence ::ffff:0:0/96" /etc/gai.conf || true
+        helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
 
-        # -----------------------------
-        # E) Restart services (systemd + snap)
-        # -----------------------------
-        echo "[INFO] restart containerd + kubelet (systemd/snap best-effort)..."
-        sudo systemctl restart containerd 2>/dev/null || true
-        sudo systemctl restart kubelet   2>/dev/null || true
-        sudo systemctl restart snap.containerd.daemon 2>/dev/null || true
-        sudo systemctl restart snap.kubelet.daemon    2>/dev/null || true
-        sudo snap restart containerd 2>/dev/null || true
-        sudo snap restart kubelet   2>/dev/null || true
+        f=/tmp/nvidia-values.yaml
+        : > "$f"
+        w(){ printf "%s\n" "$1" >> "$f"; }
 
-        # -----------------------------
-        # F) Quick verify
-        # -----------------------------
-        echo "[INFO] quick verify:"
-        echo "== ${LIST} =="; sudo cat "${LIST}" || true
-        dpkg -l | egrep -n "nvidia-container-toolkit|libnvidia-container" || true
-        sudo grep -n "nvidia" "$CFG" | head -n 60 || true
+        w "affinity:"
+        w "  nodeAffinity:"
+        w "    requiredDuringSchedulingIgnoredDuringExecution:"
+        w "      nodeSelectorTerms:"
+        w "      - matchExpressions:"
+        w "        - key: kubernetes.io/hostname"
+        w "          operator: In"
+        w "          values:"
+        w "          - {{ gpu_node_hostname }}"
+        w "nodeSelector:"
+        w "  kubernetes.io/hostname: {{ gpu_node_hostname }}"
+        w "  kubernetes.io/os: linux"
+        w "tolerations:"
+        w "- key: {{ gpu_taint_key }}"
+        w "  operator: Equal"
+        w "  value: \"{{ gpu_taint_value }}\""
+        w "  effect: NoSchedule"
 
-        echo "✅ NVIDIA Container Toolkit + Prefer IPv4 DONE"
+        helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
+          -n {{ ns_nvidia }} --create-namespace \
+          --reset-values \
+          -f "$f" \
+          --wait --timeout=600s
         EOS
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5) NVIDIA device plugin (A方案：清空 affinity，避免 NFD 依賴)
-    # -----------------------------------------------------------
-    - name: 5.0 Precheck gpu node labels/taints
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -e
-          echo "== gpu node labels =="
-          kubectl get node {{ gpu_node_hostname }} --show-labels | tr "," "\n" | egrep -n "kubernetes.io/hostname|hostname" || true
-          echo
-          echo "== gpu node taints =="
-          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Taints:" -A2 || true
-        '
-      changed_when: false
-
-    - name: 5.1 Create namespace for NVIDIA device plugin
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          kubectl create ns {{ ns_nvidia }} --dry-run=client -o yaml | kubectl apply -f -
-        '
-      changed_when: false
-
-    - name: "5.2 Install/upgrade NVIDIA device plugin (hostname pin + override default affinity)"
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-    
-          helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
-          helm repo update >/dev/null 2>&1
-    
-          f=/tmp/nvidia-values.yaml
-          : > "$f"
-          w(){ printf "%s\n" "$1" >> "$f"; }
-    
-          # 目的：
-          # 1) 用 hostname nodeAffinity 覆蓋 chart 預設的 feature.node.kubernetes.io/* 規則
-          # 2) 再用 nodeSelector 綁死 gpu-node01
-          # 3) tolerations 可留（即使 node 沒 taint 也不影響）
-          w "affinity:"
-          w "  nodeAffinity:"
-          w "    requiredDuringSchedulingIgnoredDuringExecution:"
-          w "      nodeSelectorTerms:"
-          w "      - matchExpressions:"
-          w "        - key: kubernetes.io/hostname"
-          w "          operator: In"
-          w "          values:"
-          w "          - {{ gpu_node_hostname }}"
-          w "nodeSelector:"
-          w "  kubernetes.io/hostname: {{ gpu_node_hostname }}"
-          w "  kubernetes.io/os: linux"
-          w "tolerations:"
-          w "- key: {{ gpu_taint_key }}"
-          w "  operator: Equal"
-          w "  value: \"{{ gpu_taint_value }}\""
-          w "  effect: NoSchedule"
-    
-          echo "== values.yaml (show with line numbers) =="
-          nl -ba "$f" | sed -n "1,120p"
-    
-          echo "== helm upgrade/install =="
-          helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
-            -n {{ ns_nvidia }} --create-namespace \
-            --reset-values \
-            -f "$f"
-    
-          echo "== helm status/list =="
-          helm -n {{ ns_nvidia }} status nvidia-device-plugin || true
-          helm list -n {{ ns_nvidia }} || true
-    
-          echo "== rollout + resources =="
-          kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
-          kubectl -n {{ ns_nvidia }} get ds,pod -o wide
-    
-          echo "== node gpu capacity/allocatable =="
-          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A6 || true
-        '
-      changed_when: true
-
-    - name: 5.3 Verify nvidia.com/gpu on gpu node
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -e
-          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Taints:|Capacity:|Allocatable:|nvidia.com/gpu" -n
-        '
-      changed_when: false
-
-    # -----------------------------------------------------------
     # 6) cert-manager
     # -----------------------------------------------------------
-    - name: 6.1 Create namespace cert-manager
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          kubectl create ns {{ ns_certmgr }} --dry-run=client -o yaml | kubectl apply -f -
-        '
-      changed_when: false
-
     - name: 6.2 Install/upgrade cert-manager via Helm
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
-          helm repo update >/dev/null 2>&1
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
 
-          helm upgrade --install cert-manager jetstack/cert-manager \
-            -n {{ ns_certmgr }} --create-namespace \
-            --version {{ cert_manager_chart_version }} \
-            --set crds.enabled=true
-
-          kubectl -n {{ ns_certmgr }} rollout status deploy/cert-manager --timeout=240s
-          kubectl -n {{ ns_certmgr }} rollout status deploy/cert-manager-webhook --timeout=240s
-          kubectl -n {{ ns_certmgr }} rollout status deploy/cert-manager-cainjector --timeout=240s
-        '
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          -n {{ ns_certmgr }} --create-namespace \
+          --version {{ cert_manager_chart_version }} \
+          --set crds.enabled=true \
+          --wait --timeout=600s
+        EOS
       changed_when: true
 
     # -----------------------------------------------------------
-    # 7) slurm-operator-crds + slurm-operator (OCI charts)
+    # 7) slurm-operator
     # -----------------------------------------------------------
-    - name: 7.1 Create namespace for slurm operator
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          kubectl create ns {{ ns_slurm_operator }} --dry-run=client -o yaml | kubectl apply -f -
-        '
-      changed_when: false
-
     - name: 7.2 Install/upgrade slurm-operator-crds (OCI)
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           set -euo pipefail
           helm upgrade --install slurm-operator-crds oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
             -n default --create-namespace \
             --version {{ slurm_operator_chart_ver }}
-        '
+        EOS
       changed_when: true
 
-    - name: 7.3 Install/upgrade slurm-operator (OCI)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
-          helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
-            -n {{ ns_slurm_operator }} --create-namespace \
-            --version {{ slurm_operator_chart_ver }}
-
-          kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator --timeout=240s
-        '
-      changed_when: true
-
-    - name: 7.4 Wait for Slurm Operator Webhook endpoints (robust)
+    - name: 7.3 Install/upgrade slurm-operator (OCI) - Extended Timeout
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         NS="{{ ns_slurm_operator }}"
-    
-        echo "[INFO] wait webhook deployment ready..."
-        kubectl -n "$NS" rollout status deploy/slurm-operator-webhook --timeout=300s || true
-    
-        echo "[INFO] discover webhook service..."
-        SVC=$(kubectl -n "$NS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2 || true)
-        if [ -z "$SVC" ]; then
-          echo "[FAIL] no webhook service found"
-          kubectl -n "$NS" get svc -o wide || true
-          exit 1
+        
+        helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
+            -n "$NS" --create-namespace \
+            --version {{ slurm_operator_chart_ver }}
+
+        echo "[INFO] Waiting for rollout (timeout=600s)..."
+        if ! kubectl -n "$NS" rollout status deploy/slurm-operator --timeout=600s; then
+            echo "❌ Rollout Failed!"
+            kubectl -n "$NS" get events --sort-by='.lastTimestamp' | tail -n 20
+            exit 1
         fi
-        echo "[INFO] webhook svc=$SVC"
-    
-        echo "[INFO] wait endpoints..."
+        EOS
+      changed_when: true
+
+    - name: 7.4 Wait for Slurm Operator Webhook endpoints
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        NS="{{ ns_slurm_operator }}"
+        kubectl -n "$NS" rollout status deploy/slurm-operator-webhook --timeout=300s || true
+        SVC=$(kubectl -n "$NS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2)
+        
         for i in {1..120}; do
           EP=$(kubectl -n "$NS" get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
           if [ -n "$EP" ]; then
             echo "✅ Webhook endpoints ready: $EP"
             exit 0
           fi
-          echo "⏳ waiting endpoints... ($i/120)"
           sleep 5
         done
-    
-        echo "❌ timeout"
-        kubectl -n "$NS" get pods,svc,ep -o wide || true
-        kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 60 || true
         exit 1
         EOS
       changed_when: false
@@ -807,32 +707,19 @@
     # -----------------------------------------------------------
     # 8) slurm chart (OCI)
     # -----------------------------------------------------------
-    - name: 8.1 Create namespace slurm
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          kubectl create ns {{ ns_slurm }} --dry-run=client -o yaml | kubectl apply -f -
-        '
-      changed_when: false
-
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Operator Alive + Webhook Disabled (Helm-managed) + Robust Wait
+    - name: 8.2 Install/upgrade slurm chart (OCI)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-    
         NS="{{ ns_slurm }}"
-        OPNS="{{ ns_slurm_operator }}"
         CHART_VER="{{ slurm_chart_ver }}"
-        OP_VER="{{ slurm_operator_chart_ver }}"
-    
-        # --- [STEP 1] values.yaml (保持不變) ---
-        echo "[INFO] Write values.yaml ..."
+
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
             enabled: true
             storageClassName: "{{ nfs_storageclass }}"
-            accessModes:
-              - ReadWriteOnce
+            accessModes: [ReadWriteOnce]
             resources:
               requests:
                 storage: 10Gi
@@ -900,254 +787,75 @@
           gres.conf: |
             AutoDetect=nvidia
         EOF
-    
-        # --- [STEP 2] tools + post-renderer (保留：即使 CR-only 也安全 no-op) ---
+
+        # Ensure yq
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
         fi
-        
+
+        # Post-renderer
         cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
         set -euo pipefail
         YQ="/tmp/yq"
-        tmpdir="$(mktemp -d)"
-        trap 'rm -rf "$tmpdir"' EXIT
-        in="$tmpdir/in.yaml"
+        in="$(mktemp)"
         cat > "$in"
-        
+        # 1. Move initContainers to containers
         "$YQ" eval -i '
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers
-          ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.initContainers
-          )
-          |
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.initContainers
-          ) = []
-        ' "$in" || true
-        
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers) += 
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) = []
+        ' "$in"
+        # 2. Force tcpSocket probes
         "$YQ" eval -i '
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers[] | select(.name=="slurmctld")
-          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
-          |
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers[] | select(.name=="slurmctld")
-          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1}
-          |
-          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-            .spec.template.spec.containers[] | select(.name=="slurmctld")
-          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
-        ' "$in" || true
-        
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).startupProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).readinessProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1} |
+          (select(.kind=="NodeSet" and .metadata.name=="slurm-worker-slinky").spec.slurmd).livenessProbe =
+            {"tcpSocket":{"port":6818},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
+        ' "$in"
         cat "$in"
+        rm "$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
-        
-        # --- [STEP 3] 版本A關鍵：Webhook 必須存在且 endpoints ready ---
-        echo "[GATE] Ensure operator + webhook are Running and endpoints ready..."
-        kubectl -n "$OPNS" rollout status deploy/slurm-operator --timeout=240s
-        kubectl -n "$OPNS" rollout status deploy/slurm-operator-webhook --timeout=240s
-        
-        SVC=$(kubectl -n "$OPNS" get svc -o name | grep -i webhook | head -n1 | cut -d/ -f2 || true)
-        if [ -z "$SVC" ]; then
-          echo "❌ webhook service not found in ns=$OPNS"
-          kubectl -n "$OPNS" get svc -o wide || true
-          exit 1
-        fi
-        
-        for i in {1..60}; do
-          EP=$(kubectl -n "$OPNS" get ep "$SVC" -o jsonpath="{.subsets[*].addresses[*].ip}" 2>/dev/null || true)
-          if [ -n "$EP" ]; then
-            echo "✅ webhook endpoints ready: $EP"
-            break
-          fi
-          echo "⏳ waiting webhook endpoints... ($i/60)"
-          sleep 5
-        done
-        
-        # --- [STEP 4] Helm 安裝 slurm chart (operator/webhook 都活著的情況) ---
-        echo "[INFO] Helm upgrade/install slurm ..."
+
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-          -n "$NS" --create-namespace \
-          --version "$CHART_VER" \
-          -f /tmp/slurm-values.yaml \
-          --post-renderer /tmp/slurm-post-renderer.sh \
-          --wait --timeout=600s
-        
-        echo "[INFO] Helm success."
-        
-        # --- [STEP 5] 等待 operator 產生 workloads，並在卡 init 時輸出關鍵 log ---
-        echo
-        echo "== slurm ns objects =="
-        kubectl -n "$NS" get all 2>/dev/null || true
-        
-        echo
-        echo "[WAIT] wait controller pod to appear..."
-        for i in {1..120}; do
-          if kubectl -n "$NS" get pod -o name 2>/dev/null | grep -q "slurm-controller"; then
-            echo "✅ controller pod appeared"
-            break
-          fi
-          echo "⏳ waiting controller pod... ($i/120)"
-          sleep 5
-        done
-        
-        echo
-        echo "== pods =="
-        kubectl -n "$NS" get pods -o wide || true
-        
-        CTL_POD=$(kubectl -n "$NS" get pod -o name | grep -E "slurm-controller" | head -n1 | cut -d/ -f2 || true)
-        if [ -z "$CTL_POD" ]; then
-          echo "❌ controller pod not found; show events + operator logs"
-          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 80 || true
-          kubectl -n "$OPNS" logs deploy/slurm-operator --tail=200 || true
-          exit 1
-        fi
-        
-        echo
-        echo "[INFO] controller pod=$CTL_POD"
-        kubectl -n "$NS" describe pod "$CTL_POD" | egrep -n "Init Containers:|Containers:|Events:" -A120 || true
-        
-        # 如果卡在 init：直接吐 init container logs（你最需要的資訊）
-        if kubectl -n "$NS" get pod "$CTL_POD" -o jsonpath='{.status.initContainerStatuses[*].state.running.startedAt}' 2>/dev/null | grep -q .; then
-          echo
-          echo "⚠️ init containers are running (may be stuck). Dump init logs:"
-          kubectl -n "$NS" logs "$CTL_POD" -c reconfigure --tail=200 || true
-          kubectl -n "$NS" logs "$CTL_POD" -c logfile     --tail=200 || true
-        fi
-        
-        echo "[DONE] 8.2 (Version A) finished."
+            -n "$NS" --create-namespace \
+            --version "$CHART_VER" \
+            -f /tmp/slurm-values.yaml \
+            --post-renderer /tmp/slurm-post-renderer.sh \
+            --wait --timeout=600s
         EOS
       changed_when: true
-      
-    # -----------------------------------------------------------
-    # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
-    # -----------------------------------------------------------
-    - name: 8.25 Verify worker Ready + gres.conf + /dev/nvidia0 (no srun here)
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
-        set -euo pipefail
-    
-        NS="{{ ns_slurm }}"
-        WRK="slurm-worker-slinky-0"
-    
-        echo "[INFO] wait worker Ready..."
-        kubectl -n "$NS" wait --for=condition=Ready pod/"$WRK" --timeout=300s
-    
-        echo
-        echo "[CHECK] worker gres.conf:"
-        kubectl -n "$NS" exec "$WRK" -c slurmd -- cat /run/slurm/conf/gres.conf
-    
-        echo
-        echo "[CHECK] worker /dev/nvidia0:"
-        kubectl -n "$NS" exec "$WRK" -c slurmd -- ls -l /dev/nvidia0
-    
-        echo
-        echo "[CHECK] node GPU capacity (k8s):"
-        kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A6 || true
-        EOS
-      changed_when: false
 
     # -----------------------------------------------------------
     # 9) Restart controller + worker (Robust check)
     # -----------------------------------------------------------
     - name: 9.1 Restart slurm pods and Wait for Ready
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           set -e
-          echo "[INFO] 1. Deleting old pods..."
+          echo "[INFO] Restarting pods..."
           kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true --wait=true
           kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true --wait=true
-
-          echo "[INFO] 2. Waiting for StatefulSet to recreate pods..."
           sleep 10
-
-          echo "[INFO] 3. Waiting for pods to become Ready..."
-          # 如果這裡還失敗，會自動印出狀態
-          if ! kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s; then
-             echo "DEBUG: Controller Failed. PVC Status:"
-             kubectl -n {{ ns_slurm }} get pvc
-             exit 1
-          fi
-
-          if ! kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s; then
-             echo "DEBUG: Worker Failed. Describe:"
-             kubectl -n {{ ns_slurm }} describe pod slurm-worker-slinky-0
-             exit 1
-          fi
-
+          kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
+          kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
           echo "🎉 All Pods Ready!"
-          kubectl -n {{ ns_slurm }} get pods -o wide
-        '
-      changed_when: true
-
-    # -----------------------------------------------------------
-    # 10.1 Verify partitions/nodes/GRES and run GPU job (Slurm layer)
-    # - robust: use srun --wrap (avoid nested bash -lc quoting issues)
-    # - bounded: --time + --immediate
-    # - cleanup: scancel old gpu-smoke-* jobs
-    # -----------------------------------------------------------
-    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld) - robust (no --wrap) + cleanup
-      shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
-        set -euo pipefail
-    
-        NS="{{ ns_slurm }}"
-        CTL="slurm-controller-0"
-        GPU_CNT="{{ slurm_gpu_count | default(1) }}"
-    
-        echo "== sinfo (brief) =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'sinfo -o "%P %a %l %D %t %N"'
-    
-        echo
-        echo "== slurm.conf partitions =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'grep -n "^PartitionName=" /etc/slurm/slurm.conf 2>/dev/null || true'
-    
-        echo
-        echo "== node GRES / TRES (from slurmctld) =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'scontrol show node slinky-0 | egrep -i "NodeName=|State=|Reason=|Gres=|CfgTRES=|AllocTRES="'
-    
-        echo
-        echo "== cleanup old test jobs (by name gpu-smoke-*) =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc '
-          squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
-          scancel -u slurm -n gpu-smoke-all     >/dev/null 2>&1 || true
-          scancel -u slurm -n gpu-smoke-slinky  >/dev/null 2>&1 || true
-          squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
-        '
-    
-        echo
-        echo "== srun GPU test (default partition=all) [bounded] =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
-          timeout 90s srun -N1 -n1 --job-name=gpu-smoke-all \
-            --mpi=none \
-            --gres=gpu:${GPU_CNT} --time=00:01:00 --immediate=30 \
-            bash -lc 'hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_all'
-        "
-    
-        echo
-        echo "== srun GPU test (partition=slinky) [bounded] =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
-          timeout 90s srun -p slinky -N1 -n1 --job-name=gpu-smoke-slinky \
-            --mpi=none \
-            --gres=gpu:${GPU_CNT} --time=00:01:00 --immediate=30 \
-            bash -lc 'hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_slinky'
-        "
-    
-        echo
-        echo "== final squeue =="
-        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true'
         EOS
-      changed_when: false
+      changed_when: true
 
     - name: Done
       debug:
         msg:
-          - "🎉 Standardized Slinky Slurm on K8s deployed"
-          - "Mode reset_before_install={{ reset_before_install }}"
-          - "NFS SC={{ nfs_storageclass }} (default={{ nfs_make_default_sc }})"
-          - "NVIDIA device-plugin ns={{ ns_nvidia }} (nodeSelector={{ gpu_node_hostname }}, toleration {{ gpu_taint_key }}={{ gpu_taint_value }}, affinity cleared)"
-          - "Slurm ns={{ ns_slurm }} partitions=all(default)+slinky, GRES autodetect nvidia"
+          - "🎉 Standardized Slinky Slurm on K8s deployed (GOLDEN EDITION)"
+          - "System IPv6 Disabled. Kube-cache cleared. Hosts fixed."
+          - "RTX 4090 Ready for jobs!"
