@@ -494,7 +494,7 @@
         '
       changed_when: true
 
-    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node
+    - name: 4.5 Install NVIDIA Container Toolkit on GPU Node (Machine 1) - hard purge libnvidia-container sources then add signed-by
       shell: |
         juju ssh --model {{ test_model }} {{ machine1 }} -- bash -s <<'EOS'
         set -euo pipefail
