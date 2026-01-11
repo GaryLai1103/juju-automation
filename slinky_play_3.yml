@@ -540,13 +540,12 @@
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
+
         NS="{{ ns_slurm_operator }}"
         VER="{{ slurm_operator_chart_ver }}"
         CP="{{ controlplane_hostname }}"
 
-        # YAML-safe heredoc:
-        # - heredoc content is indented in this playbook (so Ansible YAML won't break)
-        # - sed removes the leading 8 spaces when writing the actual file
+        # values.yaml (YAML-safe)
         cat <<'EOF' | sed 's/^        //' > /tmp/slurm-operator-values.yaml
         operator:
           affinity:
@@ -557,7 +556,7 @@
                   - key: kubernetes.io/hostname
                     operator: In
                     values:
-                    - ${CP}
+                    - {{ controlplane_hostname }}
           tolerations:
           - key: node-role.kubernetes.io/control-plane
             operator: Exists
@@ -576,7 +575,7 @@
                   - key: kubernetes.io/hostname
                     operator: In
                     values:
-                    - ${CP}
+                    - {{ controlplane_hostname }}
           tolerations:
           - key: node-role.kubernetes.io/control-plane
             operator: Exists
@@ -587,7 +586,7 @@
         EOF
 
         echo "== /tmp/slurm-operator-values.yaml =="
-        sed -n "1,200p" /tmp/slurm-operator-values.yaml
+        sed -n "1,220p" /tmp/slurm-operator-values.yaml
 
         helm upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
           -n "$NS" --create-namespace \
