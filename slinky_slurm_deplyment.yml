@@ -814,15 +814,17 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Smart Bypass
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Operator Alive + Webhook Disabled (Helm-managed) + Robust Wait
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        
+    
         NS="{{ ns_slurm }}"
+        OPNS="{{ ns_slurm_operator }}"
         CHART_VER="{{ slurm_chart_ver }}"
-        
-        # --- [STEP 1] 準備 values.yaml (保持不變) ---
+        OP_VER="{{ slurm_operator_chart_ver }}"
+    
+        # --- [STEP 1] values.yaml (保持不變) ---
         echo "[INFO] Write values.yaml ..."
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
@@ -898,14 +900,13 @@
           gres.conf: |
             AutoDetect=nvidia
         EOF
-        
-        # --- [STEP 2] 準備工具 ---
+    
+        # --- [STEP 2] tools + post-renderer (保留：若 chart 有 STS 則會改；CR-only 則是安全 no-op) ---
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
         fi
-        
-        # --- [STEP 3] 準備 Post-Renderer ---
+    
         cat > /tmp/slurm-post-renderer.sh <<'SH'
         #!/usr/bin/env bash
         set -euo pipefail
@@ -914,8 +915,8 @@
         trap 'rm -rf "$tmpdir"' EXIT
         in="$tmpdir/in.yaml"
         cat > "$in"
-        
-        # 1. Move Init to Sidecar
+    
+        # Best-effort: only if STS exists in rendered manifest
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers
@@ -926,9 +927,8 @@
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.initContainers
           ) = []
-        ' "$in"
-        
-        # 2. Fix Probes
+        ' "$in" || true
+    
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers[] | select(.name=="slurmctld")
@@ -941,51 +941,73 @@
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
             .spec.template.spec.containers[] | select(.name=="slurmctld")
           ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
-        ' "$in"
+        ' "$in" || true
+    
         cat "$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
-
-        # --- [STEP 4] 關鍵修正：智慧型繞過 (Smart Bypass) ---
-        echo "[SETUP] Pause Operator but Keep Webhook Running..."
-        # 1. 暫停 Operator (防止它修復 Mutating 配置)
-        kubectl -n slinky scale deploy slurm-operator --replicas=0
-        
-        # 2. 確保 Webhook 活著 (這樣 Validating 檢查會通過，不會報 no endpoints)
-        kubectl -n slinky scale deploy slurm-operator-webhook --replicas=1
-        kubectl -n slinky rollout status deploy/slurm-operator-webhook --timeout=60s || true
-        
-        # 3. 只刪除 Mutating (防止注入 Init Container)
-        echo "[KILL] Deleting ONLY MutatingWebhookConfiguration..."
-        # 刪除所有可能的名稱，確保無死角
-        kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
-        kubectl delete mutatingwebhookconfigurations slurm-operator-webhook --ignore-not-found=true
-        
-        sleep 5
-        
-        # --- [STEP 5] 執行 Helm 安裝 ---
-        echo "[INFO] Helm upgrade/install (Smart Bypass)..."
+    
+        # --- [STEP 3] 關鍵修正：Operator 必須 Alive；Webhook 用 Helm 關掉（不要 kubectl delete）---
+        echo "[SETUP] Ensure Operator is RUNNING..."
+        kubectl -n "$OPNS" scale deploy slurm-operator --replicas=1 2>/dev/null || true
+        kubectl -n "$OPNS" rollout status deploy/slurm-operator --timeout=120s || true
+    
+        echo "[SETUP] Disable operator webhook via HELM (stable & repeatable)..."
+        # 讓 Helm 自己移除/不建立 webhook 相關資源
+        helm -n "$OPNS" upgrade --install slurm-operator oci://ghcr.io/slinkyproject/charts/slurm-operator \
+          --version "$OP_VER" \
+          --set webhook.enabled=false
+    
+        # --- [STEP 4] 安裝 slurm chart ---
+        echo "[INFO] Helm upgrade/install slurm ..."
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
-            -n "$NS" --create-namespace \
-            --version "$CHART_VER" \
-            -f /tmp/slurm-values.yaml \
-            --post-renderer /tmp/slurm-post-renderer.sh \
-            --wait --timeout=600s
-            
+          -n "$NS" --create-namespace \
+          --version "$CHART_VER" \
+          -f /tmp/slurm-values.yaml \
+          --post-renderer /tmp/slurm-post-renderer.sh \
+          --wait --timeout=600s
+    
         echo "[INFO] Helm success."
-        
-        # --- [STEP 6] 驗證 ---
+    
+        # --- [STEP 5] Robust verify：不要假設 slurm-controller STS 一定立刻存在 / 名字固定 ---
         echo
-        echo "[INFO] Verify slurm-controller has NO initContainers (must be empty):"
-        kubectl -n "$NS" get sts slurm-controller -o jsonpath='init={.spec.template.spec.initContainers[*].name}{"\n"}'
-        
+        echo "== slurm ns quick check =="
+        kubectl -n "$NS" get cm,secret 2>/dev/null || true
+        kubectl -n "$NS" get all 2>/dev/null || true
+    
         echo
-        echo "[INFO] Pods:"
-        kubectl -n "$NS" get pods -o wide
-        
-        # --- [STEP 7] 恢復 Operator ---
-        echo "[RESTORE] Scaling up Operator..."
-        kubectl -n slinky scale deploy slurm-operator --replicas=1
+        echo "[WAIT] Wait for any StatefulSet to appear in $NS (operator creates workloads)..."
+        for i in {1..90}; do
+          if kubectl -n "$NS" get sts -o name 2>/dev/null | grep -q .; then
+            echo "✅ StatefulSet detected."
+            break
+          fi
+          echo "⏳ waiting sts... ($i/90)"
+          sleep 5
+        done
+    
+        echo
+        echo "== StatefulSets =="
+        kubectl -n "$NS" get sts -o wide || true
+    
+        echo
+        echo "== Pods =="
+        kubectl -n "$NS" get pods -o wide || true
+    
+        # 動態找 controller STS（避免 NotFound）
+        STS=$(kubectl -n "$NS" get sts -o name 2>/dev/null | grep -i controller | head -n1 || true)
+        echo
+        echo "[INFO] controller sts = $STS"
+        if [ -n "$STS" ]; then
+          kubectl -n "$NS" get "$STS" -o jsonpath='init={.spec.template.spec.initContainers[*].name}{"\n"}containers={.spec.template.spec.containers[*].name}{"\n"}' || true
+        else
+          echo "⚠️ controller STS not found yet. Show recent events:"
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 80 || true
+          echo "Also operator logs (tail):"
+          kubectl -n "$OPNS" logs deploy/slurm-operator --tail=120 || true
+        fi
+    
+        echo "[DONE] 8.2 finished."
         EOS
       changed_when: true
       
