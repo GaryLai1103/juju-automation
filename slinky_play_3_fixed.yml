@@ -405,60 +405,70 @@
         '
       changed_when: false
 
-    - name: "5.2 Install/upgrade NVIDIA device plugin (hostname pin + override default affinity)"
+    - name: "5.2 Install/upgrade NVIDIA device plugin (Robust + Webhook cleanup)"
       shell: |
-        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -lc '
-          set -euo pipefail
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
 
-          helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
-          helm repo update >/dev/null 2>&1
+        # 1. [預防措施] 刪除可能殘留的 NVIDIA 相關 webhook，避免它們卡住 API Server
+        # (有時候舊的安裝會留下 webhook，導致新的安裝請求被攔截並 timeout)
+        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
+        kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
 
-          f=/tmp/nvidia-values.yaml
-          : > "$f"
-          w(){ printf "%s\n" "$1" >> "$f"; }
+        helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
 
-          # 目的：
-          # 1) 用 hostname nodeAffinity 覆蓋 chart 預設的 feature.node.kubernetes.io/* 規則
-          # 2) 再用 nodeSelector 綁死 gpu-node01
-          # 3) tolerations 可留（即使 node 沒 taint 也不影響）
-          w "affinity:"
-          w "  nodeAffinity:"
-          w "    requiredDuringSchedulingIgnoredDuringExecution:"
-          w "      nodeSelectorTerms:"
-          w "      - matchExpressions:"
-          w "        - key: kubernetes.io/hostname"
-          w "          operator: In"
-          w "          values:"
-          w "          - {{ gpu_node_hostname }}"
-          w "nodeSelector:"
-          w "  kubernetes.io/hostname: {{ gpu_node_hostname }}"
-          w "  kubernetes.io/os: linux"
-          w "tolerations:"
-          w "- key: {{ gpu_taint_key }}"
-          w "  operator: Equal"
-          w "  value: \"{{ gpu_taint_value }}\""
-          w "  effect: NoSchedule"
+        f=/tmp/nvidia-values.yaml
+        : > "$f"
+        w(){ printf "%s\n" "$1" >> "$f"; }
 
-          echo "== values.yaml (show with line numbers) =="
-          nl -ba "$f" | sed -n "1,120p"
+        # --- 建構 values.yaml ---
+        w "affinity:"
+        w "  nodeAffinity:"
+        w "    requiredDuringSchedulingIgnoredDuringExecution:"
+        w "      nodeSelectorTerms:"
+        w "      - matchExpressions:"
+        w "        - key: kubernetes.io/hostname"
+        w "          operator: In"
+        w "          values:"
+        w "          - {{ gpu_node_hostname }}"
+        w "nodeSelector:"
+        w "  kubernetes.io/hostname: {{ gpu_node_hostname }}"
+        w "  kubernetes.io/os: linux"
+        w "tolerations:"
+        w "- key: {{ gpu_taint_key }}"
+        w "  operator: Equal"
+        w "  value: \"{{ gpu_taint_value }}\""
+        w "  effect: NoSchedule"
 
-          echo "== helm upgrade/install =="
-          helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
-            -n {{ ns_nvidia }} --create-namespace \
-            --reset-values \
-            -f "$f"
+        echo "== values.yaml content =="
+        cat "$f"
 
-          echo "== helm status/list =="
-          helm -n {{ ns_nvidia }} status nvidia-device-plugin || true
-          helm list -n {{ ns_nvidia }} || true
+        echo
+        echo "== helm upgrade/install (timeout=600s) =="
+        # 增加 --timeout 與 --wait，確保安裝完成
+        helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
+          -n {{ ns_nvidia }} --create-namespace \
+          --reset-values \
+          -f "$f" \
+          --wait --timeout=600s
 
-          echo "== rollout + resources =="
-          kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=240s
-          kubectl -n {{ ns_nvidia }} get ds,pod -o wide
+        echo
+        echo "== helm status =="
+        helm -n {{ ns_nvidia }} status nvidia-device-plugin
 
-          echo "== node gpu capacity/allocatable =="
-          kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A6 || true
-        '
+        echo
+        echo "== rollout status =="
+        kubectl -n {{ ns_nvidia }} rollout status ds/nvidia-device-plugin --timeout=300s
+
+        echo
+        echo "== pod check =="
+        kubectl -n {{ ns_nvidia }} get pods -o wide
+
+        echo
+        echo "== node gpu capacity check =="
+        kubectl describe node {{ gpu_node_hostname }} | egrep -n "Capacity:|Allocatable:|nvidia.com/gpu" -A6 || true
+        EOS
       changed_when: true
 
     - name: 5.3 Verify nvidia.com/gpu on gpu node
