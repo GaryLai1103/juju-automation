@@ -347,28 +347,42 @@
         EOS
       changed_when: true
 
-    - name: 4.4 Prefer IPv4 for image pulls on ALL nodes (Machine 0 + 1)
+    - name: 4.4 Disable IPv6 Completely on ALL nodes (Machine 0 + 1)
       shell: |
-        juju ssh --model {{ test_model }} {{ item }} -- bash -lc '
-          set -euo pipefail
+        juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
+        set -euo pipefail
+        
+        echo "[INFO] Disabling IPv6 system-wide on {{ item }}..."
 
-          # 1) glibc resolver prefer IPv4-mapped
-          if [ ! -f /etc/gai.conf ]; then
-            echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
-          else
-            grep -q "precedence ::ffff:0:0/96" /etc/gai.conf || echo "precedence ::ffff:0:0/96  100" | sudo tee -a /etc/gai.conf >/dev/null
-            sudo sed -i "s/^[# ]*precedence ::ffff:0:0\/96.*/precedence ::ffff:0:0\/96  100/" /etc/gai.conf
-          fi
+        # 1. 寫入永久設定檔 (Persistent)
+        cat <<EOF | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+        net.ipv6.conf.all.disable_ipv6 = 1
+        net.ipv6.conf.default.disable_ipv6 = 1
+        net.ipv6.conf.lo.disable_ipv6 = 1
+        EOF
 
-          echo "== /etc/gai.conf (effective) =="
-          grep -nE "precedence ::ffff:0:0/96" /etc/gai.conf || true
+        # 2. 立即套用 (Apply immediately)
+        sudo sysctl --system >/dev/null
 
-          # 2) restart container runtime / kubelet (best-effort)
-          sudo systemctl restart containerd || true
-          sudo systemctl restart kubelet   || true
+        # 3. 驗證 (Verify)
+        CHECK=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        if [ "$CHECK" == "1" ]; then
+            echo "✅ IPv6 is now DISABLED (value=1)."
+        else
+            echo "❌ Failed to disable IPv6."
+            exit 1
+        fi
 
-          echo "✅ Prefer IPv4 applied on node={{ item }}"
-        '
+        # 4. 重啟 Container Runtime & Kubelet 讓它們斷開 IPv6 連線
+        echo "[INFO] Restarting containerd & kubelet to flush connections..."
+        sudo systemctl restart containerd
+        sudo systemctl restart kubelet || true
+
+        # 5. (可選) 檢查目前連外 IP 確保是 IPv4
+        echo "[INFO] Test connectivity..."
+        curl -4 -s https://checkip.amazonaws.com || true
+
+        EOS
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
