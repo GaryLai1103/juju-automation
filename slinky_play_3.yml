@@ -93,7 +93,6 @@
           echo "[NET] disable IPv6 via sysctl.d ..."
           sudo install -d -m 0755 /etc/sysctl.d
 
-          # YAML-safe: use printf instead of heredoc
           printf "%s\n" \
             "net.ipv6.conf.all.disable_ipv6 = 1" \
             "net.ipv6.conf.default.disable_ipv6 = 1" \
@@ -108,7 +107,7 @@
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
-      when: disable_ipv6 | bool
+      when: (disable_ipv6 | default(true)) | bool
       changed_when: true
 
     - name: 1.6 Restart containerd/kubelet after network change (systemd + snap best-effort)
@@ -130,7 +129,7 @@
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
-      when: (disable_ipv6 | bool) and (restart_runtime_after_net_change | bool)
+      when: ((disable_ipv6 | default(true)) | bool) and ((restart_runtime_after_net_change | default(true)) | bool)
       changed_when: true
 
     # -----------------------------------------------------------
