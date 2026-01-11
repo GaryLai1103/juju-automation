@@ -521,4 +521,4 @@
 
     - name: Done
       debug:
-        msg: "🎉 Slinky Slurm on K8s (Golden + AWX Quiet) Deployed Successfully!
+        msg: "🎉 Slinky Slurm on K8s (Golden + AWX Quiet) Deployed Successfully!"
