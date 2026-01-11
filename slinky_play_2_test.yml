@@ -285,7 +285,7 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5. NVIDIA Plugin (Fixed: Zombie Webhook Cleanup)
+    # 5. NVIDIA Plugin (Fixed: Grep exit code 1 issue)
     # -----------------------------------------------------------
     - name: 5.2 Install NVIDIA Device Plugin (Zombie Webhook Cleanup)
       shell: |
@@ -293,10 +293,11 @@
         set -euo pipefail
         
         # [CRITICAL FIX] 暴力搜尋並刪除所有 NVIDIA 相關的 Webhooks
-        # 因為殘留的 Webhook 會導致 API Server 在建立資源時卡死 30 秒然後超時
+        # (grep ... || true) 是為了防止 grep 找不到東西時回傳 error code 導致腳本中斷
         echo "[FIX] Hunting down zombie NVIDIA webhooks..."
-        kubectl get validatingwebhookconfigurations -o name | grep -i "nvidia" | xargs -r kubectl delete
-        kubectl get mutatingwebhookconfigurations -o name   | grep -i "nvidia" | xargs -r kubectl delete
+        
+        kubectl get validatingwebhookconfigurations -o name | (grep -i "nvidia" || true) | xargs -r kubectl delete
+        kubectl get mutatingwebhookconfigurations -o name   | (grep -i "nvidia" || true) | xargs -r kubectl delete
 
         # 標準 Helm 安裝流程
         helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
