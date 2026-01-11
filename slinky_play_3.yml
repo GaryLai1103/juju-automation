@@ -560,7 +560,7 @@
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - With Webhook Bypass (Fixed Validating)
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Smart Bypass
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -568,7 +568,7 @@
         NS="{{ ns_slurm }}"
         CHART_VER="{{ slurm_chart_ver }}"
         
-        # --- [STEP 1] 準備 values.yaml ---
+        # --- [STEP 1] 準備 values.yaml (保持不變) ---
         echo "[INFO] Write values.yaml ..."
         cat > /tmp/slurm-values.yaml <<EOF
         controller:
@@ -688,31 +688,29 @@
             .spec.template.spec.containers[] | select(.name=="slurmctld")
           ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
         ' "$in"
-        
         cat "$in"
         SH
         chmod +x /tmp/slurm-post-renderer.sh
-        
-        # --- [STEP 4] 關鍵修正：刺殺 Webhook (Bypass Admission Controller) ---
-        echo "[KILL] Stopping Webhook & Operator to prevent interference..."
+
+        # --- [STEP 4] 關鍵修正：智慧型繞過 (Smart Bypass) ---
+        echo "[SETUP] Pause Operator but Keep Webhook Running..."
+        # 1. 暫停 Operator (防止它修復 Mutating 配置)
         kubectl -n slinky scale deploy slurm-operator --replicas=0
-        kubectl -n slinky scale deploy slurm-operator-webhook --replicas=0
         
-        echo "[KILL] Deleting BOTH Mutating and Validating Webhook Configurations..."
+        # 2. 確保 Webhook 活著 (這樣 Validating 檢查會通過，不會報 no endpoints)
+        kubectl -n slinky scale deploy slurm-operator-webhook --replicas=1
+        kubectl -n slinky rollout status deploy/slurm-operator-webhook --timeout=60s || true
         
-        # 1. 刪除 Mutating (修改型)
+        # 3. 只刪除 Mutating (防止注入 Init Container)
+        echo "[KILL] Deleting ONLY MutatingWebhookConfiguration..."
+        # 刪除所有可能的名稱，確保無死角
         kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
         kubectl delete mutatingwebhookconfigurations slurm-operator-webhook --ignore-not-found=true
         
-        # 2. [新增] 刪除 Validating (驗證型) - 這就是你剛才缺少的關鍵！
-        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
-        kubectl delete validatingwebhookconfigurations slurm-operator-webhook --ignore-not-found=true
-        
         sleep 5
         
-        # --- [STEP 5] 執行 Helm 安裝 (現在沒有人會攔截我們了) ---
-        echo "[INFO] Helm upgrade/install (Bypassing Webhook)..."
-        # 這裡不需要迴圈重試了，因為干擾源已經沒了
+        # --- [STEP 5] 執行 Helm 安裝 ---
+        echo "[INFO] Helm upgrade/install (Smart Bypass)..."
         helm upgrade --install slurm oci://ghcr.io/slinkyproject/charts/slurm \
             -n "$NS" --create-namespace \
             --version "$CHART_VER" \
@@ -731,9 +729,8 @@
         echo "[INFO] Pods:"
         kubectl -n "$NS" get pods -o wide
         
-        # --- [STEP 7] (選擇性) 恢復 Operator ---
-        # 建議先不要恢復 webhook，只恢復 operator 即可
-        echo "[RESTORE] Scaling up Operator only..."
+        # --- [STEP 7] 恢復 Operator ---
+        echo "[RESTORE] Scaling up Operator..."
         kubectl -n slinky scale deploy slurm-operator --replicas=1
         EOS
       changed_when: true
