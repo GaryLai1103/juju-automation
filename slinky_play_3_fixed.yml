@@ -262,17 +262,16 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Force Helm Config)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Nuke Kube Cache)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
-        # --- [CRITICAL FIX START] ---
         echo "[FIX] Ensuring ~/.kube directory ownership & IPv4 endpoint..."
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
 
-        # 1. 修復檔案權限與內容 (這部分已經驗證成功)
+        # 1. 修復檔案權限與內容
         if [ -d "$KUBE_DIR" ]; then
             sudo chown -R $(id -u):$(id -g) "$KUBE_DIR"
             if [ -f "$USER_CONF" ]; then
@@ -281,16 +280,23 @@
                 sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
             fi
         fi
-        
-        # 2. 為了確保 Helm 吃到正確設定，我們明確匯出變數
+
+        # 2. [關鍵步驟] 清除 Kubernetes Client 快取
+        # Helm/Client-go 會快取 API Discovery 資訊，如果不刪除，它會一直去連舊的 IPv6 地址
+        echo "[FIX] Nuking Kubernetes Discovery Cache..."
+        rm -rf "$KUBE_DIR/cache"
+        rm -rf "$KUBE_DIR/http-cache"
+
+        # 3. 確保環境變數
         export KUBECONFIG="$USER_CONF"
         
-        echo "[INFO] Current Cluster Server endpoint (via kubectl):"
-        kubectl config view --minify -o jsonpath="{.clusters[0].cluster.server}"
+        # 4. 雙重驗證：直接 grep 檔案內容給你看，確保沒有 [::1]
+        echo "[DEBUG] Grepping 'server:' in kubeconfig:"
+        grep "server:" "$USER_CONF" || true
         echo
-        # --- [CRITICAL FIX END] ---
 
-        # 3. 強制 Helm 使用該 Config
+        # --- Helm Execution ---
+
         helm --kubeconfig "$USER_CONF" repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
         helm --kubeconfig "$USER_CONF" repo update >/dev/null 2>&1
 
@@ -307,7 +313,6 @@
         EOF
 
         echo "[INFO] Helm install NFS provisioner..."
-        # 這裡也加上 --kubeconfig 確保萬無一失
         helm --kubeconfig "$USER_CONF" upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
           -n {{ ns_nfs }} --create-namespace \
           -f "$f"
