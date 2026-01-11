@@ -257,61 +257,51 @@
         '
       changed_when: false
 
-    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Smart Restart)
+    - name: 4.2 Install/upgrade nfs-subdir-external-provisioner (Force Process Restart)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
 
-        echo "[FIX] correcting /etc/hosts to prevent localhost -> ::1 resolution..."
+        echo "[FIX] Ensuring /etc/hosts has NO ::1 ..."
         if grep -q "^::1" /etc/hosts; then
-            echo " -> Commenting out ::1 in /etc/hosts"
             sudo sed -i 's/^::1/#::1/g' /etc/hosts
         fi
 
-        # 2. 再次確保 .kube/config 正確
+        # 1. [絕招] 直接殺掉進程，強迫重啟 (不管是 Snap 還是 Apt 版)
+        # 這是為了讓 API Server 重新讀取 /etc/hosts，忘記 ::1
+        echo "[FIX] Force killing K8s processes to ensure restart..."
+        sudo pkill -f kube-apiserver || true
+        sudo pkill -f kubelet || true
+        
+        # 2. 等待它們復活
+        echo "[WAIT] Waiting for API Server to respawn (max 120s)..."
         KUBE_DIR="$HOME/.kube"
         USER_CONF="$KUBE_DIR/config"
-        if [ -d "$KUBE_DIR" ]; then
-            sudo chown -R $(id -u):$(id -g) "$KUBE_DIR"
-            if [ -f "$USER_CONF" ]; then
-                sudo chmod 600 "$USER_CONF"
-                sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
-                sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
-            fi
-        fi
-
-        # 3. [關鍵步驟] 智慧偵測並重啟 K8s 服務
-        echo "[FIX] Detecting and restarting K8s services..."
         
-        # 嘗試重啟 Kubelet (Worker/Node Agent)
-        if systemctl list-units --full -all | grep -q "snap.kubelet.daemon.service"; then
-            echo " -> Detected Snap Kubelet (Charmed K8s), restarting..."
-            sudo systemctl restart snap.kubelet.daemon
-        elif systemctl list-units --full -all | grep -q "kubelet.service"; then
-            echo " -> Detected Standard Kubelet, restarting..."
-            sudo systemctl restart kubelet
-        else
-            echo " -> [WARN] Could not find kubelet service name. Skipping restart."
-        fi
-
-        # 嘗試重啟 API Server (如果是 Control Plane)
-        if systemctl list-units --full -all | grep -q "snap.kube-apiserver.daemon.service"; then
-             echo " -> Detected Snap API Server, restarting to flush DNS cache..."
-             sudo systemctl restart snap.kube-apiserver.daemon
+        # 確保 Config 是 IPv4
+        if [ -f "$USER_CONF" ]; then
+             sudo chown $(id -u):$(id -g) "$USER_CONF"
+             sed -i 's|https://\[::1\]:6443|https://127.0.0.1:6443|g' "$USER_CONF"
+             sed -i 's|https://localhost:6443|https://127.0.0.1:6443|g' "$USER_CONF"
         fi
         
-        echo "[WAIT] Waiting for API Server to come back online (max 60s)..."
         export KUBECONFIG="$USER_CONF"
-        for i in {1..20}; do
+        for i in {1..40}; do
             if kubectl get nodes >/dev/null 2>&1; then
-                echo " -> API Server is UP!"
+                echo " -> API Server is UP and responding via IPv4!"
                 break
             fi
-            echo " ... waiting for API Server ($i/20)"
+            echo " ... waiting for API Server ($i/40)"
             sleep 3
         done
 
-        # 4. 清除 Cache
+        # 3. [關鍵] 刪除所有 Webhook
+        # 如果之前的安裝失敗殘留了 webhook，它們會攔截 API 請求並導致 Internal Error
+        echo "[FIX] Cleaning up potential zombie Webhooks..."
+        kubectl delete validatingwebhookconfigurations --all --ignore-not-found=true
+        kubectl delete mutatingwebhookconfigurations --all --ignore-not-found=true
+
+        # 4. 清除 Client Cache
         rm -rf "$KUBE_DIR/cache" "$KUBE_DIR/http-cache"
 
         # --- Helm Execution ---
