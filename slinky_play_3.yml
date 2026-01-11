@@ -536,7 +536,7 @@
         '
       changed_when: true
 
-    - name: 7.3 Install/upgrade slurm-operator (OCI) - pin operator+webhook to machine0 (slurmhn) + longer wait
+    - name: 7.3 Install/upgrade slurm-operator (OCI) - pin operator+webhook to machine0 (slurmhn) + longer wait (YAML-safe)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -544,44 +544,47 @@
         VER="{{ slurm_operator_chart_ver }}"
         CP="{{ controlplane_hostname }}"
 
-        cat > /tmp/slurm-operator-values.yaml <<EOF
-operator:
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: kubernetes.io/hostname
-            operator: In
-            values:
-            - ${CP}
-  tolerations:
-  - key: node-role.kubernetes.io/control-plane
-    operator: Exists
-    effect: NoSchedule
-  - key: node-role.kubernetes.io/master
-    operator: Exists
-    effect: NoSchedule
+        # YAML-safe heredoc:
+        # - heredoc content is indented in this playbook (so Ansible YAML won't break)
+        # - sed removes the leading 8 spaces when writing the actual file
+        cat <<'EOF' | sed 's/^        //' > /tmp/slurm-operator-values.yaml
+        operator:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                    - ${CP}
+          tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
+          - key: node-role.kubernetes.io/master
+            operator: Exists
+            effect: NoSchedule
 
-webhook:
-  enabled: true
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: kubernetes.io/hostname
-            operator: In
-            values:
-            - ${CP}
-  tolerations:
-  - key: node-role.kubernetes.io/control-plane
-    operator: Exists
-    effect: NoSchedule
-  - key: node-role.kubernetes.io/master
-    operator: Exists
-    effect: NoSchedule
-EOF
+        webhook:
+          enabled: true
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                    - ${CP}
+          tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
+          - key: node-role.kubernetes.io/master
+            operator: Exists
+            effect: NoSchedule
+        EOF
 
         echo "== /tmp/slurm-operator-values.yaml =="
         sed -n "1,200p" /tmp/slurm-operator-values.yaml
@@ -598,7 +601,6 @@ EOF
         kubectl -n "$NS" get pod -o wide
         EOS
       changed_when: true
-
 
     - name: 7.4 Wait for Slurm Operator Webhook endpoints (robust)
       shell: |
@@ -646,7 +648,7 @@ EOF
         '
       changed_when: false
 
-    - name: 8.2 Install/upgrade slurm chart (OCI) - Version A (Webhook required + Endpoints gate + REMOVE mutating webhooks) + Robust Wait
+    - name: 8.2 Install/upgrade slurm chart (OCI) - Version A (Webhook required + Endpoints gate + REMOVE mutating webhooks) + Robust Wait (YAML-safe)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -655,128 +657,131 @@ EOF
         OPNS="{{ ns_slurm_operator }}"
         CHART_VER="{{ slurm_chart_ver }}"
 
-        # --- [STEP 1] values.yaml (保持不變) ---
+        # --- [STEP 1] values.yaml (YAML-safe) ---
         echo "[INFO] Write values.yaml ..."
-        cat > /tmp/slurm-values.yaml <<EOF
-controller:
-  persistence:
-    enabled: true
-    storageClassName: "{{ nfs_storageclass }}"
-    accessModes:
-      - ReadWriteOnce
-    resources:
-      requests:
-        storage: 10Gi
-  extraConf: |
-    GresTypes=gpu
-  podSpec:
-    nodeSelector:
-      kubernetes.io/hostname: {{ controlplane_hostname }}
-      kubernetes.io/os: linux
-    tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
-      - key: node-role.kubernetes.io/master
-        operator: Exists
-        effect: NoSchedule
-restapi:
-  replicas: 1
-  podSpec:
-    nodeSelector:
-      kubernetes.io/hostname: {{ controlplane_hostname }}
-      kubernetes.io/os: linux
-    tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
-nodesets:
-  slinky:
-    enabled: true
-    partition:
-      enabled: false
-    useResourceLimits: true
-    podSpec:
-      nodeSelector:
-        kubernetes.io/hostname: {{ gpu_node_hostname }}
-        kubernetes.io/os: linux
-      tolerations:
-        - key: {{ gpu_taint_key }}
-          operator: Equal
-          value: "{{ gpu_taint_value }}"
-          effect: NoSchedule
-    slurmd:
-      resources:
-        limits:
-          nvidia.com/gpu: {{ slurm_gpu_count }}
-      args:
-        - --conf
-        - Gres=gpu:{{ slurm_gpu_count }}
-partitions:
-  all:
-    enabled: true
-    nodesets: [ALL]
-    configMap:
-      Default: "YES"
-      MaxTime: UNLIMITED
-      State: UP
-  slinky:
-    enabled: true
-    nodesets: [ALL]
-    configMap:
-      Default: "NO"
-      MaxTime: UNLIMITED
-      State: UP
-configFiles:
-  gres.conf: |
-    AutoDetect=nvidia
-EOF
+        cat <<'EOF' | sed 's/^        //' > /tmp/slurm-values.yaml
+        controller:
+          persistence:
+            enabled: true
+            storageClassName: "{{ nfs_storageclass }}"
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+          extraConf: |
+            GresTypes=gpu
+          podSpec:
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+                effect: NoSchedule
+        restapi:
+          replicas: 1
+          podSpec:
+            nodeSelector:
+              kubernetes.io/hostname: {{ controlplane_hostname }}
+              kubernetes.io/os: linux
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+        nodesets:
+          slinky:
+            enabled: true
+            partition:
+              enabled: false
+            useResourceLimits: true
+            podSpec:
+              nodeSelector:
+                kubernetes.io/hostname: {{ gpu_node_hostname }}
+                kubernetes.io/os: linux
+              tolerations:
+                - key: {{ gpu_taint_key }}
+                  operator: Equal
+                  value: "{{ gpu_taint_value }}"
+                  effect: NoSchedule
+            slurmd:
+              resources:
+                limits:
+                  nvidia.com/gpu: {{ slurm_gpu_count }}
+              args:
+                - --conf
+                - Gres=gpu:{{ slurm_gpu_count }}
+        partitions:
+          all:
+            enabled: true
+            nodesets: [ALL]
+            configMap:
+              Default: "YES"
+              MaxTime: UNLIMITED
+              State: UP
+          slinky:
+            enabled: true
+            nodesets: [ALL]
+            configMap:
+              Default: "NO"
+              MaxTime: UNLIMITED
+              State: UP
+        configFiles:
+          gres.conf: |
+            AutoDetect=nvidia
+        EOF
 
-        # --- [STEP 2] post-renderer (保留：即使 CR-only 也安全 no-op) ---
+        echo "== /tmp/slurm-values.yaml =="
+        sed -n "1,220p" /tmp/slurm-values.yaml
+
+        # --- [STEP 2] post-renderer (YAML-safe) ---
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x /tmp/yq
         fi
 
-        cat > /tmp/slurm-post-renderer.sh <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-YQ="/tmp/yq"
-tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
-in="$tmpdir/in.yaml"
-cat > "$in"
+        cat <<'SH' | sed 's/^        //' > /tmp/slurm-post-renderer.sh
+        #!/usr/bin/env bash
+        set -euo pipefail
+        YQ="/tmp/yq"
+        tmpdir="$(mktemp -d)"
+        trap 'rm -rf "$tmpdir"' EXIT
+        in="$tmpdir/in.yaml"
+        cat > "$in"
 
-# Move initContainers into containers (best-effort)
-"$YQ" eval -i '
-  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-    .spec.template.spec.containers
-  ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-    .spec.template.spec.initContainers
-  )
-  |
-  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-    .spec.template.spec.initContainers
-  ) = []
-' "$in" || true
+        # Move initContainers into containers (best-effort)
+        "$YQ" eval -i '
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers
+          ) += (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.initContainers
+          )
+          |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.initContainers
+          ) = []
+        ' "$in" || true
 
-# Add probes (best-effort)
-"$YQ" eval -i '
-  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-    .spec.template.spec.containers[] | select(.name=="slurmctld")
-  ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
-  |
-  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-    .spec.template.spec.containers[] | select(.name=="slurmctld")
-  ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1}
-  |
-  (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
-    .spec.template.spec.containers[] | select(.name=="slurmctld")
-  ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
-' "$in" || true
+        # Add probes (best-effort)
+        "$YQ" eval -i '
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1}
+          |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).readinessProbe = {"tcpSocket":{"port":6817},"failureThreshold":24,"periodSeconds":5,"timeoutSeconds":1}
+          |
+          (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller")
+            .spec.template.spec.containers[] | select(.name=="slurmctld")
+          ).livenessProbe = {"tcpSocket":{"port":6817},"failureThreshold":12,"periodSeconds":10,"timeoutSeconds":1}
+        ' "$in" || true
 
-cat "$in"
-SH
+        cat "$in"
+        SH
         chmod +x /tmp/slurm-post-renderer.sh
 
         # --- [STEP 3] Gate: operator + webhook 必須 ready，且 webhook endpoints 必須 ready（fail-fast）---
@@ -879,7 +884,6 @@ SH
         EOS
       changed_when: true
 
-      
     # -----------------------------------------------------------
     # 8.25 Verify worker got correct gres.conf and GPU device (K8s layer only)
     # -----------------------------------------------------------
