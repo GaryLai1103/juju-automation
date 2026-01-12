@@ -129,34 +129,53 @@
       register: juju_status
       failed_when: "'machines' not in (juju_status.stdout | from_json)"
 
-    - name: 0.6 Inject Air-Gap Images
+    - name: 0.6 Inject Air-Gap Images (Streaming Mode)
       shell: |
-        set -e
-        # 1. 檢查檔案
-        if [ ! -f "{{ tar_file }}" ]; then
-           echo "⚠️ Tarball {{ tar_file }} not found, skipping injection."
-           exit 0
-        fi
+        # 定義要傳送的 Image 清單 (必須與 Jumpbox 上 docker images 看到的名稱一致)
+        IMAGES=(
+          "ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04"
+          "ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04"
+          "ghcr.io/slinkyproject/slurm-operator:1.0.1"
+          "docker.io/library/alpine:latest"
+          "nvcr.io/nvidia/k8s-device-plugin:v0.14.0"
+          "quay.io/jetstack/cert-manager-controller:v1.19.2"
+          "quay.io/jetstack/cert-manager-webhook:v1.19.2"
+          "quay.io/jetstack/cert-manager-cainjector:v1.19.2"
+          "quay.io/jetstack/cert-manager-startupapicheck:v1.19.2"
+          "rancher/local-path-provisioner:v0.0.30"
+          "docker.io/library/busybox:latest"
+          "registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2"
+          "registry.k8s.io/pause:3.9"
+          "registry.k8s.io/coredns/coredns:v1.10.1"
+          "docker.io/calico/node:v3.26.1"
+          "docker.io/calico/cni:v3.26.1"
+          "docker.io/calico/kube-controllers:v3.26.1"
+        )
 
-        # 2. 迴圈處理 Machine 0 和 1
+        # 迴圈處理 Machine 0 和 1
         for MACHINE in 0 1; do
-           echo "----------------------------------------"
-           echo "🚀 Injecting to Machine $MACHINE..."
-           
-           # 傳送
-           juju scp --model {{ test_model }} "{{ tar_file }}" "${MACHINE}:/tmp/airgap_images.tar"
-
-           # 匯入 (k8s.io namespace)
-           echo "📦 Importing images..."
-           juju ssh --model {{ test_model }} "${MACHINE}" -- \
-             "sudo ctr -n k8s.io images import /tmp/airgap_images.tar"
-           
-           # 清理
-           juju ssh --model {{ test_model }} "${MACHINE}" -- "rm -f /tmp/airgap_images.tar"
+          echo "==================================================="
+          echo "🚀 Processing Machine $MACHINE (Streaming Mode)..."
+          echo "==================================================="
+          
+          for IMG in "${IMAGES[@]}"; do
+             echo " -> 📤 Streaming: $IMG ..."
+             
+             # [核心修改] 使用 Pipe 直傳，不產生中間檔案
+             # docker save (本地) | juju ssh | ctr import - (遠端)
+             docker save "$IMG" | juju ssh --model {{ test_model }} "$MACHINE" "sudo ctr -n k8s.io images import -" > /dev/null
+             
+             if [ $? -eq 0 ]; then
+                 echo "    ✅ Success"
+             else
+                 echo "    ❌ Failed to transfer $IMG"
+                 exit 1
+             fi
+          done
         done
-        echo "✅ Injection Complete."
+        echo "🎉 All Image Injections Complete."
       register: inject_res
-      changed_when: "'unpacking' in inject_res.stdout"
+      changed_when: "'Success' in inject_res.stdout"
       
     # -----------------------------------------------------------
     # 3. NFS Setup
