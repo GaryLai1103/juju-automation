@@ -371,7 +371,8 @@
             -n {{ ns_slurm_operator }} --create-namespace \
             --version {{ slurm_operator_chart_ver }}
         
-        kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator --timeout=600s
+        # [FIX] Timeout 拉長到 1200s (20min) 以應對慢速網路 Image Pull
+        kubectl -n {{ ns_slurm_operator }} rollout status deploy/slurm-operator --timeout=1200s
         EOS
       changed_when: true
 
