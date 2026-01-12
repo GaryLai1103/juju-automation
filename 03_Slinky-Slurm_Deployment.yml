@@ -173,7 +173,6 @@
         EOS
       changed_when: false
 
-
 # ========================================================
 # PLAY 2: Application Layer (The Golden Edition)
 # ========================================================
@@ -281,6 +280,15 @@
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
           kubectl delete mutatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
           kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=slurm-operator --ignore-not-found=true
+        EOS
+      when: reset_before_install | bool
+      changed_when: true
+
+    - name: 0.4 Clean NFS Data (Optional)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          # 清空 NFS 分享目錄下的所有檔案，確保 Slurm 從零開始
+          sudo rm -rf {{ nfs_export_path }}/*
         EOS
       when: reset_before_install | bool
       changed_when: true
@@ -461,13 +469,21 @@
       changed_when: true
 
     # -----------------------------------------------------------
-    # 5. NVIDIA Plugin
+    # 5. NVIDIA Plugin (Fixed: Grep exit code 1 issue)
     # -----------------------------------------------------------
-    - name: 5.2 Install NVIDIA Device Plugin
+    - name: 5.2 Install NVIDIA Device Plugin (Zombie Webhook Cleanup)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        kubectl delete validatingwebhookconfigurations -l app.kubernetes.io/name=nvidia-device-plugin --ignore-not-found=true
+        
+        # [CRITICAL FIX] 暴力搜尋並刪除所有 NVIDIA 相關的 Webhooks
+        # (grep ... || true) 是為了防止 grep 找不到東西時回傳 error code 導致腳本中斷
+        echo "[FIX] Hunting down zombie NVIDIA webhooks..."
+        
+        kubectl get validatingwebhookconfigurations -o name | (grep -i "nvidia" || true) | xargs -r kubectl delete
+        kubectl get mutatingwebhookconfigurations -o name   | (grep -i "nvidia" || true) | xargs -r kubectl delete
+
+        # 標準 Helm 安裝流程
         helm repo add nvidia https://nvidia.github.io/k8s-device-plugin >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
@@ -490,6 +506,7 @@
           effect: NoSchedule
         EOF
 
+        echo "[INFO] Installing NVIDIA Device Plugin..."
         helm upgrade --install nvidia-device-plugin nvidia/nvidia-device-plugin \
           -n {{ ns_nvidia }} --create-namespace \
           --reset-values -f /tmp/nvidia-values.yaml \
@@ -688,12 +705,84 @@
           echo "[INFO] Restarting pods..."
           kubectl -n {{ ns_slurm }} delete pod slurm-controller-0 --ignore-not-found=true --wait=true
           kubectl -n {{ ns_slurm }} delete pod slurm-worker-slinky-0 --ignore-not-found=true --wait=true
-          sleep 10
+          
+          echo "[INFO] Waiting for Controller to be Ready..."
+          # Controller 通常比較快，直接等 Ready
           kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-controller-0 --timeout=300s
+
+          echo "[INFO] Waiting for Worker to be Created..."
+          # [FIX] 先循環等待 Worker Pod 出現，避免 "NotFound" 錯誤
+          for i in {1..60}; do
+             if kubectl -n {{ ns_slurm }} get pod slurm-worker-slinky-0 >/dev/null 2>&1; then
+                echo " -> Worker Pod created!"
+                break
+             fi
+             echo " -> Waiting for worker creation..."
+             sleep 3
+          done
+          
+          echo "[INFO] Waiting for Worker to be Ready..."
           kubectl -n {{ ns_slurm }} wait --for=condition=Ready pod/slurm-worker-slinky-0 --timeout=300s
+          
           echo "🎉 All Pods Ready!"
         EOS
       changed_when: true
+
+    # -----------------------------------------------------------
+    # 10.1 Verify partitions/nodes/GRES and run GPU job
+    # -----------------------------------------------------------
+    - name: 10.1 Verify partitions/nodes/GRES and run GPU job (inside slurmctld)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+
+        NS="{{ ns_slurm }}"
+        CTL="slurm-controller-0"
+        GPU_CNT="{{ slurm_gpu_count | default(1) }}"
+
+        echo "== sinfo (brief) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'sinfo -o "%P %a %l %D %t %N"'
+
+        echo
+        echo "== slurm.conf partitions =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'grep -n "^PartitionName=" /etc/slurm/slurm.conf 2>/dev/null || true'
+
+        echo
+        echo "== node GRES / TRES (from slurmctld) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'scontrol show node slinky-0 | egrep -i "NodeName=|State=|Reason=|Gres=|CfgTRES=|AllocTRES="'
+
+        echo
+        echo "== cleanup old test jobs (by name gpu-smoke-*) =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc '
+          squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
+          scancel -u slurm -n gpu-smoke-all     >/dev/null 2>&1 || true
+          scancel -u slurm -n gpu-smoke-slinky  >/dev/null 2>&1 || true
+          squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true
+        '
+
+        echo
+        echo "== srun GPU test (default partition=all) [bounded] =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
+          timeout 90s srun -N1 -n1 --job-name=gpu-smoke-all \
+            --mpi=none \
+            --gres=gpu:${GPU_CNT} --time=00:01:00 --immediate=30 \
+            bash -lc 'hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_all'
+        "
+
+        echo
+        echo "== srun GPU test (partition=slinky) [bounded] =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc "
+          timeout 90s srun -p slinky -N1 -n1 --job-name=gpu-smoke-slinky \
+            --mpi=none \
+            --gres=gpu:${GPU_CNT} --time=00:01:00 --immediate=30 \
+            bash -lc 'hostname; ls -l /dev/nvidia0 || true; echo GPU_OK_slinky'
+        "
+
+        echo
+        echo "== final squeue =="
+        kubectl -n "$NS" exec "$CTL" -c slurmctld -- bash -lc 'squeue -u slurm -o "%.18i %.9P %.16j %.8u %.2t %.10M %.6D %R" || true'
+        EOS
+      changed_when: false
 
     - name: Done
       debug:
