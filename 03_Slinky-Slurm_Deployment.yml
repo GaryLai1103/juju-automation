@@ -184,6 +184,9 @@
     # ---- Mode ----
     reset_before_install: true
 
+    # ---- Setup ----
+    tar_file: "/home/gary/slinky-airgap-final.tar"
+    
     # ---- Juju / machines ----
     test_model: "slinky-cluster"
     machine0: "0"
@@ -292,7 +295,66 @@
         EOS
       when: reset_before_install | bool
       changed_when: true
+      
+    # ===========================================================
+    # PART 0: Air-Gap Image Injection (針對現有機器)
+    # ===========================================================
+    - name: 0.5 Check machines availability
+      shell: "juju status --model {{ test_model }} --format json"
+      register: juju_status
+      failed_when: "'machines' not in (juju_status.stdout | from_json)"
 
+    - name: 0.6 Inject Air-Gap Images (Streaming Mode)
+      shell: |
+        # 定義要傳送的 Image 清單
+        IMAGES=(
+          "ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04"
+          "ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04"
+          "ghcr.io/slinkyproject/slurm-operator:1.0.1"
+          "docker.io/library/alpine:latest"
+          "nvcr.io/nvidia/k8s-device-plugin:v0.14.0"
+          "quay.io/jetstack/cert-manager-controller:v1.19.2"
+          "quay.io/jetstack/cert-manager-webhook:v1.19.2"
+          "quay.io/jetstack/cert-manager-cainjector:v1.19.2"
+          "quay.io/jetstack/cert-manager-startupapicheck:v1.19.2"
+          "rancher/local-path-provisioner:v0.0.30"
+          "docker.io/library/busybox:latest"
+          "registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2"
+          "registry.k8s.io/pause:3.9"
+          "registry.k8s.io/coredns/coredns:v1.10.1"
+          "docker.io/calico/node:v3.26.1"
+          "docker.io/calico/cni:v3.26.1"
+          "docker.io/calico/kube-controllers:v3.26.1"
+        )
+
+        # 迴圈處理 Machine 0 和 1
+        for MACHINE in 0 1; do
+          echo "==================================================="
+          echo "🚀 Processing Machine $MACHINE (Streaming Mode)..."
+          echo "==================================================="
+          
+          for IMG in "${IMAGES[@]}"; do
+             echo " -> 📤 Streaming: $IMG ..."
+             
+             # 核心傳輸指令
+             docker save "$IMG" | juju ssh --model {{ test_model }} "$MACHINE" "sudo ctr -n k8s.io images import -" > /dev/null
+             
+             if [ $? -eq 0 ]; then
+                 echo "    ✅ Success"
+             else
+                 echo "    ❌ Failed to transfer $IMG"
+                 # 這裡可以選擇是否要 exit 1，或者繼續傳下一個
+                 # exit 1 
+             fi
+          done
+        done
+        echo "🎉 All Image Injections Complete."
+      # 👇 這一行非常重要！指定使用 Bash 來執行
+      args:
+        executable: /bin/bash
+      register: inject_res
+      changed_when: "'Success' in inject_res.stdout"
+      
     # -----------------------------------------------------------
     # 3. NFS Setup
     # -----------------------------------------------------------
