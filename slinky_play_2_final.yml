@@ -1,46 +1,4 @@
 # ========================================================
-# PLAY 0: Air-Gap Pre-load (直接注入 Image 到節點，繞過網路下載)
-# ========================================================
-- name: 0. Pre-load Air-Gap Images to Nodes
-  hosts: maasjuju
-  gather_facts: no
-  vars:
-    # 這是你剛剛上傳到 Jumpbox 的檔案路徑
-    tar_file: "/home/gary/slinky-airgap-final.tar"
-    
-    # 目標節點 (Juju Machine ID)
-    target_machines: 
-      - "0"
-      - "1"
-    
-    # Juju Model 名稱
-    test_model: "slinky-cluster"
-
-  tasks:
-    - name: 0.1 Check if tarball exists on Jumpbox
-      stat:
-        path: "{{ tar_file }}"
-      register: tar_stat
-      failed_when: not tar_stat.stat.exists
-
-    - name: 0.2 Distribute & Import Images (此步驟需數分鐘)
-      shell: |
-        # 1. 將檔案傳送到 K8s 節點的 /tmp
-        echo " -> 🚀 Copying tarball to machine {{ item }}..."
-        juju scp {{ tar_file }} {{ test_model }}/{{ item }}:/tmp/airgap_images.tar
-
-        # 2. 強制匯入到 containerd (k8s.io namespace)
-        echo " -> 📦 Importing images on machine {{ item }}..."
-        juju ssh {{ test_model }}/{{ item }} -- \
-          "sudo ctr -n k8s.io images import /tmp/airgap_images.tar"
-        
-        # 3. 清理暫存檔
-        juju ssh {{ test_model }}/{{ item }} -- "rm -f /tmp/airgap_images.tar"
-      loop: "{{ target_machines }}"
-      register: import_res
-      changed_when: "'unpacking' in import_res.stdout"
-
-# ========================================================
 # PLAY 2: Application Layer (The Golden Edition)
 # ========================================================
 - name: 2. Application Layer - Deploy Slinky Slurm on K8s
@@ -51,6 +9,10 @@
     # ---- Mode ----
     reset_before_install: true
 
+    # ---- Setup ----
+    tar_file: "/home/gary/slinky-airgap-final.tar"
+    test_model: "slinky-cluster"
+    
     # ---- Juju / machines ----
     test_model: "slinky-cluster"
     machine0: "0"
@@ -85,6 +47,43 @@
     slurm_chart_ver: "1.0.1"
 
   tasks:
+    # ===========================================================
+    # PART 0: Air-Gap Image Injection (針對現有機器)
+    # ===========================================================
+    - name: 0.0 Check machines availability
+      shell: "juju status --model {{ test_model }} --format json"
+      register: juju_status
+      failed_when: "'machines' not in (juju_status.stdout | from_json)"
+
+    - name: 0.1 Inject Air-Gap Images
+      shell: |
+        set -e
+        # 1. 檢查檔案
+        if [ ! -f "{{ tar_file }}" ]; then
+           echo "⚠️ Tarball {{ tar_file }} not found, skipping injection."
+           exit 0
+        fi
+
+        # 2. 迴圈處理 Machine 0 和 1
+        for MACHINE in 0 1; do
+           echo "----------------------------------------"
+           echo "🚀 Injecting to Machine $MACHINE..."
+           
+           # 傳送
+           juju scp --model {{ test_model }} "{{ tar_file }}" "${MACHINE}:/tmp/airgap_images.tar"
+
+           # 匯入 (k8s.io namespace)
+           echo "📦 Importing images..."
+           juju ssh --model {{ test_model }} "${MACHINE}" -- \
+             "sudo ctr -n k8s.io images import /tmp/airgap_images.tar"
+           
+           # 清理
+           juju ssh --model {{ test_model }} "${MACHINE}" -- "rm -f /tmp/airgap_images.tar"
+        done
+        echo "✅ Injection Complete."
+      register: inject_res
+      changed_when: "'unpacking' in inject_res.stdout"
+      
     # -----------------------------------------------------------
     # 1. IP Discovery & Variable Setup
     # -----------------------------------------------------------
