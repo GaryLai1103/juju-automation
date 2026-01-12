@@ -274,23 +274,25 @@
         EOS
       changed_when: true
 
-    - name: 4.4 Disable IPv6 (System Wide)
+    - name: 4.4 Disable IPv6 (System Wide) - Robust Mode
       shell: |
-        juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
-        set -euo pipefail
-        cat <<EOF | sudo tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
-        net.ipv6.conf.all.disable_ipv6 = 1
-        net.ipv6.conf.default.disable_ipv6 = 1
-        net.ipv6.conf.lo.disable_ipv6 = 1
-        EOF
-        sudo sysctl --system >/dev/null
-        sudo systemctl restart containerd
-        sudo systemctl restart kubelet || true
-        EOS
-      # [Safe Check] Loop is confirmed PRESENT
+        # 使用 juju exec 透過 Agent 執行，避開 SSH IPv6 連線超時問題
+        # 寫法稍微醜一點(單行指令)，但保證能送達
+        CMD="echo 'net.ipv6.conf.all.disable_ipv6 = 1' | sudo tee /etc/sysctl.d/99-disable-ipv6.conf && \
+             echo 'net.ipv6.conf.default.disable_ipv6 = 1' | sudo tee -a /etc/sysctl.d/99-disable-ipv6.conf && \
+             echo 'net.ipv6.conf.lo.disable_ipv6 = 1' | sudo tee -a /etc/sysctl.d/99-disable-ipv6.conf && \
+             sudo sysctl --system || true && \
+             sudo systemctl restart containerd || true && \
+             sudo systemctl restart kubelet || true"
+        
+        juju exec --model {{ test_model }} --machine {{ item }} -- "bash -c '$CMD'"
       loop:
         - "{{ machine0 }}"
         - "{{ machine1 }}"
+      register: ipv6_res
+      until: ipv6_res.rc == 0
+      retries: 3
+      delay: 5
       changed_when: true
 
     # -----------------------------------------------------------
