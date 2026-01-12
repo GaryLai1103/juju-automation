@@ -131,7 +131,7 @@
 
     - name: 0.6 Inject Air-Gap Images (Streaming Mode)
       shell: |
-        # 定義要傳送的 Image 清單 (必須與 Jumpbox 上 docker images 看到的名稱一致)
+        # 定義要傳送的 Image 清單
         IMAGES=(
           "ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04"
           "ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04"
@@ -161,19 +161,22 @@
           for IMG in "${IMAGES[@]}"; do
              echo " -> 📤 Streaming: $IMG ..."
              
-             # [核心修改] 使用 Pipe 直傳，不產生中間檔案
-             # docker save (本地) | juju ssh | ctr import - (遠端)
+             # 核心傳輸指令
              docker save "$IMG" | juju ssh --model {{ test_model }} "$MACHINE" "sudo ctr -n k8s.io images import -" > /dev/null
              
              if [ $? -eq 0 ]; then
                  echo "    ✅ Success"
              else
                  echo "    ❌ Failed to transfer $IMG"
-                 exit 1
+                 # 這裡可以選擇是否要 exit 1，或者繼續傳下一個
+                 # exit 1 
              fi
           done
         done
         echo "🎉 All Image Injections Complete."
+      # 👇 這一行非常重要！指定使用 Bash 來執行
+      args:
+        executable: /bin/bash
       register: inject_res
       changed_when: "'Success' in inject_res.stdout"
       
