@@ -109,6 +109,15 @@
       when: reset_before_install | bool
       changed_when: true
 
+    - name: 0.4 Clean NFS Data (Optional)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          # 清空 NFS 分享目錄下的所有檔案，確保 Slurm 從零開始
+          sudo rm -rf {{ nfs_export_path }}/*
+        EOS
+      when: reset_before_install | bool
+      changed_when: true
+
     # -----------------------------------------------------------
     # 3. NFS Setup
     # -----------------------------------------------------------
