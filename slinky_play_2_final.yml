@@ -463,7 +463,7 @@
         NS="{{ ns_slurm }}"
         CHART_VER="{{ slurm_chart_ver }}"
 
-        cat > /tmp/slurm-values.yaml <<EOF
+    cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
             enabled: true
@@ -474,6 +474,20 @@
                 storage: 10Gi
           extraConf: |
             GresTypes=gpu
+          
+          # [1] Controller 的 Volume 定義 (Pod Level)
+          volumes:
+            - name: home-drive
+              nfs:
+                server: {{ nfs_server_ip }}
+                path: {{ nfs_export_path }}
+          
+          # [2] Slurmctld 容器掛載 (Container Level)
+          slurmctld:
+            volumeMounts:
+              - name: home-drive
+                mountPath: /home/slurm
+
           podSpec:
             nodeSelector:
               kubernetes.io/hostname: {{ controlplane_hostname }}
@@ -485,6 +499,7 @@
               - key: node-role.kubernetes.io/master
                 operator: Exists
                 effect: NoSchedule
+
         restapi:
           replicas: 1
           podSpec:
@@ -495,6 +510,7 @@
               - key: node-role.kubernetes.io/control-plane
                 operator: Exists
                 effect: NoSchedule
+
         nodesets:
           slinky:
             enabled: true
@@ -510,6 +526,14 @@
                   operator: Equal
                   value: "{{ gpu_taint_value }}"
                   effect: NoSchedule
+              
+              # [3] Worker 的 Volume 定義 (Pod Level)
+              volumes:
+                - name: home-drive
+                  nfs:
+                    server: {{ nfs_server_ip }}
+                    path: {{ nfs_export_path }}
+
             slurmd:
               resources:
                 limits:
@@ -517,6 +541,12 @@
               args:
                 - --conf
                 - Gres=gpu:{{ slurm_gpu_count }}
+              
+              # [4] Worker 容器掛載 (Container Level)
+              volumeMounts:
+                - name: home-drive
+                  mountPath: /home/slurm
+
         partitions:
           all:
             enabled: true
