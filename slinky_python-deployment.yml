@@ -52,43 +52,42 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 建立 Python venv 並離線安裝 (修正版)
+    # 3. 直接安裝 PyTorch (不使用 venv)
     # ----------------------------------------------------
-    - name: 3.1 建立 venv 並離線安裝 PyTorch (修正縮排問題)
+    - name: 3.1 離線安裝 PyTorch (使用 --user 模式)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          # 直接透過 kubectl 執行複雜指令，避開 Heredoc 巢狀縮排地獄
+          # 直接透過 kubectl 執行複雜指令
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             
-            # 1. 建立 venv
-            if [ ! -d "ai-env" ]; then
-              echo "📂 Creating Virtual Environment (ai-env)..."
-              python3 -m venv ai-env
-            fi
+            # 確保 Path 包含 user base (讓 pip 安裝的指令可以用)
+            export PATH=$HOME/.local/bin:$PATH
 
-            # 2. 啟動環境
-            source ai-env/bin/activate
+            echo "🔍 Checking Python environment..."
             
-            # 3. 檢查與安裝
+            # 檢查是否已安裝
             if python3 -c "import torch" >/dev/null 2>&1; then
               echo "✅ PyTorch already installed, skipping."
             else
-              echo "📦 Installing PyTorch from Offline Wheel..."
-              # 確保 pip 是最新的 (選擇性)
-              # pip install --upgrade pip --no-index --find-links {{ shared_dir }} || true
+              echo "📦 Installing PyTorch from Offline Wheel (User Mode)..."
               
-              # 安裝 Wheel
-              pip install {{ shared_dir }}/torch.whl --no-index --find-links {{ shared_dir }}
+              # [關鍵修正] 使用 --user 避開權限問題，並加上 --break-system-packages (針對 Python 3.11+)
+              # 注意：因為是 Container 環境，我們不需要擔心弄髒系統，加上 --break-system-packages 是安全的
+              pip3 install {{ shared_dir }}/torch.whl \
+                --no-index \
+                --find-links {{ shared_dir }} \
+                --user \
+                --break-system-packages
             fi
             
-            # 4. 最終驗證
+            # 驗證
             echo "🔍 Verifying installation..."
             python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
           '
         EOS
-      async: 900  # 給它 15 分鐘
+      async: 900
       poll: 10
       register: install_res
 
