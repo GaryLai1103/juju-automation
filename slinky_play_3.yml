@@ -1,7 +1,7 @@
 ---
 # ========================================================
 # Scenario: Post-Deployment - DCGM & KubeSphere Registration
-# Goal: Deploy K8s-native DCGM (Fixed Repo) & Register Cluster
+# Goal: Deploy K8s-native DCGM (Fixed Values) & Register Cluster
 # ========================================================
 - name: 4. 設定監控與多叢集對接
   hosts: maasjuju
@@ -19,25 +19,31 @@
   tasks:
     # -----------------------------------------------------------
     # 1. 部署 K8s 原生版 DCGM Exporter
-    #    [Fix] 使用不同的 Repo 名稱避免與 Device Plugin 衝突
+    #    [Fix] 改用 values.yaml 避免 Helm --set 跳脫字元錯誤
     # -----------------------------------------------------------
-    - name: 1.1 安裝 DCGM Exporter (Helm / Manifest)
+    - name: 1.1 安裝 DCGM Exporter (Helm with Values File)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         
-        # 1. 加入 NVIDIA Helm Repo (改名為 gpu-helm-charts 以免衝突)
+        # 1. 加入 Repo
         helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
-        # 2. 安裝 DCGM Exporter (DaemonSet)
-        # 注意：這裡參照的 Chart 名稱變成了 gpu-helm-charts/dcgm-exporter
+        # 2. 建立乾淨的 Values 檔案 (避開 Shell 跳脫地獄)
+        cat > /tmp/dcgm-values.yaml <<EOF
+        serviceMonitor:
+          enabled: true
+          additionalLabels:
+            app.kubernetes.io/vendor: kubesphere
+        EOF
+
+        # 3. 安裝 (使用 -f 讀取檔案)
         helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
           -n kubesphere-monitoring-system --create-namespace \
-          --set serviceMonitor.enabled=true \
-          --set serviceMonitor.additionalLabels.app\.kubernetes\.io/vendor=kubesphere
+          -f /tmp/dcgm-values.yaml
         
-        # 3. 等待 Pod 啟動
+        # 4. 等待 Pod 啟動
         kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
         EOS
       changed_when: true
@@ -133,5 +139,5 @@
     - name: 🚀 完成提示
       debug:
         msg: 
-          - "✅ DCGM Exporter 已安裝 (Repo: gpu-helm-charts)"
+          - "✅ DCGM Exporter 已安裝 (Values File Fix)"
           - "✅ 叢集 '{{ cluster_name }}' 已註冊到 KubeSphere"
