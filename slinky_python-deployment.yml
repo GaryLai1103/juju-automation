@@ -52,19 +52,22 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (Unzip Bootstrap)
+    # 3. 離線安裝 Pip 與 PyTorch (Match User Filename)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (解壓縮安裝法)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (使用 pip-25.3)
       shell: |
-        # 1. 傳送 pip.whl 到 Machine 0
-        cat /home/gary/pip.whl | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/pip.whl"
+        # 定義與你 Jumpbox 上完全一致的檔名
+        PIP_WHEEL="pip-25.3-py3-none-any.whl"
 
-        # 2. 傳送 pip.whl 到 Pod
+        # 1. 傳送檔案到 Machine 0
+        cat /home/gary/$PIP_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$PIP_WHEEL"
+
+        # 2. 傳送檔案到 Pod
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-           "kubectl cp /tmp/pip.whl {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/pip.whl"
+           "kubectl cp /tmp/$PIP_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$PIP_WHEEL"
         
-        # 3. 清理暫存
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/pip.whl"
+        # 3. 清理 Machine 0 暫存
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$PIP_WHEEL"
 
         # 4. 進入 Pod 執行安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
@@ -73,23 +76,25 @@
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            echo "🔍 Bootstrapping pip from wheel (Unzip Method)..."
+            # 這裡也要用變數，確保內部腳本抓對檔案
+            PIP_FILE="pip-25.3-py3-none-any.whl"
+            
+            echo "🔍 Bootstrapping pip from $PIP_FILE..."
             if ! command -v pip3 >/dev/null 2>&1; then
-               echo "⚡ pip3 not found, extracting wheel to bootstrap..."
+               echo "⚡ pip3 not found, extracting wheel..."
                
-               # [關鍵步驟] 1. 使用 Python 內建模組解壓縮 pip.whl 到暫存目錄 pip_tmp
-               # 這是最穩的方法，不用依賴作業系統的 unzip
+               # 解壓縮
                mkdir -p pip_tmp
-               python3 -m zipfile -e pip.whl pip_tmp
+               python3 -m zipfile -e "$PIP_FILE" pip_tmp
                
-               # [關鍵步驟] 2. 將解壓目錄加入 PYTHONPATH
+               # 設定 PYTHONPATH 讓 Python 讀得到解壓後的 pip
                export PYTHONPATH=$(pwd)/pip_tmp
                
-               # [關鍵步驟] 3. 現在可以用 python3 -m pip 了 (因為 pip 模組已經在 pip_tmp 裡了)
                echo "⚡ Installing pip..."
-               python3 -m pip install pip.whl --no-index --user --break-system-packages
+               # 安裝自己
+               python3 -m pip install "$PIP_FILE" --no-index --user --break-system-packages
                
-               # 4. 清理案發現場
+               # 清理
                unset PYTHONPATH
                rm -rf pip_tmp
             else
@@ -97,7 +102,6 @@
             fi
 
             echo "📦 Installing PyTorch from Offline Wheel..."
-            # 確保使用剛裝好的 pip
             python3 -m pip install {{ shared_dir }}/torch.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
