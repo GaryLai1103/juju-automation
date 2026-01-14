@@ -90,7 +90,7 @@
         import os
 
         # --- 設定 ---
-        DURATION = 300       # 跑 5 分鐘
+        DURATION = 45       # 跑 45 sec
         MATRIX_SIZE = 8192   # 矩陣大小
 
         print(f"🔥 Starting GPU Burn-in Test (With Temp Monitor)")
