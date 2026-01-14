@@ -19,13 +19,16 @@
 
   tasks:
     # ----------------------------------------------------
-    # 1. 檢查與確認
+    # 1. Pre-check Files
     # ----------------------------------------------------
-    - name: 1.1 檢查 Jumpbox 上是否有 torch.whl
+    - name: 1. Check if offline files exist
       stat:
-        path: "{{ local_wheel_path }}"
-      register: wheel_stat
-      failed_when: not wheel_stat.stat.exists
+        path: "{{ item }}"
+      loop:
+        - "/home/gary/pip-25.3-py3-none-any.whl"                # [已修正] 標準 Pip 檔名
+        - "/home/gary/torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl" # [已修正] 標準 Torch 檔名
+      register: file_check
+      failed_when: not item.stat.exists
 
     - name: 1.2 確認 Slurm Controller 活著
       shell: |
