@@ -1,9 +1,9 @@
 ---
 # ========================================================
-# Scenario: Slinky Offline AI Environment - Deployment & Verify
-# Goal: Install PyTorch (WHL) & Deploy GPU Verify Scripts
+# Scenario: Slinky Offline AI Environment - Install & Burn-in
+# Goal: Install PyTorch (WHL) & Deploy Temp Monitor Burn-in
 # ========================================================
-- name: 佈署 Slinky PyTorch 與 GPU 驗證腳本
+- name: 佈署 Slinky PyTorch 與 GPU 溫度燒機測試
   hosts: maasjuju
   gather_facts: no
   vars:
@@ -22,7 +22,6 @@
       shell: |
         # =======================================================
         # [步驟 0] 使用 sh -c 強制在 Pod 內執行刪除
-        # 確保舊的衝突檔案被徹底清除
         # =======================================================
         echo "🧹 Nuke ALL old wheels in Pod (Force)..."
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
@@ -44,15 +43,9 @@
         for FILE in $WHEEL_FILES; do
             FILENAME=$(basename "$FILE")
             echo "🚀 Transferring $FILENAME..."
-            
-            # Jumpbox -> Machine 0
             cat "$FILE" | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$FILENAME"
-            
-            # Machine 0 -> Pod
             juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
                "kubectl cp /tmp/$FILENAME {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$FILENAME"
-            
-            # Clean up Machine 0
             juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$FILENAME"
         done
 
@@ -65,11 +58,9 @@
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 再次檢查 (確認無重複檔案)
-            echo "📂 Files in directory (Should contain NO duplicates):"
+            echo "📂 Checking files..."
             ls -1 *.whl | wc -l
             
-            # --- 安裝所有 .whl 檔 ---
             echo "📦 Installing ALL wheels..."
             python3 -m pip install *.whl \
                 --no-index \
@@ -78,7 +69,6 @@
                 --break-system-packages
             
             echo "🔍 Verifying PyTorch on Controller..."
-            # 簡單驗證 Controller 端安裝是否成功 (這裡 CUDA False 是正常的)
             python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
           '
         EOS
@@ -87,86 +77,117 @@
       register: install_res
 
     # ----------------------------------------------------
-    # 2. 佈署 GPU 驗證腳本 (取代原本的 train.py)
+    # 2. 佈署 GPU 燒機與溫度監控腳本
     # ----------------------------------------------------
-    - name: 2.1 注入 GPU 檢測程式 (gpu_test.py)
+    - name: 2.1 注入燒機程式 (burn_test.py - 含溫度顯示)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          # 1. 建立 Python 測試檔
-          cat << 'PY' > /tmp/gpu_test.py
+          # 1. 建立 Python 測試檔 (含 nvidia-smi 呼叫)
+          cat << 'PY' > /tmp/burn_test.py
         import torch
         import sys
-        import socket
         import time
+        import os
 
-        hostname = socket.gethostname()
-        print(f"========================================")
-        print(f"📍 Node Name: {hostname}")
-        print(f"🐍 PyTorch Version: {torch.__version__}")
-        print(f"========================================")
+        # --- 設定 ---
+        DURATION = 300       # 跑 5 分鐘
+        MATRIX_SIZE = 8192   # 矩陣大小
 
-        if torch.cuda.is_available():
-            print(f"✅ SUCCESS! GPU Detected!")
-            print(f"🔢 GPU Count: {torch.cuda.device_count()}")
-            print(f"🏷️  GPU Name:  {torch.cuda.get_device_name(0)}")
+        print(f"🔥 Starting GPU Burn-in Test (With Temp Monitor)")
+        print(f"⏱️  Duration: {DURATION}s")
 
-            # 簡單矩陣運算測試
-            print("🔥 Running tensor calculation on GPU (Matrix Multiplication)...")
-            try:
-                x = torch.randn(4096, 4096).cuda()
-                y = torch.mm(x, x)
-                torch.cuda.synchronize()
-                print("✅ Calculation finished successfully.")
-            except Exception as e:
-                print(f"❌ Calculation Failed: {e}")
-                sys.exit(1)
-        else:
-            print(f"❌ ERROR: GPU NOT detected on this node ({hostname}).")
+        if not torch.cuda.is_available():
+            print("❌ Error: No GPU found!")
             sys.exit(1)
+
+        device = torch.device("cuda")
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"✅ Using GPU: {gpu_name}")
+
+        # 準備資料
+        x = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+        y = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+
+        start_time = time.time()
+        end_time = start_time + DURATION
+        batch = 0
+
+        print("🚀 Burn-in started!")
+        print("-" * 65)
+        print(f"{'Batch':<8} | {'Time':<10} | {'Temp':<8} | {'Status'}")
+        print("-" * 65)
+
+        try:
+            while time.time() < end_time:
+                # 1. 運算
+                z = torch.mm(x, y)
+                torch.cuda.synchronize()
+                
+                batch += 1
+                elapsed = time.time() - start_time
+                remaining = DURATION - elapsed
+                
+                # 2. 每 10 個 Batch 抓一次溫度
+                if batch % 10 == 0:
+                    try:
+                        # 呼叫系統指令抓溫度
+                        temp_str = os.popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader").read().strip()
+                        temp = f"{temp_str}°C"
+                    except:
+                        temp = "N/A"
+
+                    # 3. 印出 Log (\r 讓它即時更新)
+                    sys.stdout.write(f"\r⚡ {batch:<6} | {elapsed:>5.1f}s used | 🔥 {temp:<6} | ⏳ Left: {remaining:>5.1f}s  ")
+                    sys.stdout.flush()
+
+        except KeyboardInterrupt:
+            print("\n🛑 Stopped by user.")
+
+        print(f"\n\n✅ Finished! Total Batches: {batch}")
         PY
           
           # 2. 傳入 Pod
-          kubectl cp /tmp/gpu_test.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/gpu_test.py
+          kubectl cp /tmp/burn_test.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/burn_test.py
         EOS
 
-    - name: 2.2 注入 Slurm 排程腳本 (run_verify.sh)
+    - name: 2.2 注入 Slurm 排程腳本 (run_burn.sh)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           # 1. 建立 SBATCH 腳本
-          cat << 'SBATCH' > /tmp/run_verify.sh
+          cat << 'SBATCH' > /tmp/run_burn.sh
         #!/bin/bash
-        #SBATCH --job-name=gpu-verify
-        #SBATCH --output=gpu-verify.out
+        #SBATCH --job-name=gpu-burn
+        #SBATCH --output=burn-%j.out
         #SBATCH --partition=slinky
         #SBATCH --gres=gpu:1
         #SBATCH --ntasks=1
-        #SBATCH --time=00:02:00
+        #SBATCH --time=00:10:00   # 設定 10 分鐘，確保夠跑 Python 的 5 分鐘
 
-        # 設定 PATH (因為是 --user 安裝)
         export PATH=$HOME/.local/bin:$PATH
 
-        echo "🚀 Starting GPU Verification on Worker Node..."
-        python3 {{ shared_dir }}/gpu_test.py
+        echo "🚀 Starting Burn-in on Worker Node..."
+        python3 {{ shared_dir }}/burn_test.py
         SBATCH
         
           # 2. 傳入 Pod
-          kubectl cp /tmp/run_verify.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_verify.sh
+          kubectl cp /tmp/run_burn.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_burn.sh
           
-          # 3. (選用) 直接幫你送出 Job，省得你手動打指令
-          echo "📤 Submitting Slurm Job automatically..."
-          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c "cd {{ shared_dir }} && sbatch run_verify.sh"
+          # 3. 自動送出工作 (先清空舊的，再送新的)
+          echo "📤 Submitting Slurm Job..."
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c "cd {{ shared_dir }} && scancel -u slurm && sbatch run_burn.sh"
         EOS
 
     # ----------------------------------------------------
     # 3. 提示訊息
     # ----------------------------------------------------
-    - name: 🚀 佈署完成
+    - name: 🚀 佈署與測試啟動完成
       debug:
         msg: 
           - "========================================================"
-          - "✅ 安裝與佈署完成！GPU 測試工作已送出。"
+          - "✅ 燒機程式已啟動！(將運行 5 分鐘)"
           - "========================================================"
-          - "請稍後登入檢查結果："
+          - "請依照下列指令查看即時溫度："
           - "1. 登入: juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
-          - "2. 查看: cat /home/slurm/gpu-verify.out"
+          - "2. 進入目錄: cd /home/slurm"
+          - "3. 監看 Log: tail -f burn-*.out"
           - "========================================================"
