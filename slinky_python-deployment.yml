@@ -16,14 +16,23 @@
 
   tasks:
     # ----------------------------------------------------
-    # 1. 離線安裝 Pip 與 Dependencies (改為從 WHL 資料夾讀取)
+    # 1. 離線安裝 Pip 與 Dependencies (WHL 資料夾版 + 自動清空)
     # ----------------------------------------------------
     - name: 1.1 離線安裝所有 Wheel 套件 (Bulk Install from WHL)
       shell: |
-        # [修改點 1] 這裡改成從 WHL 資料夾抓檔案 (最重要的修改!)
+        # =======================================================
+        # [新增步驟] 0. 先殺光 Pod 裡所有殘留的 .whl 檔案
+        # 這是避免版本衝突的關鍵！
+        # =======================================================
+        echo "🧹 Nuke ALL old wheels in Pod..."
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+           "kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- rm -f {{ shared_dir }}/*.whl"
+
+        # -------------------------------------------------------
+        # 1. 取得 Jumpbox 上 WHL 資料夾的檔案
+        # -------------------------------------------------------
         WHEEL_FILES=$(ls /home/gary/WHL/*.whl)
         
-        # 檢查有沒有抓到檔案
         if [ -z "$WHEEL_FILES" ]; then
             echo "❌ Error: No .whl files found in /home/gary/WHL/"
             exit 1
@@ -31,7 +40,9 @@
 
         echo "📦 Found wheels: $WHEEL_FILES"
 
+        # -------------------------------------------------------
         # 2. 迴圈：將每個檔案傳送到 Pod
+        # -------------------------------------------------------
         for FILE in $WHEEL_FILES; do
             FILENAME=$(basename "$FILE")
             echo "🚀 Transferring $FILENAME..."
@@ -47,20 +58,22 @@
             juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$FILENAME"
         done
 
+        # -------------------------------------------------------
         # 3. 進入 Pod 執行安裝
+        # -------------------------------------------------------
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 強制清理可能存在的舊壞檔
-            echo "🧹 Cleaning up legacy files..."
-            rm -f pip.whl torch.whl
+            # 再次確認目錄現在只有新檔案 (Debug用)
+            echo "📂 Files in directory:"
+            ls -lh *.whl
             
             # --- 安裝所有 .whl 檔 ---
             echo "📦 Installing ALL wheels..."
-            # 這次所有依賴都在裡面了
+            # 這次目錄裡只有 Docker 下載的那一套完美檔案，絕對不會衝突
             python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
