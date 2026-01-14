@@ -16,17 +16,17 @@
 
   tasks:
     # ----------------------------------------------------
-    # 1. 離線安裝 Pip 與 Dependencies (WHL 資料夾版 + 自動清空)
+    # 1. 離線安裝 Pip 與 Dependencies (強力清除 V3 版)
     # ----------------------------------------------------
     - name: 1.1 離線安裝所有 Wheel 套件 (Bulk Install from WHL)
       shell: |
         # =======================================================
-        # [新增步驟] 0. 先殺光 Pod 裡所有殘留的 .whl 檔案
-        # 這是避免版本衝突的關鍵！
+        # [修正步驟] 0. 使用 sh -c 強制在 Pod 內執行刪除
+        # 這次絕對會刪乾淨！
         # =======================================================
-        echo "🧹 Nuke ALL old wheels in Pod..."
+        echo "🧹 Nuke ALL old wheels in Pod (Force)..."
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-           "kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- rm -f {{ shared_dir }}/*.whl"
+           "kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- sh -c 'rm -f {{ shared_dir }}/*.whl'"
 
         # -------------------------------------------------------
         # 1. 取得 Jumpbox 上 WHL 資料夾的檔案
@@ -37,9 +37,7 @@
             echo "❌ Error: No .whl files found in /home/gary/WHL/"
             exit 1
         fi
-
-        echo "📦 Found wheels: $WHEEL_FILES"
-
+        
         # -------------------------------------------------------
         # 2. 迴圈：將每個檔案傳送到 Pod
         # -------------------------------------------------------
@@ -67,13 +65,12 @@
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 再次確認目錄現在只有新檔案 (Debug用)
-            echo "📂 Files in directory:"
-            ls -lh *.whl
+            # 再次檢查 (這次應該只會看到新傳進去的那 20 幾個檔案)
+            echo "📂 Files in directory (Should contain NO duplicates):"
+            ls -1 *.whl | wc -l
             
             # --- 安裝所有 .whl 檔 ---
             echo "📦 Installing ALL wheels..."
-            # 這次目錄裡只有 Docker 下載的那一套完美檔案，絕對不會衝突
             python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
@@ -81,7 +78,14 @@
                 --break-system-packages
             
             echo "🔍 Verifying PyTorch..."
-            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready. CUDA: {torch.cuda.is_available()}\")"
+            # 驗證是否能抓到 CUDA
+            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready. CUDA available: {torch.cuda.is_available()}\")"
+            
+            if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)"; then
+               echo "✅ GPU is detected!"
+            else
+               echo "⚠️ GPU not detected (Running on CPU mode)"
+            fi
           '
         EOS
       async: 1800
