@@ -1,7 +1,7 @@
 ---
 # ========================================================
 # Scenario: Post-Deployment - DCGM & KubeSphere Registration
-# Goal: Deploy K8s-native DCGM (Fix OOM & CRD) & Register
+# Goal: Deploy K8s-native DCGM (Restricted to GPU Node)
 # ========================================================
 - name: 4. 設定監控與多叢集對接
   hosts: maasjuju
@@ -10,6 +10,10 @@
     # ---- Juju / Model 設定 ----
     test_model: "slinky-cluster"
     machine0: "0"
+    
+    # ---- 關鍵修正：指定 GPU 節點名稱 ----
+    # (必須跟你在 K8s 裡看到的 Node Name 一樣，通常是 gpu-node01)
+    gpu_node_hostname: "gpu-node01" 
     
     # ---- KubeSphere Host 設定 ----
     ks_host_ip: "192.168.100.4"
@@ -30,8 +34,8 @@
         EOS
       changed_when: true
 
-    # [步驟 1.1] 安裝 DCGM Exporter (Fix: 增加記憶體限制)
-    - name: 1.1 安裝 DCGM Exporter (Helm with Memory Limits)
+    # [步驟 1.1] 安裝 DCGM Exporter (Fix: 增加 NodeSelector)
+    - name: 1.1 安裝 DCGM Exporter (Restricted to GPU Nodes)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -40,14 +44,13 @@
         helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
-        # 2. 建立 Values 檔案 (重點修正：加大 resources)
+        # 2. 建立 Values 檔案 (重點修正：nodeSelector)
         cat > /tmp/dcgm-values.yaml <<EOF
         serviceMonitor:
           enabled: true
           additionalLabels:
             app.kubernetes.io/vendor: kubesphere
         
-        # [FIX] 防止 OOMKilled，加大記憶體限制
         resources:
           limits:
             cpu: 500m
@@ -56,7 +59,16 @@
             cpu: 100m
             memory: 128Mi
             
-        # [FIX] 確保掛載正確的驅動路徑 (有些環境需要)
+        # [FIX] 關鍵修正：只允許在指定節點運行
+        nodeSelector:
+          kubernetes.io/hostname: {{ gpu_node_hostname }}
+          
+        # [Optional] 如果節點有 Taint，需要容忍它
+        tolerations:
+          - key: "node-role.anxpert/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
+
         hostPath:
           root: "/"
         EOF
@@ -66,7 +78,7 @@
           -n kubesphere-monitoring-system --create-namespace \
           -f /tmp/dcgm-values.yaml
         
-        # 4. 等待 Pod 啟動 (這次應該不會死了)
+        # 4. 等待 Pod 啟動 (這次只會有一顆 Pod 跑起來，而且是 Running)
         kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
         EOS
       changed_when: true
@@ -157,5 +169,6 @@
     - name: 🚀 完成提示
       debug:
         msg: 
-          - "✅ DCGM Exporter 已修復 OOM 問題 (Memory Limit increased)"
-          - "✅ 叢集註冊完成！"
+          - "✅ DCGM Exporter 已修正 (只在 GPU 節點運行)"
+          - "✅ Master 節點不會再出現 CrashLoopBackOff 的 Pod"
+          - "✅ 叢集註冊完成！請去 KubeSphere 驗收 GPU 監控數據。"
