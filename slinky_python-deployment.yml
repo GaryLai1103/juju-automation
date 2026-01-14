@@ -1,15 +1,12 @@
 ---
 # ========================================================
 # Scenario: Slinky Offline AI Environment - Deployment Only
-# Goal: Upload files & Prep Env, BUT DO NOT RUN JOBS.
+# Goal: Upload files & Prep Env (WHL Folder Version)
 # ========================================================
-- name: 佈署 Slinky PyTorch 測試檔案 (不自動執行)
+- name: 佈署 Slinky PyTorch 測試檔案 (WHL 資料夾版)
   hosts: maasjuju
   gather_facts: no
   vars:
-    # ---- 本地檔案位置 (Jumpbox) ----
-    local_wheel_path: "/home/gary/torch.whl"
-    
     # ---- Slinky 設定 ----
     test_model: "slinky-cluster"
     k8s_machine: "0"
@@ -19,46 +16,19 @@
 
   tasks:
     # ----------------------------------------------------
-    # 1. Pre-check Files (Corrected Logic)
+    # 1. 離線安裝 Pip 與 Dependencies (改為從 WHL 資料夾讀取)
     # ----------------------------------------------------
-    - name: 1.1 Collect file status
-      stat:
-        path: "{{ item }}"
-      loop:
-        - "/home/gary/pip-25.3-py3-none-any.whl"
-        - "/home/gary/torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
-      register: file_check_results
-
-    - name: 1.2 Fail if any file is missing
-      fail:
-        msg: "❌ Missing file: {{ item.item }} - Please upload it to Jumpbox first."
-      when: not item.stat.exists
-      loop: "{{ file_check_results.results }}"
-
-    # ----------------------------------------------------
-    # 2. 搬運大檔案 (Wheel)
-    # ----------------------------------------------------
-    - name: 2.1 上傳 torch.whl 到 Controller 共享目錄
+    - name: 1.1 離線安裝所有 Wheel 套件 (Bulk Install from WHL)
       shell: |
-        # 1. Jumpbox -> Machine 0
-        juju scp {{ local_wheel_path }} {{ test_model }}/{{ k8s_machine }}:/tmp/torch.whl
+        # [修改點 1] 這裡改成從 WHL 資料夾抓檔案 (最重要的修改!)
+        WHEEL_FILES=$(ls /home/gary/WHL/*.whl)
         
-        # 2. Machine 0 -> Pod (NFS Shared Dir)
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-          "kubectl cp /tmp/torch.whl {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/torch.whl"
-        
-        # 3. 清除暫存
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/torch.whl"
-      async: 1200
-      poll: 10
+        # 檢查有沒有抓到檔案
+        if [ -z "$WHEEL_FILES" ]; then
+            echo "❌ Error: No .whl files found in /home/gary/WHL/"
+            exit 1
+        fi
 
-    # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 Dependencies (最終通關版)
-    # ----------------------------------------------------
-    - name: 3.1 離線安裝所有 Wheel 套件 (Bulk Install)
-      shell: |
-        # 1. 取得 Jumpbox 上所有 .whl 檔案列表
-        WHEEL_FILES=$(ls /home/gary/*.whl)
         echo "📦 Found wheels: $WHEEL_FILES"
 
         # 2. 迴圈：將每個檔案傳送到 Pod
@@ -85,12 +55,12 @@
             export PATH=$HOME/.local/bin:$PATH
             
             # 強制清理可能存在的舊壞檔
-            echo "🧹 Force removing legacy invalid wheels..."
+            echo "🧹 Cleaning up legacy files..."
             rm -f pip.whl torch.whl
             
             # --- 安裝所有 .whl 檔 ---
             echo "📦 Installing ALL wheels..."
-            # 這次 setuptools 也在裡面了，PyTorch 會很開心
+            # 這次所有依賴都在裡面了
             python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
@@ -98,7 +68,7 @@
                 --break-system-packages
             
             echo "🔍 Verifying PyTorch..."
-            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
+            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready. CUDA: {torch.cuda.is_available()}\")"
           '
         EOS
       async: 1800
@@ -106,9 +76,9 @@
       register: install_res
 
     # ----------------------------------------------------
-    # 4. 佈署測試腳本 (30秒倒數 + 可中斷)
+    # 2. 佈署測試腳本
     # ----------------------------------------------------
-    - name: 4.1 注入 train.py (30秒自動倒數，可 Ctrl+C)
+    - name: 2.1 注入 train.py
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           cat << 'PY' > /tmp/train.py
@@ -118,74 +88,44 @@
         import socket
         import sys
 
-        # 1. 設定
-        TARGET_DURATION = 30  # 設定跑 30 秒
+        TARGET_DURATION = 30
         node_name = socket.gethostname()
         job_id = os.environ.get('SLURM_JOB_ID', 'Interactive')
 
-        print(f"\n🚀 [Job {job_id}] GPU Stress Test (Duration: {TARGET_DURATION}s)")
-        print(f"📍 Node: {node_name}")
-        print("-" * 65)
-
-        # 2. 檢查 GPU
+        print(f"\n🚀 [Job {job_id}] GPU Test (Node: {node_name})")
+        
         if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            print(f"✅ GPU Detected: {gpu_name}")
+            print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
             dev = torch.device("cuda")
         else:
-            print("❌ No GPU found! Running on CPU.")
+            print("❌ No GPU found! Using CPU.")
             dev = torch.device("cpu")
 
-        # 3. 準備矩陣
-        N = 10000
-        print(f"🔥 Allocating Tensors ({N}x{N})...")
+        N = 4096 # 矩陣大小
         a = torch.randn(N, N, device=dev)
         b = torch.randn(N, N, device=dev)
 
-        print(f"⏳ Starting Countdown... Press [Ctrl+C] to stop early.")
-        print("-" * 65)
-
-        # 4. 執行迴圈
+        print(f"🔥 Start Matrix Multiplication loop ({TARGET_DURATION}s)...")
         start_time = time.time()
         count = 0
-
-        try:
-            while True:
-                # 計算經過時間
-                current_time = time.time()
-                elapsed = current_time - start_time
-                remaining = TARGET_DURATION - elapsed
-
-                # 時間到就自動跳出
-                if remaining <= 0:
-                    break
-
-                # 運算負載
-                c = torch.mm(a, b)
-                torch.cuda.synchronize() # 等待 GPU 算完
-                
-                count += 1
-                
-                # 動態顯示進度條
-                # \r 回到行首，覆蓋舊文字
-                sys.stdout.write(f"\r⚡ Batch: {count} | ⏱️ Used: {elapsed:4.1f}s | ⏳ Left: {remaining:4.1f}s ")
-                sys.stdout.flush()
-
-        except KeyboardInterrupt:
-            print("\n\n🛑 Test Stopped by User (Ctrl+C).")
         
-        # 5. 結算
-        final_time = time.time() - start_time
-        print(f"\n\n" + "="* 65)
-        print(f"✅ Test Finished in {final_time:.2f} seconds.")
-        print(f"📊 Total Batches Processed: {count}")
-        print("="* 65 + "\n")
+        try:
+            while (time.time() - start_time) < TARGET_DURATION:
+                c = torch.mm(a, b)
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                count += 1
+                sys.stdout.write(f"\r⚡ Batch: {count}")
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+
+        print(f"\n✅ Finished. Total Batches: {count}")
         PY
           
           kubectl cp /tmp/train.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/train.py
         EOS
 
-    - name: 4.2 注入 run_job.sh (Slurm 排程腳本)
+    - name: 2.2 注入 run_job.sh
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           cat << 'SBATCH' > /tmp/run_job.sh
@@ -197,37 +137,23 @@
         #SBATCH --time=00:05:00
         #SBATCH --partition=slinky
 
-        echo "➡️ Loading AI Environment..."
-        source {{ shared_dir }}/ai-env/bin/activate
-
+        # [修改點 2] 移除 source ai-env，因為我們是用 --user 安裝到預設路徑
         echo "➡️ Starting Training..."
-        python {{ shared_dir }}/train.py
+        export PATH=$HOME/.local/bin:$PATH
+        
+        python3 {{ shared_dir }}/train.py
         SBATCH
         
           kubectl cp /tmp/run_job.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_job.sh
         EOS
 
     # ----------------------------------------------------
-    # 5. 手動操作指引
+    # 3. 提示訊息
     # ----------------------------------------------------
-    - name: 🚀 佈署完成！請手動開始測試
+    - name: 🚀 佈署完成
       debug:
         msg: 
-          - "========================================================"
-          - "✅ 檔案與環境已就緒，請依照下列步驟手動測試："
-          - "========================================================"
-          - "1. [登入 Controller Pod]"
-          - "   juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
-          - ""
-          - "2. [進入共享目錄]"
-          - "   cd /home/slurm"
-          - ""
-          - "3. [方式 A: 互動式測試 (推薦! 可以直接看螢幕輸出)]"
-          - "   source ai-env/bin/activate"
-          - "   srun --gres=gpu:1 --pty python train.py"
-          - ""
-          - "4. [方式 B: 排程測試 (標準做法)]"
-          - "   sbatch run_job.sh"
-          - "   squeue (查看狀態)"
-          - "   cat gpu-*.out (查看結果)"
-          - "========================================================"
+          - "✅ 安裝完成！請登入 Controller 測試："
+          - "juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
+          - "cd /home/slurm"
+          - "python3 train.py"
