@@ -52,37 +52,42 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 直接安裝 PyTorch (不使用 venv)
+    # 3. 離線安裝 Pip 與 PyTorch
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 PyTorch (使用 --user 模式)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (Bootstrap Pip)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          # 直接透過 kubectl 執行複雜指令
+          # 1. 先把 get-pip.py 傳進去
+          juju scp /home/gary/get-pip.py {{ test_model }}/{{ k8s_machine }}:/tmp/get-pip.py
+          kubectl cp /tmp/get-pip.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/get-pip.py
+          rm -f /tmp/get-pip.py
+
+          # 2. 進入 Pod 執行安裝
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
-            
-            # 確保 Path 包含 user base (讓 pip 安裝的指令可以用)
             export PATH=$HOME/.local/bin:$PATH
-
-            echo "🔍 Checking Python environment..."
             
-            # 檢查是否已安裝
-            if python3 -c "import torch" >/dev/null 2>&1; then
-              echo "✅ PyTorch already installed, skipping."
+            echo "🔍 Bootstrapping pip..."
+            # 檢查 pip 是否存在，不存在就安裝
+            if ! command -v pip3 >/dev/null 2>&1; then
+               echo "⚡ pip3 not found, installing via get-pip.py..."
+               # --no-setuptools --no-wheel 是為了避免它嘗試連網下載這些依賴
+               # 但通常 get-pip.py 內建了這些。如果失敗，我們可能需要下載完整的 wheel。
+               # 先嘗試標準安裝：
+               python3 get-pip.py --user --break-system-packages
             else
-              echo "📦 Installing PyTorch from Offline Wheel (User Mode)..."
-              
-              # [關鍵修正] 使用 --user 避開權限問題，並加上 --break-system-packages (針對 Python 3.11+)
-              # 注意：因為是 Container 環境，我們不需要擔心弄髒系統，加上 --break-system-packages 是安全的
-              pip3 install {{ shared_dir }}/torch.whl \
+               echo "✅ pip3 is already installed."
+            fi
+
+            echo "📦 Installing PyTorch from Offline Wheel..."
+            # 使用 python3 -m pip 確保調用到正確的 pip
+            python3 -m pip install {{ shared_dir }}/torch.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
                 --user \
                 --break-system-packages
-            fi
             
-            # 驗證
             echo "🔍 Verifying installation..."
             python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
           '
