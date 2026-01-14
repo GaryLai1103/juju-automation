@@ -53,20 +53,15 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 Dependencies (清理並安裝)
+    # 3. 離線安裝 Pip 與 Dependencies (Pod內強力清除版)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝所有 Wheel 套件 (Clean & Install)
+    - name: 3.1 離線安裝所有 Wheel 套件 (Force Clean & Install)
       shell: |
-        # 1. [關鍵步驟] 先清理 Pod 內的舊檔案，避免殘留的 pip.whl 搞破壞
-        echo "🧹 Cleaning up old files in Pod..."
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-           "kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- rm -f {{ shared_dir }}/*.whl"
-
-        # 2. 取得 Jumpbox 上所有 .whl 檔案列表
+        # 1. 取得 Jumpbox 上所有 .whl 檔案列表
         WHEEL_FILES=$(ls /home/gary/*.whl)
         echo "📦 Found wheels: $WHEEL_FILES"
 
-        # 3. 迴圈：將每個檔案傳送到 Pod
+        # 2. 迴圈：將每個檔案傳送到 Pod
         for FILE in $WHEEL_FILES; do
             FILENAME=$(basename "$FILE")
             echo "🚀 Transferring $FILENAME..."
@@ -82,19 +77,22 @@
             juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$FILENAME"
         done
 
-        # 4. 進入 Pod 執行「全家桶」安裝
+        # 3. 進入 Pod 執行安裝 (這裡是重點！)
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 再次檢查確保沒有怪檔案 (Optional check)
+            # [關鍵修正] 在這裡直接刪除舊的壞檔，這是在 Pod 裡的 Bash 執行，絕對有效！
+            echo "🧹 Force removing legacy invalid wheels..."
+            rm -f pip.whl torch.whl
+            
+            # 再次檢查 (現在應該只剩標準檔名的檔案了)
             ls -lh *.whl
             
             # --- 安裝所有 .whl 檔 ---
             echo "📦 Installing ALL wheels..."
-            # 這次只會有標準檔名的檔案，絕對不會報錯
             python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
