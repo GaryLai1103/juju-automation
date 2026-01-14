@@ -52,9 +52,9 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (PYTHONPATH Fix)
+    # 3. 離線安裝 Pip 與 PyTorch (Unzip Bootstrap)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (修正安裝指令)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (解壓縮安裝法)
       shell: |
         # 1. 傳送 pip.whl 到 Machine 0
         cat /home/gary/pip.whl | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/pip.whl"
@@ -73,23 +73,31 @@
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            echo "🔍 Bootstrapping pip from wheel..."
+            echo "🔍 Bootstrapping pip from wheel (Unzip Method)..."
             if ! command -v pip3 >/dev/null 2>&1; then
-               echo "⚡ pip3 not found, installing directly from wheel..."
+               echo "⚡ pip3 not found, extracting wheel to bootstrap..."
                
-               # [關鍵修正] 使用 PYTHONPATH 將 whl 暫時掛載為模組庫，然後執行裡面的 pip 模組
-               # 這樣做等於是 "用 pip.whl 裡面的 pip 來安裝 pip.whl 自己"
-               export PYTHONPATH=$(pwd)/pip.whl
+               # [關鍵步驟] 1. 使用 Python 內建模組解壓縮 pip.whl 到暫存目錄 pip_tmp
+               # 這是最穩的方法，不用依賴作業系統的 unzip
+               mkdir -p pip_tmp
+               python3 -m zipfile -e pip.whl pip_tmp
+               
+               # [關鍵步驟] 2. 將解壓目錄加入 PYTHONPATH
+               export PYTHONPATH=$(pwd)/pip_tmp
+               
+               # [關鍵步驟] 3. 現在可以用 python3 -m pip 了 (因為 pip 模組已經在 pip_tmp 裡了)
+               echo "⚡ Installing pip..."
                python3 -m pip install pip.whl --no-index --user --break-system-packages
                
-               # 安裝完後清除 PYTHONPATH，避免干擾
+               # 4. 清理案發現場
                unset PYTHONPATH
+               rm -rf pip_tmp
             else
                echo "✅ pip3 is already installed."
             fi
 
             echo "📦 Installing PyTorch from Offline Wheel..."
-            # 現在 pip3 已經安裝好了，可以直接用
+            # 確保使用剛裝好的 pip
             python3 -m pip install {{ shared_dir }}/torch.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
