@@ -52,9 +52,9 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (Full Offline Mode)
+    # 3. 離線安裝 Pip 與 PyTorch (PYTHONPATH Fix)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (使用 pip.whl)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (修正安裝指令)
       shell: |
         # 1. 傳送 pip.whl 到 Machine 0
         cat /home/gary/pip.whl | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/pip.whl"
@@ -76,13 +76,20 @@
             echo "🔍 Bootstrapping pip from wheel..."
             if ! command -v pip3 >/dev/null 2>&1; then
                echo "⚡ pip3 not found, installing directly from wheel..."
-               # 技巧：直接把 whl 當作 zip 執行，這是 Python 的隱藏功能
-               python3 pip.whl/pip install pip.whl --no-index --user --break-system-packages
+               
+               # [關鍵修正] 使用 PYTHONPATH 將 whl 暫時掛載為模組庫，然後執行裡面的 pip 模組
+               # 這樣做等於是 "用 pip.whl 裡面的 pip 來安裝 pip.whl 自己"
+               export PYTHONPATH=$(pwd)/pip.whl
+               python3 -m pip install pip.whl --no-index --user --break-system-packages
+               
+               # 安裝完後清除 PYTHONPATH，避免干擾
+               unset PYTHONPATH
             else
                echo "✅ pip3 is already installed."
             fi
 
             echo "📦 Installing PyTorch from Offline Wheel..."
+            # 現在 pip3 已經安裝好了，可以直接用
             python3 -m pip install {{ shared_dir }}/torch.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
