@@ -52,19 +52,19 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (Pipe Mode)
+    # 3. 離線安裝 Pip 與 PyTorch (Full Offline Mode)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (直接串流傳輸)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (使用 pip.whl)
       shell: |
-        # 1. 直接用 cat 把本地檔案透過 SSH Pipe 傳送到 Machine 0
-        cat /home/gary/get-pip.py | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/get-pip.py"
+        # 1. 傳送 pip.whl 到 Machine 0
+        cat /home/gary/pip.whl | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/pip.whl"
 
-        # 2. 透過 kubectl 把檔案從 Machine 0 複製進 Pod
+        # 2. 傳送 pip.whl 到 Pod
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-           "kubectl cp /tmp/get-pip.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/get-pip.py"
-           
-        # 3. 清理 Machine 0 的暫存
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/get-pip.py"
+           "kubectl cp /tmp/pip.whl {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/pip.whl"
+        
+        # 3. 清理暫存
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/pip.whl"
 
         # 4. 進入 Pod 執行安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
@@ -73,10 +73,11 @@
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            echo "🔍 Bootstrapping pip..."
+            echo "🔍 Bootstrapping pip from wheel..."
             if ! command -v pip3 >/dev/null 2>&1; then
-               echo "⚡ pip3 not found, installing via get-pip.py..."
-               python3 get-pip.py --user --break-system-packages
+               echo "⚡ pip3 not found, installing directly from wheel..."
+               # 技巧：直接把 whl 當作 zip 執行，這是 Python 的隱藏功能
+               python3 pip.whl/pip install pip.whl --no-index --user --break-system-packages
             else
                echo "✅ pip3 is already installed."
             fi
