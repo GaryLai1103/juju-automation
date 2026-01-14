@@ -1,0 +1,171 @@
+---
+# ========================================================
+# Scenario: Real User AI Environment (Offline/Air-Gap)
+# Goal: Distribute offline wheel -> Install -> Run Training
+# ========================================================
+- name: 部署真實使用者 PyTorch 環境 (離線版)
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    # ---- 你的檔案位置 ----
+    local_wheel_path: "/home/gary/torch.whl"  # Jumpbox 上的路徑
+    
+    # ---- Slinky 設定 ----
+    test_model: "slinky-cluster"
+    k8s_machine: "0"
+    slurm_ns: "slurm"
+    controller_pod: "slurm-controller-0"
+    shared_dir: "/home/slurm"
+
+  tasks:
+    # ----------------------------------------------------
+    # 1. 檢查必要的安裝檔是否存在
+    # ----------------------------------------------------
+    - name: 1.1 檢查 Jumpbox 上是否有 torch.whl
+      stat:
+        path: "{{ local_wheel_path }}"
+      register: wheel_stat
+      failed_when: not wheel_stat.stat.exists
+
+    - name: 1.2 檢查 Controller Pod 狀態
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+          "kubectl get pod -n {{ slurm_ns }} {{ controller_pod }} -o jsonpath='{.status.phase}'"
+      register: pod_status
+      failed_when: "'Running' not in pod_status.stdout"
+
+    # ----------------------------------------------------
+    # 2. 將安裝檔搬運到 NFS 共享目錄 (所有節點可見)
+    # ----------------------------------------------------
+    - name: 2.1 上傳 torch.whl 到 Controller Pod
+      # 為了避免 Ansible 傳大檔超時，我們讓 Juju 機器自己用 scp/kubectl 處理
+      shell: |
+        # 1. 先傳到 Machine 0 的 /tmp
+        juju scp {{ local_wheel_path }} {{ test_model }}/{{ k8s_machine }}:/tmp/torch.whl
+        
+        # 2. 再從 Machine 0 複製進 Pod 的共享目錄
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+          "kubectl cp /tmp/torch.whl {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/torch.whl"
+        
+        # 3. 清理 Machine 0 的暫存
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/torch.whl"
+      async: 1200 # 允許跑 20 分鐘 (傳輸大檔)
+      poll: 10
+      register: upload_res
+
+    # ----------------------------------------------------
+    # 3. 建立 Python venv 並離線安裝
+    # ----------------------------------------------------
+    - name: 3.1 建立 venv 並離線安裝 PyTorch
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          # 在 Pod 裡面產生安裝腳本
+          cat << 'SCRIPT' > /tmp/install_env.sh
+          #!/bin/bash
+          cd {{ shared_dir }}
+          
+          echo "📂 Creating Virtual Environment..."
+          # 如果已存在先不刪除，節省時間，但真實場景可能需要 --clear
+          python3 -m venv ai-env
+
+          echo "📦 Installing PyTorch from Offline Wheel..."
+          source ai-env/bin/activate
+          
+          # [關鍵] 離線安裝指令，不連網
+          pip install {{ shared_dir }}/torch.whl --no-index --find-links {{ shared_dir }}
+          
+          # 驗證安裝
+          python3 -c "import torch; print(f'✅ PyTorch Installed: {torch.__version__}, CUDA: {torch.version.cuda}')"
+          SCRIPT
+          
+          chmod +x /tmp/install_env.sh
+          
+          # 複製進去並執行
+          kubectl cp /tmp/install_env.sh {{ slurm_ns }}/{{ controller_pod }}:/tmp/install_env.sh
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- /tmp/install_env.sh
+        EOS
+      async: 600
+      poll: 10
+
+    # ----------------------------------------------------
+    # 4. 準備真實的訓練程式 (Matrix Multiplication)
+    # ----------------------------------------------------
+    - name: 4.1 注入 train.py (真實 GPU 負載)
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          cat << 'PY' > /tmp/train.py
+        import torch
+        import time
+        import os
+        import socket
+
+        # 1. 取得節點資訊
+        node_name = socket.gethostname()
+        job_id = os.environ.get('SLURM_JOB_ID', 'Local')
+        print(f"🚀 [Job {job_id}] Training started on {node_name}")
+
+        # 2. 確認 GPU
+        if torch.cuda.is_available():
+            dev = torch.device("cuda")
+            print(f"✅ GPU Found: {torch.cuda.get_device_name(0)}")
+        else:
+            print("❌ No GPU found! Training on CPU (Slow).")
+            dev = torch.device("cpu")
+
+        # 3. 模擬訓練 (矩陣乘法)
+        N = 8000
+        print(f"🔥 Allocating Tensors ({N}x{N})...")
+        a = torch.randn(N, N, device=dev)
+        b = torch.randn(N, N, device=dev)
+
+        print("🔄 Starting Compute Loop (10 iterations)...")
+        start = time.time()
+        for i in range(10):
+            c = torch.mm(a, b)
+            # 強制同步以測量真實 GPU 時間
+            torch.cuda.synchronize()
+            print(f"   -> Batch {i+1} done.")
+            
+        end = time.time()
+        print(f"✅ Training Finished in {end - start:.2f} seconds.")
+        PY
+          
+          kubectl cp /tmp/train.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/train.py
+        EOS
+
+    # ----------------------------------------------------
+    # 5. 產生 sbatch 腳本 (使用者操作介面)
+    # ----------------------------------------------------
+    - name: 5.1 產生 run_job.sh
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          cat << 'SBATCH' > /tmp/run_job.sh
+        #!/bin/bash
+        #SBATCH --job-name=real-ai-train
+        #SBATCH --output=train-%j.out
+        #SBATCH --ntasks=1
+        #SBATCH --gres=gpu:1
+        #SBATCH --time=00:05:00
+        #SBATCH --partition=slinky
+
+        echo "➡️  Loading Environment..."
+        source {{ shared_dir }}/ai-env/bin/activate
+
+        echo "➡️  Running Training Script..."
+        python {{ shared_dir }}/train.py
+        SBATCH
+        
+          kubectl cp /tmp/run_job.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_job.sh
+        EOS
+
+    - name: 🚀 完成提示
+      debug:
+        msg: 
+          - "部署成功！真實使用者場景已就緒。"
+          - "----------------------------------------------------"
+          - "請進入 Pod 執行測試："
+          - "1. 登入: juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
+          - "2. 進入目錄: cd /home/slurm"
+          - "3. 送出訓練任務: sbatch run_job.sh"
+          - "4. 查看 Log: cat train-*.out"
+          - "----------------------------------------------------"
