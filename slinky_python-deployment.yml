@@ -52,57 +52,50 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (Match User Filename)
+    # 3. 離線安裝 Pip 與 PyTorch (修正 Torch 檔名)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (使用 pip-25.3)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (最終成功版)
       shell: |
-        # 定義與你 Jumpbox 上完全一致的檔名
+        # 定義標準檔名 (這兩個檔案都已經在 Jumpbox 改好名了)
         PIP_WHEEL="pip-25.3-py3-none-any.whl"
+        TORCH_WHEEL="torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
 
-        # 1. 傳送檔案到 Machine 0
+        # 1. 傳送 PIP (雖然裝過了，但為了腳本完整性還是傳一下，或你可以註解掉)
         cat /home/gary/$PIP_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$PIP_WHEEL"
-
-        # 2. 傳送檔案到 Pod
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-           "kubectl cp /tmp/$PIP_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$PIP_WHEEL"
-        
-        # 3. 清理 Machine 0 暫存
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "kubectl cp /tmp/$PIP_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$PIP_WHEEL"
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$PIP_WHEEL"
 
-        # 4. 進入 Pod 執行安裝
+        # 2. 傳送 TORCH (這次是用新檔名傳)
+        cat /home/gary/$TORCH_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$TORCH_WHEEL"
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "kubectl cp /tmp/$TORCH_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$TORCH_WHEEL"
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$TORCH_WHEEL"
+
+        # 3. 進入 Pod 執行安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 這裡也要用變數，確保內部腳本抓對檔案
             PIP_FILE="pip-25.3-py3-none-any.whl"
+            TORCH_FILE="torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
             
-            echo "🔍 Bootstrapping pip from $PIP_FILE..."
+            # --- 安裝 PIP (如果已安裝會自動跳過) ---
             if ! command -v pip3 >/dev/null 2>&1; then
-               echo "⚡ pip3 not found, extracting wheel..."
-               
-               # 解壓縮
+               echo "🔍 Bootstrapping pip..."
                mkdir -p pip_tmp
                python3 -m zipfile -e "$PIP_FILE" pip_tmp
-               
-               # 設定 PYTHONPATH 讓 Python 讀得到解壓後的 pip
                export PYTHONPATH=$(pwd)/pip_tmp
-               
-               echo "⚡ Installing pip..."
-               # 安裝自己
                python3 -m pip install "$PIP_FILE" --no-index --user --break-system-packages
-               
-               # 清理
                unset PYTHONPATH
                rm -rf pip_tmp
             else
                echo "✅ pip3 is already installed."
             fi
 
-            echo "📦 Installing PyTorch from Offline Wheel..."
-            python3 -m pip install {{ shared_dir }}/torch.whl \
+            # --- 安裝 PyTorch (使用新檔名) ---
+            echo "📦 Installing PyTorch from $TORCH_FILE..."
+            python3 -m pip install "$TORCH_FILE" \
                 --no-index \
                 --find-links {{ shared_dir }} \
                 --user \
