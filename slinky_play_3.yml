@@ -12,7 +12,6 @@
     machine0: "0"
     
     # ---- 關鍵修正：指定 GPU 節點名稱 ----
-    # (必須跟你在 K8s 裡看到的 Node Name 一樣，通常是 gpu-node01)
     gpu_node_hostname: "gpu-node01" 
     
     # ---- KubeSphere Host 設定 ----
@@ -21,6 +20,23 @@
     k8s_cluster_name: "slinky-k8s"
 
   tasks:
+    # -----------------------------------------------------------
+    # 0. 衝突資源清理 (針對 Whizard Agent 安裝失敗修復)
+    # -----------------------------------------------------------
+    - name: 0.1 移除衝突的 Kube-State-Metrics 資源
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        echo "🧹 Cleaning up conflicting resources for Whizard Agent..."
+        
+        # 刪除導致 Whizard Agent 裝不起來的舊 ClusterRole 與 Binding
+        kubectl delete clusterrole kube-state-metrics --ignore-not-found
+        kubectl delete clusterrolebinding kube-state-metrics --ignore-not-found
+        kubectl -n kubesphere-monitoring-system delete serviceaccount kube-state-metrics --ignore-not-found
+        
+        echo "✅ Cleanup Done."
+        EOS
+      changed_when: true
+
     # -----------------------------------------------------------
     # 1. 部署 K8s 原生版 DCGM Exporter
     # -----------------------------------------------------------
@@ -34,17 +50,17 @@
         EOS
       changed_when: true
 
-    # [步驟 1.1] 安裝 DCGM Exporter (Fix: 增加 NodeSelector)
+    # [步驟 1.1] 安裝 DCGM Exporter
     - name: 1.1 安裝 DCGM Exporter (Restricted to GPU Nodes)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         
-        # 1. 加入 Repo
+        # 加入 Repo
         helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
-        # 2. 建立 Values 檔案 (重點修正：nodeSelector)
+        # 建立 Values 檔案 (重點修正：nodeSelector + Resources)
         cat > /tmp/dcgm-values.yaml <<EOF
         serviceMonitor:
           enabled: true
@@ -59,11 +75,9 @@
             cpu: 100m
             memory: 128Mi
             
-        # [FIX] 關鍵修正：只允許在指定節點運行
         nodeSelector:
           kubernetes.io/hostname: {{ gpu_node_hostname }}
           
-        # [Optional] 如果節點有 Taint，需要容忍它
         tolerations:
           - key: "node-role.anxpert/gpu"
             operator: "Exists"
@@ -73,12 +87,12 @@
           root: "/"
         EOF
 
-        # 3. 安裝
+        # 安裝
         helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
           -n kubesphere-monitoring-system --create-namespace \
           -f /tmp/dcgm-values.yaml
         
-        # 4. 等待 Pod 啟動 (這次只會有一顆 Pod 跑起來，而且是 Running)
+        # 等待 Pod 啟動
         kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
         EOS
       changed_when: true
@@ -86,7 +100,7 @@
     # -----------------------------------------------------------
     # 2. 獲取 Kubeconfig 用於註冊
     # -----------------------------------------------------------
-    - name: 2.1 獲取 Machine 0 (Master) 實體 IP
+    - name: 2.1 獲取 Master 實體 IP
       shell: "juju ssh --model {{ test_model }} {{ machine0 }} 'hostname -I' | awk '{print $1}'"
       register: master_ip_result
 
@@ -169,6 +183,6 @@
     - name: 🚀 完成提示
       debug:
         msg: 
-          - "✅ DCGM Exporter 已修正 (只在 GPU 節點運行)"
-          - "✅ Master 節點不會再出現 CrashLoopBackOff 的 Pod"
-          - "✅ 叢集註冊完成！請去 KubeSphere 驗收 GPU 監控數據。"
+          - "✅ 舊衝突資源已清理 (kube-state-metrics)"
+          - "✅ DCGM Exporter 已修正並運行中"
+          - "✅ 叢集註冊完成！"
