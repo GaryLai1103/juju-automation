@@ -52,41 +52,45 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 預先安裝環境 (幫你省去打複雜指令的時間)
+    # 3. 建立 Python venv 並離線安裝 (修正版)
     # ----------------------------------------------------
-    - name: 3.1 建立 venv 並離線安裝 PyTorch
+    - name: 3.1 建立 venv 並離線安裝 PyTorch (修正縮排問題)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          cat << 'SCRIPT' > /tmp/install_env.sh
-          #!/bin/bash
-          cd {{ shared_dir }}
-          
-          # 1. 建立 venv (如果沒有的話)
-          if [ ! -d "ai-env" ]; then
-             echo "📂 Creating Virtual Environment (ai-env)..."
-             python3 -m venv ai-env
-          fi
+          # 直接透過 kubectl 執行複雜指令，避開 Heredoc 巢狀縮排地獄
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
+            set -e
+            cd {{ shared_dir }}
+            
+            # 1. 建立 venv
+            if [ ! -d "ai-env" ]; then
+              echo "📂 Creating Virtual Environment (ai-env)..."
+              python3 -m venv ai-env
+            fi
 
-          # 2. 啟動並安裝
-          source ai-env/bin/activate
-          
-          # 檢查是否已安裝，避免重複跑
-          if python3 -c "import torch" >/dev/null 2>&1; then
-             echo "✅ PyTorch already installed, skipping."
-          else
-             echo "📦 Installing PyTorch from Offline Wheel (this takes time)..."
-             pip install {{ shared_dir }}/torch.whl --no-index --find-links {{ shared_dir }}
-          fi
-          SCRIPT
-          
-          chmod +x /tmp/install_env.sh
-          kubectl cp /tmp/install_env.sh {{ slurm_ns }}/{{ controller_pod }}:/tmp/install_env.sh
-          
-          # 執行安裝
-          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- /tmp/install_env.sh
+            # 2. 啟動環境
+            source ai-env/bin/activate
+            
+            # 3. 檢查與安裝
+            if python3 -c "import torch" >/dev/null 2>&1; then
+              echo "✅ PyTorch already installed, skipping."
+            else
+              echo "📦 Installing PyTorch from Offline Wheel..."
+              # 確保 pip 是最新的 (選擇性)
+              # pip install --upgrade pip --no-index --find-links {{ shared_dir }} || true
+              
+              # 安裝 Wheel
+              pip install {{ shared_dir }}/torch.whl --no-index --find-links {{ shared_dir }}
+            fi
+            
+            # 4. 最終驗證
+            echo "🔍 Verifying installation..."
+            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
+          '
         EOS
-      async: 600
+      async: 900  # 給它 15 分鐘
       poll: 10
+      register: install_res
 
     # ----------------------------------------------------
     # 4. 佈署測試腳本 (30秒倒數 + 可中斷)
