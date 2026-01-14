@@ -1,9 +1,9 @@
 ---
 # ========================================================
-# Scenario: Slinky Offline AI Environment - Deployment Only
-# Goal: Upload files & Prep Env (WHL Folder Version)
+# Scenario: Slinky Offline AI Environment - Deployment & Verify
+# Goal: Install PyTorch (WHL) & Deploy GPU Verify Scripts
 # ========================================================
-- name: 佈署 Slinky PyTorch 測試檔案 (WHL 資料夾版)
+- name: 佈署 Slinky PyTorch 與 GPU 驗證腳本
   hosts: maasjuju
   gather_facts: no
   vars:
@@ -21,15 +21,15 @@
     - name: 1.1 離線安裝所有 Wheel 套件 (Bulk Install from WHL)
       shell: |
         # =======================================================
-        # [修正步驟] 0. 使用 sh -c 強制在 Pod 內執行刪除
-        # 這次絕對會刪乾淨！
+        # [步驟 0] 使用 sh -c 強制在 Pod 內執行刪除
+        # 確保舊的衝突檔案被徹底清除
         # =======================================================
         echo "🧹 Nuke ALL old wheels in Pod (Force)..."
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
            "kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- sh -c 'rm -f {{ shared_dir }}/*.whl'"
 
         # -------------------------------------------------------
-        # 1. 取得 Jumpbox 上 WHL 資料夾的檔案
+        # [步驟 1] 取得 Jumpbox 上 WHL 資料夾的檔案
         # -------------------------------------------------------
         WHEEL_FILES=$(ls /home/gary/WHL/*.whl)
         
@@ -39,7 +39,7 @@
         fi
         
         # -------------------------------------------------------
-        # 2. 迴圈：將每個檔案傳送到 Pod
+        # [步驟 2] 迴圈：將每個檔案傳送到 Pod
         # -------------------------------------------------------
         for FILE in $WHEEL_FILES; do
             FILENAME=$(basename "$FILE")
@@ -57,7 +57,7 @@
         done
 
         # -------------------------------------------------------
-        # 3. 進入 Pod 執行安裝
+        # [步驟 3] 進入 Pod 執行安裝
         # -------------------------------------------------------
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
@@ -65,7 +65,7 @@
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 再次檢查 (這次應該只會看到新傳進去的那 20 幾個檔案)
+            # 再次檢查 (確認無重複檔案)
             echo "📂 Files in directory (Should contain NO duplicates):"
             ls -1 *.whl | wc -l
             
@@ -77,15 +77,9 @@
                 --user \
                 --break-system-packages
             
-            echo "🔍 Verifying PyTorch..."
-            # 驗證是否能抓到 CUDA
-            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready. CUDA available: {torch.cuda.is_available()}\")"
-            
-            if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)"; then
-               echo "✅ GPU is detected!"
-            else
-               echo "⚠️ GPU not detected (Running on CPU mode)"
-            fi
+            echo "🔍 Verifying PyTorch on Controller..."
+            # 簡單驗證 Controller 端安裝是否成功 (這裡 CUDA False 是正常的)
+            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
           '
         EOS
       async: 1800
@@ -93,75 +87,74 @@
       register: install_res
 
     # ----------------------------------------------------
-    # 2. 佈署測試腳本
+    # 2. 佈署 GPU 驗證腳本 (取代原本的 train.py)
     # ----------------------------------------------------
-    - name: 2.1 注入 train.py
+    - name: 2.1 注入 GPU 檢測程式 (gpu_test.py)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          cat << 'PY' > /tmp/train.py
+          # 1. 建立 Python 測試檔
+          cat << 'PY' > /tmp/gpu_test.py
         import torch
-        import time
-        import os
-        import socket
         import sys
+        import socket
+        import time
 
-        TARGET_DURATION = 30
-        node_name = socket.gethostname()
-        job_id = os.environ.get('SLURM_JOB_ID', 'Interactive')
+        hostname = socket.gethostname()
+        print(f"========================================")
+        print(f"📍 Node Name: {hostname}")
+        print(f"🐍 PyTorch Version: {torch.__version__}")
+        print(f"========================================")
 
-        print(f"\n🚀 [Job {job_id}] GPU Test (Node: {node_name})")
-        
         if torch.cuda.is_available():
-            print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
-            dev = torch.device("cuda")
+            print(f"✅ SUCCESS! GPU Detected!")
+            print(f"🔢 GPU Count: {torch.cuda.device_count()}")
+            print(f"🏷️  GPU Name:  {torch.cuda.get_device_name(0)}")
+
+            # 簡單矩陣運算測試
+            print("🔥 Running tensor calculation on GPU (Matrix Multiplication)...")
+            try:
+                x = torch.randn(4096, 4096).cuda()
+                y = torch.mm(x, x)
+                torch.cuda.synchronize()
+                print("✅ Calculation finished successfully.")
+            except Exception as e:
+                print(f"❌ Calculation Failed: {e}")
+                sys.exit(1)
         else:
-            print("❌ No GPU found! Using CPU.")
-            dev = torch.device("cpu")
-
-        N = 4096 # 矩陣大小
-        a = torch.randn(N, N, device=dev)
-        b = torch.randn(N, N, device=dev)
-
-        print(f"🔥 Start Matrix Multiplication loop ({TARGET_DURATION}s)...")
-        start_time = time.time()
-        count = 0
-        
-        try:
-            while (time.time() - start_time) < TARGET_DURATION:
-                c = torch.mm(a, b)
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
-                count += 1
-                sys.stdout.write(f"\r⚡ Batch: {count}")
-                sys.stdout.flush()
-        except KeyboardInterrupt:
-            print("\nStopped.")
-
-        print(f"\n✅ Finished. Total Batches: {count}")
+            print(f"❌ ERROR: GPU NOT detected on this node ({hostname}).")
+            sys.exit(1)
         PY
           
-          kubectl cp /tmp/train.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/train.py
+          # 2. 傳入 Pod
+          kubectl cp /tmp/gpu_test.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/gpu_test.py
         EOS
 
-    - name: 2.2 注入 run_job.sh
+    - name: 2.2 注入 Slurm 排程腳本 (run_verify.sh)
       shell: |
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          cat << 'SBATCH' > /tmp/run_job.sh
+          # 1. 建立 SBATCH 腳本
+          cat << 'SBATCH' > /tmp/run_verify.sh
         #!/bin/bash
-        #SBATCH --job-name=gpu-test
-        #SBATCH --output=gpu-%j.out
-        #SBATCH --ntasks=1
-        #SBATCH --gres=gpu:1
-        #SBATCH --time=00:05:00
+        #SBATCH --job-name=gpu-verify
+        #SBATCH --output=gpu-verify.out
         #SBATCH --partition=slinky
+        #SBATCH --gres=gpu:1
+        #SBATCH --ntasks=1
+        #SBATCH --time=00:02:00
 
-        # [修改點 2] 移除 source ai-env，因為我們是用 --user 安裝到預設路徑
-        echo "➡️ Starting Training..."
+        # 設定 PATH (因為是 --user 安裝)
         export PATH=$HOME/.local/bin:$PATH
-        
-        python3 {{ shared_dir }}/train.py
+
+        echo "🚀 Starting GPU Verification on Worker Node..."
+        python3 {{ shared_dir }}/gpu_test.py
         SBATCH
         
-          kubectl cp /tmp/run_job.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_job.sh
+          # 2. 傳入 Pod
+          kubectl cp /tmp/run_verify.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_verify.sh
+          
+          # 3. (選用) 直接幫你送出 Job，省得你手動打指令
+          echo "📤 Submitting Slurm Job automatically..."
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c "cd {{ shared_dir }} && sbatch run_verify.sh"
         EOS
 
     # ----------------------------------------------------
@@ -170,7 +163,10 @@
     - name: 🚀 佈署完成
       debug:
         msg: 
-          - "✅ 安裝完成！請登入 Controller 測試："
-          - "juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
-          - "cd /home/slurm"
-          - "python3 train.py"
+          - "========================================================"
+          - "✅ 安裝與佈署完成！GPU 測試工作已送出。"
+          - "========================================================"
+          - "請稍後登入檢查結果："
+          - "1. 登入: juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
+          - "2. 查看: cat /home/slurm/gpu-verify.out"
+          - "========================================================"
