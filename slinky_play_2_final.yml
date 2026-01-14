@@ -210,18 +210,41 @@
       when: nfs_server_setup | bool
       changed_when: true
 
-    - name: 3.1 Setup NFS Client (All Nodes) - WITH REPO CLEANUP
+    - name: 3.1 Setup NFS Client (All Nodes) - ROBUST FIX
       shell: |
         juju ssh --model {{ test_model }} {{ item }} -- bash -s <<'EOS'
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
         
-        # Critical cleanup
+        echo "🔧 [Fix] Pre-flight check for APT locks..."
+
+        # 1. 停止自動更新服務，避免干擾佈署
+        sudo systemctl stop unattended-upgrades || true
+        
+        # 2. 如果進程還活著，直接殺掉 (暴力但有效)
+        if pgrep -f unattended-upgr >/dev/null; then
+            echo "⚠️  Killing active unattended-upgrades process..."
+            sudo pkill -f unattended-upgr || true
+        fi
+
+        # 3. 清理舊的 nvidia repo (維持原本邏輯)
         sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
         sudo rm -f /etc/apt/sources.list.d/nvidia-docker.list
         sudo rm -f /etc/apt/sources.list.d/libnvidia-container.list
 
-        while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+        # 4. 嚴格等待鎖釋放 (檢查所有可能的鎖)
+        echo "⏳ Waiting for APT locks to release..."
+        while sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+              sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+              sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+           echo " -> Lock held, waiting 5s..."
+           sleep 5
+        done
+        
+        # 5. 修復可能中斷的 dpkg 狀態
+        sudo dpkg --configure -a || true
+
+        echo "🚀 Starting Installation..."
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true update -y
         timeout 600 sudo apt-get -o Acquire::ForceIPv4=true install -y nfs-common
         EOS
