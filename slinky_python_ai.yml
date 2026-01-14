@@ -62,4 +62,73 @@
             # 3. 驗證
             export PATH=\$HOME/.local/bin:\$PATH
             python3 -m pip --version
-            python3 -c 'import torch; print
+            python3 -c 'import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")'
+          "
+        EOS
+      async: 1800
+      poll: 10
+      register: install_res
+
+    # ----------------------------------------------------
+    # 2. 佈署 GPU 燒機與溫度監控腳本
+    # ----------------------------------------------------
+    - name: 2.1 注入燒機程式 (burn_test.py)
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          cat << 'PY' > /tmp/burn_test.py
+        import torch
+        import sys
+        import time
+        import os
+
+        DURATION = 45
+        MATRIX_SIZE = 8192
+
+        print(f"🔥 Starting GPU Burn-in Test")
+        if not torch.cuda.is_available():
+            print("❌ Error: No GPU found!")
+            sys.exit(1)
+
+        device = torch.device("cuda")
+        x = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+        y = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+        start_time = time.time()
+        end_time = start_time + DURATION
+        batch = 0
+
+        try:
+            while time.time() < end_time:
+                z = torch.mm(x, y)
+                torch.cuda.synchronize()
+                batch += 1
+                if batch % 10 == 0:
+                    temp = os.popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader").read().strip()
+                    sys.stdout.write(f"\r⚡ Batch: {batch} | Temp: {temp}°C | Left: {int(end_time - time.time())}s ")
+                    sys.stdout.flush()
+        except KeyboardInterrupt:
+            pass
+        print(f"\n✅ Finished! Total Batches: {batch}")
+        PY
+          kubectl cp /tmp/burn_test.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/burn_test.py
+        EOS
+
+    - name: 2.2 注入並送出 Slurm 任務
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          cat << 'SBATCH' > /tmp/run_burn.sh
+        #!/bin/bash
+        #SBATCH --job-name=gpu-burn
+        #SBATCH --output=burn-%j.out
+        #SBATCH --partition=slinky
+        #SBATCH --gres=gpu:1
+        #SBATCH --time=00:10:00
+        export PATH=$HOME/.local/bin:$PATH
+        python3 {{ shared_dir }}/burn_test.py
+        SBATCH
+          kubectl cp /tmp/run_burn.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_burn.sh
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c "cd {{ shared_dir }} && scancel -u slurm && sbatch run_burn.sh"
+        EOS
+
+    - name: 🚀 佈署完成
+      debug:
+        msg: "✅ 測試已啟動！請執行 tail -f {{ shared_dir }}/burn-*.out 監看"
