@@ -53,9 +53,9 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 Dependencies (Pod內強力清除版)
+    # 3. 離線安裝 Pip 與 Dependencies (最終通關版)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝所有 Wheel 套件 (Force Clean & Install)
+    - name: 3.1 離線安裝所有 Wheel 套件 (Bulk Install)
       shell: |
         # 1. 取得 Jumpbox 上所有 .whl 檔案列表
         WHEEL_FILES=$(ls /home/gary/*.whl)
@@ -77,22 +77,20 @@
             juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$FILENAME"
         done
 
-        # 3. 進入 Pod 執行安裝 (這裡是重點！)
+        # 3. 進入 Pod 執行安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # [關鍵修正] 在這裡直接刪除舊的壞檔，這是在 Pod 裡的 Bash 執行，絕對有效！
+            # 強制清理可能存在的舊壞檔
             echo "🧹 Force removing legacy invalid wheels..."
             rm -f pip.whl torch.whl
             
-            # 再次檢查 (現在應該只剩標準檔名的檔案了)
-            ls -lh *.whl
-            
             # --- 安裝所有 .whl 檔 ---
             echo "📦 Installing ALL wheels..."
+            # 這次 setuptools 也在裡面了，PyTorch 會很開心
             python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
