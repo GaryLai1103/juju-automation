@@ -474,14 +474,15 @@
                 storage: 10Gi
           extraConf: |
             GresTypes=gpu
+          slurmctld:
+            volumeMounts:
+              - name: home-drive
+                mountPath: /home/slurm
           volumes:
             - name: home-drive
               nfs:
                 server: {{ nfs_server_ip }}
                 path: {{ nfs_export_path }}
-          volumeMounts:
-            - name: home-drive
-              mountPath: /home/slurm
           podSpec:
             nodeSelector:
               kubernetes.io/hostname: {{ controlplane_hostname }}
