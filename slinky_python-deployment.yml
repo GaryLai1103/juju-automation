@@ -52,22 +52,21 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (Bootstrap Pip)
+    # 3. 離線安裝 Pip 與 PyTorch (Pipe Mode)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (修正傳輸邏輯)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (直接串流傳輸)
       shell: |
-        # --- [Step 1] 在 Jumpbox 本地執行傳輸 (Juju Client) ---
-        # 1.1 傳送到 Machine 0 的 /tmp
-        juju scp /home/gary/get-pip.py {{ test_model }}/{{ k8s_machine }}:/tmp/get-pip.py
-        
-        # 1.2 叫 Machine 0 把檔案塞進 Pod (透過 kubectl)
+        # 1. 直接用 cat 把本地檔案透過 SSH Pipe 傳送到 Machine 0
+        cat /home/gary/get-pip.py | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/get-pip.py"
+
+        # 2. 透過 kubectl 把檔案從 Machine 0 複製進 Pod
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
            "kubectl cp /tmp/get-pip.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/get-pip.py"
            
-        # 1.3 清理 Machine 0 的暫存
+        # 3. 清理 Machine 0 的暫存
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/get-pip.py"
 
-        # --- [Step 2] 進入 Pod 執行安裝 ---
+        # 4. 進入 Pod 執行安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
