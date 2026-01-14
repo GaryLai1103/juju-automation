@@ -474,15 +474,6 @@
                 storage: 10Gi
           extraConf: |
             GresTypes=gpu
-          slurmctld:
-            volumeMounts:
-              - name: home-drive
-                mountPath: /home/slurm
-          volumes:
-            - name: home-drive
-              nfs:
-                server: {{ nfs_server_ip }}
-                path: {{ nfs_export_path }}
           podSpec:
             nodeSelector:
               kubernetes.io/hostname: {{ controlplane_hostname }}
@@ -519,11 +510,6 @@
                   operator: Equal
                   value: "{{ gpu_taint_value }}"
                   effect: NoSchedule
-              volumes:
-                - name: home-drive
-                  nfs:
-                    server: {{ nfs_server_ip }}
-                    path: {{ nfs_export_path }}
             slurmd:
               resources:
                 limits:
@@ -531,9 +517,6 @@
               args:
                 - --conf
                 - Gres=gpu:{{ slurm_gpu_count }}
-              volumeMounts:
-                - name: home-drive
-                  mountPath: /home/slurm
         partitions:
           all:
             enabled: true
