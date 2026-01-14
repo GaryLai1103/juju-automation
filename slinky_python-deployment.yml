@@ -19,23 +19,21 @@
 
   tasks:
     # ----------------------------------------------------
-    # 1. Pre-check Files
+    # 1. Pre-check Files (Corrected Logic)
     # ----------------------------------------------------
-    - name: 1. Check if offline files exist
+    - name: 1.1 Collect file status
       stat:
         path: "{{ item }}"
       loop:
-        - "/home/gary/pip-25.3-py3-none-any.whl"                # [已修正] 標準 Pip 檔名
-        - "/home/gary/torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl" # [已修正] 標準 Torch 檔名
-      register: file_check
-      failed_when: not item.stat.exists
+        - "/home/gary/pip-25.3-py3-none-any.whl"
+        - "/home/gary/torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
+      register: file_check_results
 
-    - name: 1.2 確認 Slurm Controller 活著
-      shell: |
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
-          "kubectl get pod -n {{ slurm_ns }} {{ controller_pod }} -o jsonpath='{.status.phase}'"
-      register: pod_status
-      failed_when: "'Running' not in pod_status.stdout"
+    - name: 1.2 Fail if any file is missing
+      fail:
+        msg: "❌ Missing file: {{ item.item }} - Please upload it to Jumpbox first."
+      when: not item.stat.exists
+      loop: "{{ file_check_results.results }}"
 
     # ----------------------------------------------------
     # 2. 搬運大檔案 (Wheel)
