@@ -1,7 +1,7 @@
 ---
 # ========================================================
 # Scenario: Post-Deployment - DCGM & KubeSphere Registration
-# Goal: Deploy K8s-native DCGM (Fix CRD) & Register Cluster
+# Goal: Deploy K8s-native DCGM (Fix OOM & CRD) & Register
 # ========================================================
 - name: 4. 設定監控與多叢集對接
   hosts: maasjuju
@@ -21,44 +21,52 @@
     # 1. 部署 K8s 原生版 DCGM Exporter
     # -----------------------------------------------------------
     
-    # [新增步驟] 1.0 預先安裝 ServiceMonitor CRD
-    # 這是為了解決 "no matches for kind ServiceMonitor" 的錯誤
-    # 因為 KubeSphere 的 Agent 還沒進來，K8s 不認得這個物件
+    # [步驟 1.0] 預先安裝 ServiceMonitor CRD
     - name: 1.0 預先安裝 Prometheus CRD (ServiceMonitor)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        
-        echo "🔧 Installing ServiceMonitor CRD..."
-        # 下載並套用 Prometheus Operator 的 CRD 定義檔
         kubectl apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
-        
         EOS
       changed_when: true
 
-    - name: 1.1 安裝 DCGM Exporter (Helm with Values File)
+    # [步驟 1.1] 安裝 DCGM Exporter (Fix: 增加記憶體限制)
+    - name: 1.1 安裝 DCGM Exporter (Helm with Memory Limits)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         
-        # 1. 加入 Repo (gpu-helm-charts)
+        # 1. 加入 Repo
         helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
-        # 2. 建立乾淨的 Values 檔案
+        # 2. 建立 Values 檔案 (重點修正：加大 resources)
         cat > /tmp/dcgm-values.yaml <<EOF
         serviceMonitor:
           enabled: true
           additionalLabels:
             app.kubernetes.io/vendor: kubesphere
+        
+        # [FIX] 防止 OOMKilled，加大記憶體限制
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+            
+        # [FIX] 確保掛載正確的驅動路徑 (有些環境需要)
+        hostPath:
+          root: "/"
         EOF
 
-        # 3. 安裝 (現在 K8s 已經認得 ServiceMonitor 了，這裡會成功)
+        # 3. 安裝
         helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
           -n kubesphere-monitoring-system --create-namespace \
           -f /tmp/dcgm-values.yaml
         
-        # 4. 等待 Pod 啟動
+        # 4. 等待 Pod 啟動 (這次應該不會死了)
         kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
         EOS
       changed_when: true
@@ -116,14 +124,10 @@
             kubeconfig: {{ cluster_config }}
         EOF
 
-    # --------------------------------------------------------
-    # 5.2 確保監控數據對接 (ServiceMonitor)
-    # --------------------------------------------------------
     - name: 5.2 建立 ServiceMonitor 補丁
       shell: |
         echo "{{ cluster_config }}" | base64 -d > {{ member_config_file }}
 
-        # 在 Member Cluster 補上特定的 ServiceMonitor 設定 (雙重保險)
         cat <<EOF | kubectl --kubeconfig {{ member_config_file }} apply -f -
         apiVersion: monitoring.coreos.com/v1
         kind: ServiceMonitor
@@ -153,5 +157,5 @@
     - name: 🚀 完成提示
       debug:
         msg: 
-          - "✅ CRD 已修復，DCGM Exporter 安裝成功！"
-          - "✅ 叢集 '{{ cluster_name }}' 已註冊到 KubeSphere"
+          - "✅ DCGM Exporter 已修復 OOM 問題 (Memory Limit increased)"
+          - "✅ 叢集註冊完成！"
