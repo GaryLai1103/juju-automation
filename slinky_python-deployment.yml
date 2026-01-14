@@ -1,4 +1,94 @@
-# ----------------------------------------------------
+---
+# ========================================================
+# Scenario: Slinky Offline AI Environment - Deployment Only
+# Goal: Upload files & Prep Env, BUT DO NOT RUN JOBS.
+# ========================================================
+- name: 佈署 Slinky PyTorch 測試檔案 (不自動執行)
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    # ---- 本地檔案位置 (Jumpbox) ----
+    local_wheel_path: "/home/gary/torch.whl"
+    
+    # ---- Slinky 設定 ----
+    test_model: "slinky-cluster"
+    k8s_machine: "0"
+    slurm_ns: "slurm"
+    controller_pod: "slurm-controller-0"
+    shared_dir: "/home/slurm"
+
+  tasks:
+    # ----------------------------------------------------
+    # 1. 檢查與確認
+    # ----------------------------------------------------
+    - name: 1.1 檢查 Jumpbox 上是否有 torch.whl
+      stat:
+        path: "{{ local_wheel_path }}"
+      register: wheel_stat
+      failed_when: not wheel_stat.stat.exists
+
+    - name: 1.2 確認 Slurm Controller 活著
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+          "kubectl get pod -n {{ slurm_ns }} {{ controller_pod }} -o jsonpath='{.status.phase}'"
+      register: pod_status
+      failed_when: "'Running' not in pod_status.stdout"
+
+    # ----------------------------------------------------
+    # 2. 搬運大檔案 (Wheel)
+    # ----------------------------------------------------
+    - name: 2.1 上傳 torch.whl 到 Controller 共享目錄
+      shell: |
+        # 1. Jumpbox -> Machine 0
+        juju scp {{ local_wheel_path }} {{ test_model }}/{{ k8s_machine }}:/tmp/torch.whl
+        
+        # 2. Machine 0 -> Pod (NFS Shared Dir)
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+          "kubectl cp /tmp/torch.whl {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/torch.whl"
+        
+        # 3. 清除暫存
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/torch.whl"
+      async: 1200
+      poll: 10
+
+    # ----------------------------------------------------
+    # 3. 預先安裝環境 (幫你省去打複雜指令的時間)
+    # ----------------------------------------------------
+    - name: 3.1 建立 venv 並離線安裝 PyTorch
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          cat << 'SCRIPT' > /tmp/install_env.sh
+          #!/bin/bash
+          cd {{ shared_dir }}
+          
+          # 1. 建立 venv (如果沒有的話)
+          if [ ! -d "ai-env" ]; then
+             echo "📂 Creating Virtual Environment (ai-env)..."
+             python3 -m venv ai-env
+          fi
+
+          # 2. 啟動並安裝
+          source ai-env/bin/activate
+          
+          # 檢查是否已安裝，避免重複跑
+          if python3 -c "import torch" >/dev/null 2>&1; then
+             echo "✅ PyTorch already installed, skipping."
+          else
+             echo "📦 Installing PyTorch from Offline Wheel (this takes time)..."
+             pip install {{ shared_dir }}/torch.whl --no-index --find-links {{ shared_dir }}
+          fi
+          SCRIPT
+          
+          chmod +x /tmp/install_env.sh
+          kubectl cp /tmp/install_env.sh {{ slurm_ns }}/{{ controller_pod }}:/tmp/install_env.sh
+          
+          # 執行安裝
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- /tmp/install_env.sh
+        EOS
+      async: 600
+      poll: 10
+
+    # ----------------------------------------------------
     # 4. 佈署測試腳本 (30秒倒數 + 可中斷)
     # ----------------------------------------------------
     - name: 4.1 注入 train.py (30秒自動倒數，可 Ctrl+C)
@@ -12,7 +102,7 @@
         import sys
 
         # 1. 設定
-        TARGET_DURATION = 60  # 設定跑 30 秒
+        TARGET_DURATION = 30  # 設定跑 30 秒
         node_name = socket.gethostname()
         job_id = os.environ.get('SLURM_JOB_ID', 'Interactive')
 
@@ -77,3 +167,50 @@
           
           kubectl cp /tmp/train.py {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/train.py
         EOS
+
+    - name: 4.2 注入 run_job.sh (Slurm 排程腳本)
+      shell: |
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          cat << 'SBATCH' > /tmp/run_job.sh
+        #!/bin/bash
+        #SBATCH --job-name=gpu-test
+        #SBATCH --output=gpu-%j.out
+        #SBATCH --ntasks=1
+        #SBATCH --gres=gpu:1
+        #SBATCH --time=00:05:00
+        #SBATCH --partition=slinky
+
+        echo "➡️ Loading AI Environment..."
+        source {{ shared_dir }}/ai-env/bin/activate
+
+        echo "➡️ Starting Training..."
+        python {{ shared_dir }}/train.py
+        SBATCH
+        
+          kubectl cp /tmp/run_job.sh {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/run_job.sh
+        EOS
+
+    # ----------------------------------------------------
+    # 5. 手動操作指引
+    # ----------------------------------------------------
+    - name: 🚀 佈署完成！請手動開始測試
+      debug:
+        msg: 
+          - "========================================================"
+          - "✅ 檔案與環境已就緒，請依照下列步驟手動測試："
+          - "========================================================"
+          - "1. [登入 Controller Pod]"
+          - "   juju ssh -m {{ test_model }} 0 -- kubectl exec -it -n slurm slurm-controller-0 -- bash"
+          - ""
+          - "2. [進入共享目錄]"
+          - "   cd /home/slurm"
+          - ""
+          - "3. [方式 A: 互動式測試 (推薦! 可以直接看螢幕輸出)]"
+          - "   source ai-env/bin/activate"
+          - "   srun --gres=gpu:1 --pty python train.py"
+          - ""
+          - "4. [方式 B: 排程測試 (標準做法)]"
+          - "   sbatch run_job.sh"
+          - "   squeue (查看狀態)"
+          - "   cat gpu-*.out (查看結果)"
+          - "========================================================"
