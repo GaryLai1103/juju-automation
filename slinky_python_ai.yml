@@ -50,31 +50,34 @@
         done
 
         # -------------------------------------------------------
-        # [步驟 3] 進入 Pod 執行安裝
-        # -------------------------------------------------------
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
-          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
-            set -e
-            cd {{ shared_dir }}
-            export PATH=$HOME/.local/bin:$PATH
-            
-            echo "📂 Checking files..."
-            ls -1 *.whl | wc -l
-            
-            echo "📦 Installing ALL wheels..."
-            python3 -m pip install *.whl \
-                --no-index \
-                --find-links {{ shared_dir }} \
-                --user \
-                --break-system-packages
-            
-            echo "🔍 Verifying PyTorch on Controller..."
-            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
-          '
-        EOS
-      async: 1800
-      poll: 10
-      register: install_res
+        # [步驟 3] 進入 Pod 執行安裝 (修正：解決無 pip 問題)
+        # -------------------------------------------------------
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
+          kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
+            set -e
+            cd {{ shared_dir }}
+            
+            # 1. 自動偵測傳進去的 pip 檔名
+            BOOTSTRAP_PIP=$(ls pip-*.whl | head -n 1)
+            
+            echo "🛠️  Found pip wheel: $BOOTSTRAP_PIP"
+            echo "📦 Bootstrapping pip and installing all packages..."
+            
+            # 2. 關鍵：使用 PYTHONPATH 將 whl 加入路徑，並執行 python3 -m pip
+            PYTHONPATH=$BOOTSTRAP_PIP python3 -m pip install *.whl \
+                --no-index \
+                --find-links . \
+                --user \
+                --break-system-packages
+            
+            # 3. 設置路徑並驗證
+            export PATH=$HOME/.local/bin:$PATH
+            
+            echo "🔍 Verifying Installation..."
+            python3 -m pip --version
+            python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
+          '
+        EOS
 
     # ----------------------------------------------------
     # 2. 佈署 GPU 燒機與溫度監控腳本
