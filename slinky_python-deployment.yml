@@ -53,60 +53,68 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (最終修正版)
+    # 3. 離線安裝 Pip 與 所有 PyTorch Dependencies (最終完美版)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (使用標準檔名)
+    - name: 3.1 離線安裝所有 Wheel 套件 (Bulk Install)
       shell: |
-        # 定義標準檔名 (這兩個檔案都已經在 Jumpbox 改好名了)
-        PIP_WHEEL="pip-25.3-py3-none-any.whl"
-        TORCH_WHEEL="torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
+        # 1. 取得 Jumpbox 上所有 .whl 檔案列表
+        # 這會抓到 pip, torch, filelock, sympy 等所有檔案
+        WHEEL_FILES=$(ls /home/gary/*.whl)
 
-        # 1. 傳送 PIP
-        cat /home/gary/$PIP_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$PIP_WHEEL"
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "kubectl cp /tmp/$PIP_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$PIP_WHEEL"
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$PIP_WHEEL"
+        echo "📦 Found wheels: $WHEEL_FILES"
 
-        # 2. 傳送 TORCH
-        cat /home/gary/$TORCH_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$TORCH_WHEEL"
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "kubectl cp /tmp/$TORCH_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$TORCH_WHEEL"
-        juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$TORCH_WHEEL"
+        # 2. 迴圈：將每個檔案傳送到 Pod
+        for FILE in $WHEEL_FILES; do
+            FILENAME=$(basename "$FILE")
+            echo "🚀 Transferring $FILENAME..."
+            
+            # Jumpbox -> Machine 0
+            cat "$FILE" | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$FILENAME"
+            
+            # Machine 0 -> Pod
+            juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+               "kubectl cp /tmp/$FILENAME {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$FILENAME"
+            
+            # Clean up Machine 0
+            juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$FILENAME"
+        done
 
-        # 3. 進入 Pod 執行安裝
+        # 3. 進入 Pod 執行「全家桶」安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            PIP_FILE="pip-25.3-py3-none-any.whl"
-            TORCH_FILE="torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
+            # 先找 pip 安裝檔 (以防萬一還沒裝)
+            PIP_WHEEL=$(ls pip-*.whl | head -n 1)
             
-            # --- 安裝 PIP (如果已安裝會自動跳過) ---
             if ! command -v pip3 >/dev/null 2>&1; then
-               echo "🔍 Bootstrapping pip..."
+               echo "🔍 Bootstrapping pip from $PIP_WHEEL..."
                mkdir -p pip_tmp
-               python3 -m zipfile -e "$PIP_FILE" pip_tmp
+               python3 -m zipfile -e "$PIP_WHEEL" pip_tmp
                export PYTHONPATH=$(pwd)/pip_tmp
-               python3 -m pip install "$PIP_FILE" --no-index --user --break-system-packages
+               python3 -m pip install "$PIP_WHEEL" --no-index --user --break-system-packages
                unset PYTHONPATH
                rm -rf pip_tmp
             else
                echo "✅ pip3 is already installed."
             fi
 
-            # --- 安裝 PyTorch ---
-            echo "📦 Installing PyTorch from $TORCH_FILE..."
-            python3 -m pip install "$TORCH_FILE" \
+            # --- 關鍵：一次安裝所有 .whl 檔 ---
+            echo "📦 Installing ALL wheels found in directory..."
+            # pip install *.whl 會自動解析依賴順序，先裝 filelock 再裝 torch
+            python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
                 --user \
                 --break-system-packages
             
-            echo "🔍 Verifying installation..."
+            echo "🔍 Verifying PyTorch..."
             python3 -c "import torch; print(f\"🎉 Success! PyTorch {torch.__version__} is ready.\")"
           '
         EOS
-      async: 900
+      async: 1800
       poll: 10
       register: install_res
 
