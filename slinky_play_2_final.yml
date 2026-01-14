@@ -463,7 +463,7 @@
         NS="{{ ns_slurm }}"
         CHART_VER="{{ slurm_chart_ver }}"
 
-    cat > /tmp/slurm-values.yaml <<EOF
+        cat > /tmp/slurm-values.yaml <<EOF
         controller:
           persistence:
             enabled: true
