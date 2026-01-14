@@ -1,0 +1,143 @@
+---
+# ========================================================
+# Scenario: Post-Deployment - DCGM & KubeSphere Registration
+# Goal: Deploy K8s-native DCGM & Register Cluster to Host
+# ========================================================
+- name: 4. 設定監控與多叢集對接
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    # ---- Juju / Model 設定 ----
+    test_model: "slinky-cluster"
+    machine0: "0"  # Control Plane (slurmhn)
+    
+    # ---- KubeSphere Host 設定 (請修改這裡) ----
+    ks_host_ip: "192.168.100.4"      # 你的 KubeSphere 主機 IP
+    ks_host_user: "ubuntu"           # SSH 使用者
+    k8s_cluster_name: "slinky-k8s"   # 在 KubeSphere 上顯示的名稱
+
+  tasks:
+    # -----------------------------------------------------------
+    # 1. 部署 K8s 原生版 DCGM Exporter
+    #    (取代舊的 Snap 安裝，這是 Cloud Native 的做法)
+    # -----------------------------------------------------------
+    - name: 1.1 安裝 DCGM Exporter (Helm / Manifest)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        
+        # 1. 加入 NVIDIA Helm Repo
+        helm repo add nvidia https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
+
+        # 2. 安裝 DCGM Exporter (DaemonSet)
+        # 這樣會自動在所有 GPU 節點 (gpu-node01) 上跑一個 Pod
+        helm upgrade --install dcgm-exporter nvidia/dcgm-exporter \
+          -n kubesphere-monitoring-system --create-namespace \
+          --set serviceMonitor.enabled=true \
+          --set serviceMonitor.additionalLabels.app\.kubernetes\.io/vendor=kubesphere
+        
+        # 3. 等待 Pod 啟動
+        kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
+        EOS
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 2. 獲取 Kubeconfig 用於註冊
+    # -----------------------------------------------------------
+    - name: 2.1 獲取 Machine 0 (Master) 實體 IP
+      shell: "juju ssh --model {{ test_model }} {{ machine0 }} 'hostname -I' | awk '{print $1}'"
+      register: master_ip_result
+
+    - name: 2.2 抓取並修正 Kubeconfig (Base64)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          # 讀取 config，將內部 IP (127.0.0.1) 替換為外部實體 IP
+          # 這樣 KubeSphere Host 才能連過來
+          cat ~/.kube/config | sed "s/127.0.0.1/{{ master_ip_result.stdout | trim }}/g" | sed "s/localhost/{{ master_ip_result.stdout | trim }}/g" | base64 -w 0
+        EOS
+      register: kubeconfig_b64
+
+    # -----------------------------------------------------------
+    # 3. 準備 KubeSphere Host 連線
+    # -----------------------------------------------------------
+    - name: 3.1 加入 KubeSphere Host 到 Inventory
+      add_host:
+        name: "ks_host"
+        ansible_host: "{{ ks_host_ip }}"
+        ansible_user: "{{ ks_host_user }}"
+        cluster_name: "{{ k8s_cluster_name }}"
+        cluster_config: "{{ kubeconfig_b64.stdout }}"
+
+# ========================================================
+# 第二部分：在 KubeSphere Host 上執行註冊
+# ========================================================
+- name: 5. 執行 KubeSphere 註冊
+  hosts: ks_host
+  gather_facts: no
+  vars:
+    member_config_file: "/tmp/kubeconfig-{{ cluster_name }}"
+
+  tasks:
+    - name: 5.1 注入 Member Cluster CRD
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ cluster_name }}
+          labels:
+            kubesphere.io/managed: "true"
+            cluster-role.kubesphere.io/member: ""
+        spec:
+          provider: kubernetes
+          joinFederation: true
+          connection:
+            type: direct
+            kubeconfig: {{ cluster_config }}
+        EOF
+
+    # --------------------------------------------------------
+    # 5.2 確保監控數據對接 (ServiceMonitor)
+    # --------------------------------------------------------
+    - name: 5.2 建立 ServiceMonitor 補丁 (確保 KS 能抓到 DCGM)
+      shell: |
+        # 解碼 kubeconfig 到臨時檔，以便操作 Member Cluster
+        echo "{{ cluster_config }}" | base64 -d > {{ member_config_file }}
+
+        # 在 Member Cluster (Slurm K8s) 裡面補上特定的 ServiceMonitor 設定
+        # 雖然 Helm 裝了 ServiceMonitor，但有時候 Label 對不上 KS 的預設抓取規則
+        cat <<EOF | kubectl --kubeconfig {{ member_config_file }} apply -f -
+        apiVersion: monitoring.coreos.com/v1
+        kind: ServiceMonitor
+        metadata:
+          name: dcgm-exporter-ks-patch
+          namespace: kubesphere-monitoring-system
+          labels:
+            app.kubernetes.io/vendor: kubesphere  # 這是關鍵 Label
+        spec:
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: dcgm-exporter
+          endpoints:
+          - port: metrics
+            path: /metrics
+            interval: 15s
+          namespaceSelector:
+            matchNames:
+            - kubesphere-monitoring-system
+        EOF
+
+    - name: 5.3 清理
+      file:
+        path: "{{ member_config_file }}"
+        state: absent
+
+    - name: 🚀 完成提示
+      debug:
+        msg: 
+          - "✅ DCGM Exporter 已安裝在 K8s 叢集內 (DaemonSet 模式)"
+          - "✅ 叢集 '{{ cluster_name }}' 已註冊到 KubeSphere"
+          - "⚠️  請前往 KubeSphere 介面 -> '平台管理' -> '叢集管理'"
+          - "   確認 {{ cluster_name }} 狀態為 '運行中'。"
+          - "   等待約 3-5 分鐘，GPU 監控數據應會自動出現在儀表板。"
