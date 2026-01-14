@@ -55,20 +55,20 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 PyTorch (修正 Torch 檔名)
+    # 3. 離線安裝 Pip 與 PyTorch (最終修正版)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝 Pip 與 PyTorch (最終成功版)
+    - name: 3.1 離線安裝 Pip 與 PyTorch (使用標準檔名)
       shell: |
         # 定義標準檔名 (這兩個檔案都已經在 Jumpbox 改好名了)
         PIP_WHEEL="pip-25.3-py3-none-any.whl"
         TORCH_WHEEL="torch-2.5.1-cp312-cp312-manylinux1_x86_64.whl"
 
-        # 1. 傳送 PIP (雖然裝過了，但為了腳本完整性還是傳一下，或你可以註解掉)
+        # 1. 傳送 PIP
         cat /home/gary/$PIP_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$PIP_WHEEL"
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- "kubectl cp /tmp/$PIP_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$PIP_WHEEL"
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$PIP_WHEEL"
 
-        # 2. 傳送 TORCH (這次是用新檔名傳)
+        # 2. 傳送 TORCH
         cat /home/gary/$TORCH_WHEEL | juju ssh -m {{ test_model }} {{ k8s_machine }} "cat > /tmp/$TORCH_WHEEL"
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- "kubectl cp /tmp/$TORCH_WHEEL {{ slurm_ns }}/{{ controller_pod }}:{{ shared_dir }}/$TORCH_WHEEL"
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$TORCH_WHEEL"
@@ -96,7 +96,7 @@
                echo "✅ pip3 is already installed."
             fi
 
-            # --- 安裝 PyTorch (使用新檔名) ---
+            # --- 安裝 PyTorch ---
             echo "📦 Installing PyTorch from $TORCH_FILE..."
             python3 -m pip install "$TORCH_FILE" \
                 --no-index \
