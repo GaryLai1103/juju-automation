@@ -907,3 +907,190 @@
       debug:
         msg: "🎉 Slinky Slurm on K8s (Golden + AWX Quiet) Deployed Successfully!"
 
+# ========================================================
+# Scenario: Post-Deployment - DCGM & KubeSphere Registration
+# Goal: Deploy K8s-native DCGM (Restricted to GPU Node)
+# ========================================================
+- name: 3. 設定監控與多叢集對接
+  hosts: maasjuju
+  gather_facts: no
+  vars:
+    # ---- Juju / Model 設定 ----
+    test_model: "slinky-cluster"
+    machine0: "0"
+    
+    # ---- 關鍵修正：指定 GPU 節點名稱 ----
+    gpu_node_hostname: "gpu-node01" 
+    
+    # ---- KubeSphere Host 設定 ----
+    ks_host_ip: "192.168.100.4"
+    ks_host_user: "ubuntu"
+    k8s_cluster_name: "slinky-k8s"
+
+  tasks:
+    # -----------------------------------------------------------
+    # 0. 衝突資源清理 (針對 Whizard Agent 安裝失敗修復)
+    # -----------------------------------------------------------
+    - name: 0.1 移除衝突的 Kube-State-Metrics 資源
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        echo "🧹 Cleaning up conflicting resources for Whizard Agent..."
+        
+        # 刪除導致 Whizard Agent 裝不起來的舊 ClusterRole 與 Binding
+        kubectl delete clusterrole kube-state-metrics --ignore-not-found
+        kubectl delete clusterrolebinding kube-state-metrics --ignore-not-found
+        kubectl -n kubesphere-monitoring-system delete serviceaccount kube-state-metrics --ignore-not-found
+        
+        echo "✅ Cleanup Done."
+        EOS
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 1. 部署 K8s 原生版 DCGM Exporter
+    # -----------------------------------------------------------
+    
+    # [步驟 1.0] 預先安裝 ServiceMonitor CRD
+    - name: 1.0 預先安裝 Prometheus CRD (ServiceMonitor)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        kubectl apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+        EOS
+      changed_when: true
+
+    # [步驟 1.1] 安裝 DCGM Exporter
+    - name: 1.1 安裝 DCGM Exporter (Restricted to GPU Nodes)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        
+        # 加入 Repo
+        helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
+        helm repo update >/dev/null 2>&1
+
+        # 建立 Values 檔案 (重點修正：nodeSelector + Resources)
+        cat > /tmp/dcgm-values.yaml <<EOF
+        serviceMonitor:
+          enabled: true
+          additionalLabels:
+            app.kubernetes.io/vendor: kubesphere
+        
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+            
+        nodeSelector:
+          kubernetes.io/hostname: {{ gpu_node_hostname }}
+          
+        tolerations:
+          - key: "node-role.anxpert/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
+
+        hostPath:
+          root: "/"
+        EOF
+
+        # 安裝
+        helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
+          -n kubesphere-monitoring-system --create-namespace \
+          -f /tmp/dcgm-values.yaml
+        
+        # 等待 Pod 啟動
+        kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
+        EOS
+      changed_when: true
+
+    # -----------------------------------------------------------
+    # 2. 獲取 Kubeconfig 用於註冊
+    # -----------------------------------------------------------
+    - name: 2.1 獲取 Master 實體 IP
+      shell: "juju ssh --model {{ test_model }} {{ machine0 }} 'hostname -I' | awk '{print $1}'"
+      register: master_ip_result
+
+    - name: 2.2 抓取並修正 Kubeconfig (Base64)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+          cat ~/.kube/config | sed "s/127.0.0.1/{{ master_ip_result.stdout | trim }}/g" | sed "s/localhost/{{ master_ip_result.stdout | trim }}/g" | base64 -w 0
+        EOS
+      register: kubeconfig_b64
+
+    # -----------------------------------------------------------
+    # 3. 準備 KubeSphere Host 連線
+    # -----------------------------------------------------------
+    - name: 3.1 加入 KubeSphere Host 到 Inventory
+      add_host:
+        name: "ks_host"
+        ansible_host: "{{ ks_host_ip }}"
+        ansible_user: "{{ ks_host_user }}"
+        cluster_name: "{{ k8s_cluster_name }}"
+        cluster_config: "{{ kubeconfig_b64.stdout }}"
+
+# ========================================================
+# 第二部分：在 KubeSphere Host 上執行註冊
+# ========================================================
+- name: 4. 執行 KubeSphere 註冊
+  hosts: ks_host
+  gather_facts: no
+  vars:
+    member_config_file: "/tmp/kubeconfig-{{ cluster_name }}"
+
+  tasks:
+    - name: 0.1 注入 Member Cluster CRD
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cluster.kubesphere.io/v1alpha1
+        kind: Cluster
+        metadata:
+          name: {{ cluster_name }}
+          labels:
+            kubesphere.io/managed: "true"
+            cluster-role.kubesphere.io/member: ""
+        spec:
+          provider: kubernetes
+          joinFederation: true
+          connection:
+            type: direct
+            kubeconfig: {{ cluster_config }}
+        EOF
+
+    - name: 0.2 建立 ServiceMonitor 補丁
+      shell: |
+        echo "{{ cluster_config }}" | base64 -d > {{ member_config_file }}
+
+        cat <<EOF | kubectl --kubeconfig {{ member_config_file }} apply -f -
+        apiVersion: monitoring.coreos.com/v1
+        kind: ServiceMonitor
+        metadata:
+          name: dcgm-exporter-ks-patch
+          namespace: kubesphere-monitoring-system
+          labels:
+            app.kubernetes.io/vendor: kubesphere
+        spec:
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: dcgm-exporter
+          endpoints:
+          - port: metrics
+            path: /metrics
+            interval: 15s
+          namespaceSelector:
+            matchNames:
+            - kubesphere-monitoring-system
+        EOF
+
+    - name: 0.3 清理
+      file:
+        path: "{{ member_config_file }}"
+        state: absent
+
+    - name: 🚀 完成提示
+      debug:
+        msg: 
+          - "✅ 舊衝突資源已清理 (kube-state-metrics)"
+          - "✅ DCGM Exporter 已修正並運行中"
+          - "✅ 叢集註冊完成！"
