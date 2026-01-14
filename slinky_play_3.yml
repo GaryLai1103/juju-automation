@@ -1,7 +1,7 @@
 ---
 # ========================================================
 # Scenario: Post-Deployment - DCGM & KubeSphere Registration
-# Goal: Deploy K8s-native DCGM (Fixed Values) & Register Cluster
+# Goal: Deploy K8s-native DCGM (Fix CRD) & Register Cluster
 # ========================================================
 - name: 4. 設定監控與多叢集對接
   hosts: maasjuju
@@ -9,28 +9,43 @@
   vars:
     # ---- Juju / Model 設定 ----
     test_model: "slinky-cluster"
-    machine0: "0"  # Control Plane (slurmhn)
+    machine0: "0"
     
-    # ---- KubeSphere Host 設定 (請修改這裡) ----
-    ks_host_ip: "192.168.100.4"      # 你的 KubeSphere 主機 IP
-    ks_host_user: "ubuntu"           # SSH 使用者
-    k8s_cluster_name: "slinky-k8s"   # 在 KubeSphere 上顯示的名稱
+    # ---- KubeSphere Host 設定 ----
+    ks_host_ip: "192.168.100.4"
+    ks_host_user: "ubuntu"
+    k8s_cluster_name: "slinky-k8s"
 
   tasks:
     # -----------------------------------------------------------
     # 1. 部署 K8s 原生版 DCGM Exporter
-    #    [Fix] 改用 values.yaml 避免 Helm --set 跳脫字元錯誤
     # -----------------------------------------------------------
+    
+    # [新增步驟] 1.0 預先安裝 ServiceMonitor CRD
+    # 這是為了解決 "no matches for kind ServiceMonitor" 的錯誤
+    # 因為 KubeSphere 的 Agent 還沒進來，K8s 不認得這個物件
+    - name: 1.0 預先安裝 Prometheus CRD (ServiceMonitor)
+      shell: |
+        juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
+        set -euo pipefail
+        
+        echo "🔧 Installing ServiceMonitor CRD..."
+        # 下載並套用 Prometheus Operator 的 CRD 定義檔
+        kubectl apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+        
+        EOS
+      changed_when: true
+
     - name: 1.1 安裝 DCGM Exporter (Helm with Values File)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         
-        # 1. 加入 Repo
+        # 1. 加入 Repo (gpu-helm-charts)
         helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
         helm repo update >/dev/null 2>&1
 
-        # 2. 建立乾淨的 Values 檔案 (避開 Shell 跳脫地獄)
+        # 2. 建立乾淨的 Values 檔案
         cat > /tmp/dcgm-values.yaml <<EOF
         serviceMonitor:
           enabled: true
@@ -38,7 +53,7 @@
             app.kubernetes.io/vendor: kubesphere
         EOF
 
-        # 3. 安裝 (使用 -f 讀取檔案)
+        # 3. 安裝 (現在 K8s 已經認得 ServiceMonitor 了，這裡會成功)
         helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
           -n kubesphere-monitoring-system --create-namespace \
           -f /tmp/dcgm-values.yaml
@@ -58,7 +73,6 @@
     - name: 2.2 抓取並修正 Kubeconfig (Base64)
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
-          # 讀取 config，將內部 IP (127.0.0.1) 替換為外部實體 IP
           cat ~/.kube/config | sed "s/127.0.0.1/{{ master_ip_result.stdout | trim }}/g" | sed "s/localhost/{{ master_ip_result.stdout | trim }}/g" | base64 -w 0
         EOS
       register: kubeconfig_b64
@@ -109,7 +123,7 @@
       shell: |
         echo "{{ cluster_config }}" | base64 -d > {{ member_config_file }}
 
-        # 在 Member Cluster 補上特定的 ServiceMonitor 設定
+        # 在 Member Cluster 補上特定的 ServiceMonitor 設定 (雙重保險)
         cat <<EOF | kubectl --kubeconfig {{ member_config_file }} apply -f -
         apiVersion: monitoring.coreos.com/v1
         kind: ServiceMonitor
@@ -139,5 +153,5 @@
     - name: 🚀 完成提示
       debug:
         msg: 
-          - "✅ DCGM Exporter 已安裝 (Values File Fix)"
+          - "✅ CRD 已修復，DCGM Exporter 安裝成功！"
           - "✅ 叢集 '{{ cluster_name }}' 已註冊到 KubeSphere"
