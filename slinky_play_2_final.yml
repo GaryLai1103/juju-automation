@@ -456,7 +456,7 @@
     # -----------------------------------------------------------
     # 8. Slurm Cluster (Full Post-Renderer)
     # -----------------------------------------------------------
-    - name: 8.2 Install/upgrade slurm chart (OCI)
+    - name: 8.2 Install/upgrade slurm chart (OCI) - INDENTATION FIXED
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
@@ -475,20 +475,20 @@
           extraConf: |
             GresTypes=gpu
           
-          # [1] Controller 的 Volume 定義 (Pod Level)
-          volumes:
-            - name: home-drive
-              nfs:
-                server: {{ nfs_server_ip }}
-                path: {{ nfs_export_path }}
-          
-          # [2] Slurmctld 容器掛載 (Container Level)
+          # [1] Slurmctld 容器掛載 (Container Level) - 這邊維持不變
           slurmctld:
             volumeMounts:
               - name: home-drive
                 mountPath: /home/slurm
 
+          # [2] Controller 的 Volume 定義 (必須在 podSpec 裡面！)
           podSpec:
+            volumes:
+              - name: home-drive
+                nfs:
+                  server: {{ nfs_server_ip }}
+                  path: {{ nfs_export_path }}
+
             nodeSelector:
               kubernetes.io/hostname: {{ controlplane_hostname }}
               kubernetes.io/os: linux
@@ -527,7 +527,7 @@
                   value: "{{ gpu_taint_value }}"
                   effect: NoSchedule
               
-              # [3] Worker 的 Volume 定義 (Pod Level)
+              # [3] Worker 的 Volume 定義 (這裡本來就是對的，不用動)
               volumes:
                 - name: home-drive
                   nfs:
@@ -567,6 +567,9 @@
             AutoDetect=nvidia
         EOF
 
+        # ... (yq 和 Post-Renderer 保持原樣，不需要變動) ...
+        # (這裡為了完整性，建議你確認你的 Playbook 下方是否還有 yq 和 helm upgrade 的指令)
+        
         # Ensure yq
         if ! [ -x /tmp/yq ]; then
           curl -fsSL -o /tmp/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
@@ -580,13 +583,11 @@
         YQ="/tmp/yq"
         in="$(mktemp)"
         cat > "$in"
-        # 1. Move initContainers to containers
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers) += 
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) |
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.initContainers) = []
         ' "$in"
-        # 2. Force tcpSocket probes (FULL LOGIC)
         "$YQ" eval -i '
           (select(.kind=="StatefulSet" and .metadata.name=="slurm-controller").spec.template.spec.containers[] | select(.name=="slurmctld")
           ).startupProbe = {"tcpSocket":{"port":6817},"failureThreshold":240,"periodSeconds":5,"timeoutSeconds":1} |
