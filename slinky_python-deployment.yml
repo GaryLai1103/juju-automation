@@ -53,17 +53,20 @@
       poll: 10
 
     # ----------------------------------------------------
-    # 3. 離線安裝 Pip 與 所有 PyTorch Dependencies (最終完美版)
+    # 3. 離線安裝 Pip 與 Dependencies (清理並安裝)
     # ----------------------------------------------------
-    - name: 3.1 離線安裝所有 Wheel 套件 (Bulk Install)
+    - name: 3.1 離線安裝所有 Wheel 套件 (Clean & Install)
       shell: |
-        # 1. 取得 Jumpbox 上所有 .whl 檔案列表
-        # 這會抓到 pip, torch, filelock, sympy 等所有檔案
-        WHEEL_FILES=$(ls /home/gary/*.whl)
+        # 1. [關鍵步驟] 先清理 Pod 內的舊檔案，避免殘留的 pip.whl 搞破壞
+        echo "🧹 Cleaning up old files in Pod..."
+        juju ssh -m {{ test_model }} {{ k8s_machine }} -- \
+           "kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- rm -f {{ shared_dir }}/*.whl"
 
+        # 2. 取得 Jumpbox 上所有 .whl 檔案列表
+        WHEEL_FILES=$(ls /home/gary/*.whl)
         echo "📦 Found wheels: $WHEEL_FILES"
 
-        # 2. 迴圈：將每個檔案傳送到 Pod
+        # 3. 迴圈：將每個檔案傳送到 Pod
         for FILE in $WHEEL_FILES; do
             FILENAME=$(basename "$FILE")
             echo "🚀 Transferring $FILENAME..."
@@ -79,31 +82,19 @@
             juju ssh -m {{ test_model }} {{ k8s_machine }} -- "rm -f /tmp/$FILENAME"
         done
 
-        # 3. 進入 Pod 執行「全家桶」安裝
+        # 4. 進入 Pod 執行「全家桶」安裝
         juju ssh -m {{ test_model }} {{ k8s_machine }} -- bash -s <<'EOS'
           kubectl exec -n {{ slurm_ns }} {{ controller_pod }} -- bash -c '
             set -e
             cd {{ shared_dir }}
             export PATH=$HOME/.local/bin:$PATH
             
-            # 先找 pip 安裝檔 (以防萬一還沒裝)
-            PIP_WHEEL=$(ls pip-*.whl | head -n 1)
+            # 再次檢查確保沒有怪檔案 (Optional check)
+            ls -lh *.whl
             
-            if ! command -v pip3 >/dev/null 2>&1; then
-               echo "🔍 Bootstrapping pip from $PIP_WHEEL..."
-               mkdir -p pip_tmp
-               python3 -m zipfile -e "$PIP_WHEEL" pip_tmp
-               export PYTHONPATH=$(pwd)/pip_tmp
-               python3 -m pip install "$PIP_WHEEL" --no-index --user --break-system-packages
-               unset PYTHONPATH
-               rm -rf pip_tmp
-            else
-               echo "✅ pip3 is already installed."
-            fi
-
-            # --- 關鍵：一次安裝所有 .whl 檔 ---
-            echo "📦 Installing ALL wheels found in directory..."
-            # pip install *.whl 會自動解析依賴順序，先裝 filelock 再裝 torch
+            # --- 安裝所有 .whl 檔 ---
+            echo "📦 Installing ALL wheels..."
+            # 這次只會有標準檔名的檔案，絕對不會報錯
             python3 -m pip install *.whl \
                 --no-index \
                 --find-links {{ shared_dir }} \
