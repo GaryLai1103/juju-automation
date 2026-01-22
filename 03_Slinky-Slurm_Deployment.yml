@@ -958,26 +958,20 @@
     # 1. 部署 K8s 原生版 DCGM Exporter
     # -----------------------------------------------------------
     
-    # [步驟 1.0] 預先安裝 ServiceMonitor CRD
-    - name: 1.0 預先安裝 Prometheus CRD (ServiceMonitor)
+    - name: 1.0 預先安裝 Prometheus CRD (ServiceMonitor) [OFFLINE]
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        kubectl apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.68.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+        kubectl apply -f /home/ubuntu/monitoring.coreos.com_servicemonitors.yaml
         EOS
       changed_when: true
 
-    # [步驟 1.1] 安裝 DCGM Exporter
-    - name: 1.1 安裝 DCGM Exporter (Restricted to GPU Nodes)
+    - name: 1.1 安裝 DCGM Exporter (Restricted to GPU Nodes) [OFFLINE CHART]
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         
-        # 加入 Repo
-        helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts >/dev/null 2>&1 || true
-        helm repo update >/dev/null 2>&1
-
-        # 建立 Values 檔案 (重點修正：nodeSelector + Resources)
+        # 建立 Values 檔案 (nodeSelector + Resources)
         cat > /tmp/dcgm-values.yaml <<EOF
         serviceMonitor:
           enabled: true
@@ -1004,12 +998,11 @@
           root: "/"
         EOF
 
-        # 安裝
-        helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
+        # ✅ 離線安裝：直接用本地 chart 檔
+        helm upgrade --install dcgm-exporter /home/ubuntu/dcgm-exporter-4.7.1.tgz \
           -n kubesphere-monitoring-system --create-namespace \
           -f /tmp/dcgm-values.yaml
         
-        # 等待 Pod 啟動
         kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
         EOS
       changed_when: true
