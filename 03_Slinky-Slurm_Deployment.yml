@@ -960,7 +960,7 @@
     - name: 1.0 Upload ServiceMonitor CRD yaml to machine0 (juju scp)
       shell: |
         juju scp --model {{ test_model }} \
-          /home/gary/offline/monitoring.coreos.com_servicemonitors.yaml \
+          /home/gary/monitoring.coreos.com_servicemonitors.yaml \
           {{ machine0 }}:/home/ubuntu/
       changed_when: true
     
@@ -975,7 +975,7 @@
     - name: 1.2 Upload DCGM Exporter Chart tgz to machine0 (juju scp)
       shell: |
         juju scp --model {{ test_model }} \
-          /home/gary/offline/dcgm-exporter-4.7.1.tgz \
+          /home/gary/dcgm-exporter-4.7.1.tgz \
           {{ machine0 }}:/home/ubuntu/
       changed_when: true
     
