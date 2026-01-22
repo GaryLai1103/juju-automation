@@ -315,7 +315,7 @@
           "ghcr.io/slinkyproject/slurm-operator-webhook:1.0.1"
         
           "docker.io/library/alpine:latest"
-          "nvcr.io/nvidia/k8s-device-plugin:v0.14.0"
+          "nvcr.io/nvidia/k8s-device-plugin:v0.17.1"
         
           "quay.io/jetstack/cert-manager-controller:v1.19.2"
           "quay.io/jetstack/cert-manager-webhook:v1.19.2"
