@@ -310,6 +310,7 @@
         IMAGES=(
           "ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04"
           "ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04"
+          "ghcr.io/slinkyproject/slurmrestd:25.11-ubuntu24.04"
         
           "ghcr.io/slinkyproject/slurm-operator:1.0.1"
           "ghcr.io/slinkyproject/slurm-operator-webhook:1.0.1"
