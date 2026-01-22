@@ -956,28 +956,41 @@
 
     # -----------------------------------------------------------
     # 1. 部署 K8s 原生版 DCGM Exporter
-    # -----------------------------------------------------------
+    # -----------------------------------------------------------    
+    - name: 1.0 Upload ServiceMonitor CRD yaml to machine0 (juju scp)
+      shell: |
+        juju scp --model {{ test_model }} \
+          /home/gary/offline/monitoring.coreos.com_servicemonitors.yaml \
+          {{ machine0 }}:/home/ubuntu/
+      changed_when: true
     
-    - name: 1.0 預先安裝 Prometheus CRD (ServiceMonitor) [OFFLINE]
+    - name: 1.1 Apply Prometheus CRD (ServiceMonitor) [OFFLINE]
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
         kubectl apply -f /home/ubuntu/monitoring.coreos.com_servicemonitors.yaml
         EOS
       changed_when: true
-
-    - name: 1.1 安裝 DCGM Exporter (Restricted to GPU Nodes) [OFFLINE CHART]
+    
+    - name: 1.2 Upload DCGM Exporter Chart tgz to machine0 (juju scp)
+      shell: |
+        juju scp --model {{ test_model }} \
+          /home/gary/offline/dcgm-exporter-4.7.1.tgz \
+          {{ machine0 }}:/home/ubuntu/
+      changed_when: true
+    
+    - name: 1.3 Install DCGM Exporter (Restricted to GPU Nodes) [OFFLINE CHART]
       shell: |
         juju ssh --model {{ test_model }} {{ machine0 }} -- bash -s <<'EOS'
         set -euo pipefail
-        
+    
         # 建立 Values 檔案 (nodeSelector + Resources)
         cat > /tmp/dcgm-values.yaml <<EOF
         serviceMonitor:
           enabled: true
           additionalLabels:
             app.kubernetes.io/vendor: kubesphere
-        
+    
         resources:
           limits:
             cpu: 500m
@@ -985,24 +998,25 @@
           requests:
             cpu: 100m
             memory: 128Mi
-            
+    
         nodeSelector:
           kubernetes.io/hostname: {{ gpu_node_hostname }}
-          
+    
         tolerations:
           - key: "node-role.anxpert/gpu"
             operator: "Exists"
             effect: "NoSchedule"
-
+    
         hostPath:
           root: "/"
         EOF
-
+    
         # ✅ 離線安裝：直接用本地 chart 檔
         helm upgrade --install dcgm-exporter /home/ubuntu/dcgm-exporter-4.7.1.tgz \
           -n kubesphere-monitoring-system --create-namespace \
           -f /tmp/dcgm-values.yaml
-        
+    
+        # 等待 Pod 啟動
         kubectl -n kubesphere-monitoring-system rollout status daemonset/dcgm-exporter --timeout=300s
         EOS
       changed_when: true
