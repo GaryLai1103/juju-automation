@@ -310,22 +310,30 @@
         IMAGES=(
           "ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04"
           "ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04"
+        
           "ghcr.io/slinkyproject/slurm-operator:1.0.1"
+          "ghcr.io/slinkyproject/slurm-operator-webhook:1.0.1"
+        
           "docker.io/library/alpine:latest"
           "nvcr.io/nvidia/k8s-device-plugin:v0.14.0"
+        
           "quay.io/jetstack/cert-manager-controller:v1.19.2"
           "quay.io/jetstack/cert-manager-webhook:v1.19.2"
           "quay.io/jetstack/cert-manager-cainjector:v1.19.2"
           "quay.io/jetstack/cert-manager-startupapicheck:v1.19.2"
+        
           "rancher/local-path-provisioner:v0.0.30"
           "docker.io/library/busybox:latest"
           "registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2"
           "registry.k8s.io/pause:3.9"
           "registry.k8s.io/coredns/coredns:v1.10.1"
+        
           "docker.io/calico/node:v3.26.1"
           "docker.io/calico/cni:v3.26.1"
           "docker.io/calico/kube-controllers:v3.26.1"
         )
+
+
 
         # 迴圈處理 Machine 0 和 1
         for MACHINE in 0 1; do
