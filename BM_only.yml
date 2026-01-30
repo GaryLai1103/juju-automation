@@ -1,0 +1,27 @@
+- name: 1. Deploy and Generate Config (on Juju)
+  hosts: all  # 確保 AWX Inventory 指向您的 Juju Controller (maasjuju)
+  gather_facts: no
+  vars:
+    # [修改 1] 移除原本的 k8s_model 定義
+    # 因為 AWX Survey 會直接傳入 'k8s_cluster' 這個變數，這裡不需要再定義
+    # 如果您想保留預設值以防萬一，可以解開下面這行註解，但通常不需要：
+    # k8s_cluster: "{{ k8s_cluster | default('k8s-cluster-auto') }}"
+
+    # [保留] 這些建議也加入 Survey，目前先保留在此當作預設值
+    ks_host_ip: "192.168.100.4"
+    ks_host_user: "ubuntu"
+
+  tasks:
+    # ----------------------------------------------------------------
+    # Juju 部署部分
+    # ----------------------------------------------------------------
+    - name: 1.1 Create Juju Model
+      # [修改 2] 變數名稱改為 k8s_cluster
+      command: "juju add-model {{ k8s_cluster }}"
+      ignore_errors: yes
+
+    - name: 1.2 Set Model Base to Ubuntu 22.04
+      # [修改 3] 變數名稱改為 k8s_cluster
+      command: "juju model-config -m {{ k8s_cluster }} default-base=ubuntu@22.04"
+      ignore_errors: yes
+      tags: [deploy]
