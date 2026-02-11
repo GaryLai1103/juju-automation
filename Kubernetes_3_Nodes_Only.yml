@@ -1,6 +1,6 @@
 # ========================================================
 # PLAY 1: Infrastructure - Deploy K8s (Run:ai Ready)
-# 包含: K8s 1.31, StorageClass, Ingress, MetalLB, TLS Secret
+# 修正版: 將 Ingress/MetalLB 改為 Post-Install 步驟
 # ========================================================
 - name: 1. Infrastructure - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
@@ -8,104 +8,55 @@
   vars:
     test_model: "k8s-cluster-runai"
     k8s_channel: "1.31/stable"
-    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-runai.yaml"
+    bundle_path: "{{ ansible_user_dir }}/charmed-k8s-core.yaml"
     
-    # [已修正] MetalLB IP 設定 (配合你的網段 192.168.1.x)
-    # 我們預留 .200 到 .210 給 Run:ai 的 Web UI 使用
+    # MetalLB IP 設定 (請確認這是你 VM 網段的閒置 IP)
     metallb_ip_range: "192.168.1.200-192.168.1.210"
 
   tasks:
-    # --- 1. Environment Cleanup ---
+    # --- 1. Cleanup & Model ---
     - name: 1.0 Force cleanup old model
       command: "juju destroy-model {{ test_model }} --no-prompt --force --destroy-storage"
       register: destroy_result
-      failed_when: 
-        - destroy_result.rc != 0 
-        - '"not found" not in destroy_result.stderr'
+      failed_when: destroy_result.rc != 0 and '"not found" not in destroy_result.stderr'
       ignore_errors: yes
 
     - name: 1.1 Wait for model release
-      pause:
-        seconds: 15
+      pause: seconds: 15
 
     - name: 1.2 Create new Juju Model
       shell: juju add-model {{ test_model }}
 
-    # --- 2. Bundle & Deploy (含 MetalLB & Ingress) ---
-    - name: 2.1 Generate Local Bundle
+    # --- 2. Core Bundle (只包含基礎建設) ---
+    - name: 2.1 Generate Core Bundle
       copy:
         dest: "{{ bundle_path }}"
         mode: '0644'
         content: |
-          description: Modern K8s Cluster (Run:ai Ready)
+          description: Core K8s Cluster
           base: ubuntu@22.04
-          
           machines:
-            "0":
-              constraints: tags=runai
-            "1":
-              constraints: tags=runai
-            "2":
-              constraints: tags=runai
-          
+            "0": {constraints: tags=runai}
+            "1": {constraints: tags=runai}
+            "2": {constraints: tags=runai}
           applications:
-            # K8s 核心組件
-            easyrsa:
-              charm: easyrsa
-              channel: latest/stable
-              num_units: 1
-              to: ["0"]
-            etcd:
-              charm: etcd
-              channel: latest/stable
-              num_units: 1
-              to: ["0"]
-            
-            kubernetes-control-plane:
+            easyrsa: {charm: easyrsa, channel: latest/stable, num_units: 1, to: ["0"]}
+            etcd: {charm: etcd, channel: latest/stable, num_units: 1, to: ["0"]}
+            kubernetes-control-plane: 
               charm: kubernetes-control-plane
               channel: {{ k8s_channel }}
               num_units: 1
               to: ["0"]
-              options:
-                allow-privileged: "true"
-            
+              options: {allow-privileged: "true"}
             kubernetes-worker:
               charm: kubernetes-worker
               channel: {{ k8s_channel }}
               num_units: 2
               to: ["1", "2"]
               expose: true
-            
-            calico:
-              charm: calico
-              channel: latest/stable
-            containerd:
-              charm: containerd
-              channel: latest/stable
-            
-            # --- Run:ai 必要組件 ---
-            
-            # 1. Metrics Server (Run:ai 排程器需要)
-            kubernetes-metrics-server:
-              charm: kubernetes-metrics-server
-              channel: stable
-              trust: true
-            
-            # 2. Ingress Controller (Web UI 入口)
-            ingress-nginx-k8s:
-              charm: ingress-nginx-k8s
-              channel: stable
-              trust: true
-            
-            # 3. MetalLB (提供外部 IP 192.168.1.2xx 給 Ingress)
-            metallb:
-              charm: metallb
-              channel: stable
-              options:
-                iprange: "{{ metallb_ip_range }}"
-
+            calico: {charm: calico, channel: latest/stable}
+            containerd: {charm: containerd, channel: latest/stable}
           relations:
-            # K8s 核心連接
             - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
             - ["kubernetes-control-plane:certificates", "easyrsa:client"]
             - ["etcd:certificates", "easyrsa:client"]
@@ -116,29 +67,22 @@
             - ["calico:cni", "kubernetes-worker:cni"]
             - ["containerd:containerd", "kubernetes-worker:container-runtime"]
             - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
-            
-            # 監控與 Ingress 連接
-            - ["kubernetes-metrics-server:kube-control", "kubernetes-control-plane:kube-control"]
-            - ["ingress-nginx-k8s:kube-control", "kubernetes-control-plane:kube-control"]
 
     - name: 2.2 Deploy Bundle
-      shell: |
-        juju deploy {{ bundle_path }} --model {{ test_model }} --trust
+      shell: juju deploy {{ bundle_path }} --model {{ test_model }} --trust
       register: deploy_out
       until: deploy_out.rc == 0
       retries: 3
       delay: 10
 
-    # --- 3. Infra Monitoring (Wait Loop) ---
+    # --- 3. Wait for K8s Ready ---
     - name: 3.1 Wait for Juju Apps Active
       shell: |
         echo "⏳ Monitoring Juju status (Timeout: 45min)..."
         for i in {1..540}; do
           JSON=$(juju status --model {{ test_model }} --format json)
-          # 檢查主要組件
           CP=$(echo "$JSON" | jq -r '.applications["kubernetes-control-plane"]["application-status"].current // "unknown"')
           WK=$(echo "$JSON" | jq -r '.applications["kubernetes-worker"]["application-status"].current // "unknown"')
-          
           if [[ "$CP" == "active" && "$WK" == "active" ]]; then
             echo "✅ Core Juju Apps are Active!"
             exit 0
@@ -146,91 +90,102 @@
           if (( i % 12 == 0 )); then echo "   [$i/540] Waiting... (CP=$CP, WK=$WK)"; fi
           sleep 5
         done
-        echo "❌ Timeout waiting for Juju apps."
         exit 1
-      args:
-        executable: /bin/bash
+      args: {executable: /bin/bash}
       register: juju_wait
       changed_when: false
 
-    # --- 4. Storage Class Setup ---
+    # --- 4. Post-Install: Storage & Metrics ---
     - name: 4.1 Install Local Path Provisioner
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
-      register: install_sc
-      changed_when: "'created' in install_sc.stdout or 'configured' in install_sc.stdout"
 
     - name: 4.2 Set Default StorageClass
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
         "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
-      register: patch_sc
-      changed_when: "'patched' in patch_sc.stdout"
 
-    # --- 5. Run:ai Specific Requirements (TLS & Namespace) ---
-    - name: 5.1 Generate TLS Secret for Run:ai
+    - name: 4.3 Install Metrics Server (Required for Run:ai)
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+        # Patch allow-insecure for self-signed certs in lab
+        juju ssh --model {{ test_model }} 0 -- \
+        "kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/args/-\", \"value\": \"--kubelet-insecure-tls\"}]'"
+
+    # --- 5. Post-Install: MetalLB (Load Balancer) ---
+    - name: 5.1 Install MetalLB
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
+        kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml
+        echo "⏳ Waiting for MetalLB Controller..."
+        kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=300s
+        EOS
+
+    - name: 5.2 Configure MetalLB Pool
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
+        cat <<EOF | kubectl apply -f -
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: first-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - {{ metallb_ip_range }}
+        ---
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: l2-advert
+          namespace: metallb-system
+        EOF
+        EOS
+
+    # --- 6. Post-Install: Ingress NGINX ---
+    - name: 6.1 Install NGINX Ingress Controller
+      shell: |
+        juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/cloud/deploy.yaml
+        echo "⏳ Waiting for Ingress Controller..."
+        # 等待 Deployment 建立
+        sleep 10
+        kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=300s
+        EOS
+
+    # --- 7. Post-Install: TLS Secret ---
+    - name: 7.1 Generate TLS Secret for Run:ai
       shell: |
         juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
         set -e
-        # 1. 建立 Run:ai Backend Namespace (新版強制要求)
         kubectl create namespace runai-backend --dry-run=client -o yaml | kubectl apply -f -
         
-        # 2. 產生自簽憑證 (Self-Signed Cert)
-        # Run:ai Control Plane 啟動時需要掛載這個 Secret
-        # 這裡設定 CN=runai.lab.local，請記得之後要在你的 Mac 設定 hosts
         openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
           -keyout private.pem -out fullchain.pem \
           -subj "/CN=runai.lab.local"
         
-        # 3. 建立 Secret (如果不存在)
         if ! kubectl get secret runai-backend-tls -n runai-backend; then
             kubectl create secret tls runai-backend-tls -n runai-backend \
               --cert=fullchain.pem \
               --key=private.pem
             echo "✅ Created TLS Secret: runai-backend-tls"
-        else
-            echo "ℹ️ TLS Secret already exists."
         fi
-        
-        # 清理暫存檔
         rm -f private.pem fullchain.pem
         EOS
-      register: tls_setup
 
-    # --- 6. Final K8s Health Check ---
-    - name: 6.1 Wait for K8s Nodes & System Pods
+    # --- 8. Final Check ---
+    - name: 8.1 Check Ingress IP
       shell: |
         juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
-        set -e
-        echo "⏳ Waiting for K8s Nodes & System Pods (Timeout: 15min)..."
-        
-        # 等待 3 個節點 Ready
-        echo "   -> Waiting for 3 nodes to be Ready..."
-        for i in {1..60}; do
-           READY_COUNT=$(kubectl get nodes --no-headers | grep -w "Ready" | wc -l)
-           if [ "$READY_COUNT" -ge 3 ]; then
-               echo "   ✅ Found $READY_COUNT Ready nodes."
-               break
-           fi
-           sleep 10
-        done
-        kubectl wait --for=condition=Ready node --all --timeout=600s
-
-        # 等待系統 Pods
-        echo "   -> Waiting for System Pods..."
-        kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=600s
-        # 確保 Ingress Controller 取得 LoadBalancer IP
-        echo "   -> Waiting for Ingress Controller External IP..."
-        sleep 20 # 給 MetalLB 一點時間反應
-        kubectl -n ingress-nginx wait deployment/ingress-nginx-controller --for=condition=Available --timeout=300s
-        
-        # 取得分配到的 IP
+        echo "Waiting for LoadBalancer IP..."
+        sleep 15
         LB_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
         echo "---------------------------------------------------------"
-        echo "✅ K8s Infrastructure is Ready!"
-        echo "🔑 Ingress IP Assigned: $LB_IP"
-        echo "📝 ACTION: Please add '$LB_IP runai.lab.local' to your /etc/hosts"
+        echo "✅ Cluster Ready!"
+        echo "🔑 Ingress IP: $LB_IP"
+        echo "📝 ACTION: Add '$LB_IP runai.lab.local' to /etc/hosts"
         echo "---------------------------------------------------------"
         EOS
       changed_when: false
