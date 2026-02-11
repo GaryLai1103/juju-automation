@@ -1,6 +1,6 @@
 # ========================================================
 # PLAY 1: Infrastructure - Deploy K8s (Run:ai Ready)
-# 修正版: 將 Ingress/MetalLB 改為 Post-Install 步驟
+# 修正版 V2: 修復 pause 語法錯誤 & 優化 MetalLB 部署
 # ========================================================
 - name: 1. Infrastructure - Deploy Modern Charmed Kubernetes
   hosts: maasjuju
@@ -22,7 +22,8 @@
       ignore_errors: yes
 
     - name: 1.1 Wait for model release
-      pause: seconds: 15
+      pause:
+        seconds: 15
 
     - name: 1.2 Create new Juju Model
       shell: juju add-model {{ test_model }}
@@ -91,7 +92,8 @@
           sleep 5
         done
         exit 1
-      args: {executable: /bin/bash}
+      args:
+        executable: /bin/bash
       register: juju_wait
       changed_when: false
 
@@ -108,11 +110,11 @@
 
     - name: 4.3 Install Metrics Server (Required for Run:ai)
       shell: |
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+        juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
         # Patch allow-insecure for self-signed certs in lab
-        juju ssh --model {{ test_model }} 0 -- \
-        "kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/args/-\", \"value\": \"--kubelet-insecure-tls\"}]'"
+        kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+        EOS
 
     # --- 5. Post-Install: MetalLB (Load Balancer) ---
     - name: 5.1 Install MetalLB
@@ -150,7 +152,6 @@
         juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
         kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/cloud/deploy.yaml
         echo "⏳ Waiting for Ingress Controller..."
-        # 等待 Deployment 建立
         sleep 10
         kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=300s
         EOS
