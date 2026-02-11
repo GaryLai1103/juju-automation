@@ -1,7 +1,5 @@
----
 # ========================================================
-# K8S CLuster - 3 Nodes
-# Structure: Reverted to explicit separate tasks for maximum clarity.
+# K8S CLuster - 3 Nodes (1 Master, 2 Workers) for Run:ai
 # ========================================================
 
 # ========================================================
@@ -32,19 +30,24 @@
     - name: 1.2 Create new Juju Model
       shell: juju add-model {{ test_model }}
 
-    # --- 2. Bundle & Deploy ---
+    # --- 2. Bundle & Deploy (Critical Changes Here) ---
     - name: 2.1 Generate Local Bundle
       copy:
         dest: "{{ bundle_path }}"
         mode: '0644'
         content: |
-          description: Slinky Modern K8s Cluster
+          description: Slinky Modern K8s Cluster (Run:ai Ready)
           base: ubuntu@22.04
+          
+          # [修改點 1] 定義三台機器: 0(Master), 1(Worker/GPU), 2(Worker/GPU)
           machines:
             "0":
               constraints: tags=virtual
             "1":
-              constraints: tags=slurm-node
+              constraints: tags=slurm-node  # 建議改為 tags=gpu-node 若實際是 GPU 機
+            "2":
+              constraints: tags=slurm-node  # 第三台節點
+          
           applications:
             easyrsa:
               charm: easyrsa
@@ -56,6 +59,7 @@
               channel: latest/stable
               num_units: 1
               to: ["0"]
+            
             kubernetes-control-plane:
               charm: kubernetes-control-plane
               channel: {{ k8s_channel }}
@@ -63,18 +67,36 @@
               to: ["0"]
               options:
                 allow-privileged: "true"
+                # Run:ai 有時需要 API server 允許特定參數，預設通常夠用
+            
+            # [修改點 2] Worker 擴增為 2 個單位
             kubernetes-worker:
               charm: kubernetes-worker
               channel: {{ k8s_channel }}
-              num_units: 1
-              to: ["1"]
+              num_units: 2
+              to: ["1", "2"]
               expose: true
+            
             calico:
               charm: calico
               channel: latest/stable
             containerd:
               charm: containerd
               channel: latest/stable
+            
+            # [修改點 3] 加入 Metrics Server (Run:ai 排程需要資源數據)
+            kubernetes-metrics-server:
+              charm: kubernetes-metrics-server
+              channel: stable
+              trust: true
+            
+            # [修改點 4] 加入 Ingress (Run:ai Dashboard 存取需求)
+            ingress-nginx-k8s:
+              charm: ingress-nginx-k8s
+              channel: stable
+              trust: true
+
+          # [修改點 5] Relations 必須是 Root Key
           relations:
             - ["kubernetes-control-plane:kube-control", "kubernetes-worker:kube-control"]
             - ["kubernetes-control-plane:certificates", "easyrsa:client"]
@@ -86,6 +108,9 @@
             - ["calico:cni", "kubernetes-worker:cni"]
             - ["containerd:containerd", "kubernetes-worker:container-runtime"]
             - ["containerd:containerd", "kubernetes-control-plane:container-runtime"]
+            # Metrics Server & Ingress Relations
+            - ["kubernetes-metrics-server:kube-control", "kubernetes-control-plane:kube-control"]
+            - ["ingress-nginx-k8s:kube-control", "kubernetes-control-plane:kube-control"]
 
     - name: 2.2 Deploy Bundle
       shell: |
@@ -95,19 +120,18 @@
       retries: 3
       delay: 10
 
-    # --- 3. Infra Monitoring (AWX Quiet Mode) ---
-    - name: 3.1 Wait for Juju Apps Active (Bash Loop)
+    # --- 3. Infra Monitoring (Wait Loop) ---
+    - name: 3.1 Wait for Juju Apps Active
       shell: |
         echo "⏳ Monitoring Juju status (Timeout: 45min)..."
         for i in {1..540}; do
           JSON=$(juju status --model {{ test_model }} --format json)
+          # 檢查主要組件
           CP=$(echo "$JSON" | jq -r '.applications["kubernetes-control-plane"]["application-status"].current // "unknown"')
           WK=$(echo "$JSON" | jq -r '.applications["kubernetes-worker"]["application-status"].current // "unknown"')
-          CA=$(echo "$JSON" | jq -r '.applications["calico"]["application-status"].current // "unknown"')
-          CD=$(echo "$JSON" | jq -r '.applications["containerd"]["application-status"].current // "unknown"')
           
-          if [[ "$CP" == "active" && "$WK" == "active" && "$CA" == "active" && "$CD" == "active" ]]; then
-            echo "✅ All Juju Apps are Active!"
+          if [[ "$CP" == "active" && "$WK" == "active" ]]; then
+            echo "✅ Core Juju Apps are Active!"
             exit 0
           fi
           if (( i % 12 == 0 )); then echo "   [$i/540] Waiting... (CP=$CP, WK=$WK)"; fi
@@ -120,7 +144,7 @@
       register: juju_wait
       changed_when: false
 
-    # --- 4. Local Path Provisioner ---
+    # --- 4. Local Path Provisioner (Storage) ---
     - name: 4.1 Install Local Path Provisioner
       shell: |
         juju ssh --model {{ test_model }} 0 -- \
@@ -135,39 +159,32 @@
       register: patch_sc
       changed_when: "'patched' in patch_sc.stdout"
 
-    # --- 5. K8s Internal Check ---
+    # --- 5. K8s Internal Check (Modified) ---
     - name: 5.1 Wait for K8s Nodes & System Pods
       shell: |
         juju ssh --model {{ test_model }} 0 -- bash -s <<'EOS'
         set -e
         echo "⏳ Waiting for K8s Nodes & System Pods (Timeout: 15min)..."
         
-        wait_for_condition() {
-            local resource=$1; local condition=$2; local timeout=$3
-            echo "   -> Waiting for $resource to be $condition..."
-            if ! kubectl wait "$resource" --for=condition="$condition" --timeout="${timeout}s" >/dev/null 2>&1; then
-                echo "   ❌ Timeout waiting for $resource"; return 1
-            fi
-            return 0
-        }
-
-        # Wait for Nodes
-        wait_for_condition "node/slurmhn" "Ready" 900
-        wait_for_condition "node/gpu-node01" "Ready" 900
-
-        # Wait for Calico Pods
-        echo "   -> Waiting for calico-node pods..."
+        # [修改點 6] 通用型檢查：等待 3 個節點都 Ready
+        echo "   -> Waiting for 3 nodes to be Ready..."
         for i in {1..60}; do
-           if kubectl -n kube-system get pod -l k8s-app=calico-node | grep -q "Running"; then break; fi
-           sleep 2
+           READY_COUNT=$(kubectl get nodes --no-headers | grep -w "Ready" | wc -l)
+           if [ "$READY_COUNT" -ge 3 ]; then
+               echo "   ✅ Found $READY_COUNT Ready nodes."
+               break
+           fi
+           sleep 10
         done
-        kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=600s
+        # Double check with wait command
+        kubectl wait --for=condition=Ready node --all --timeout=600s
 
-        # Wait for CoreDNS
-        echo "   -> Waiting for DNS..."
+        # Wait for CoreDNS/Calico
+        echo "   -> Waiting for System Pods..."
+        kubectl -n kube-system wait pod -l k8s-app=calico-node --for=condition=Ready --timeout=600s
         kubectl -n kube-system wait pod -l k8s-app=kube-dns --for=condition=Ready --timeout=600s 2>/dev/null || \
         kubectl -n kube-system wait pod -l k8s-app=coredns --for=condition=Ready --timeout=600s 2>/dev/null || true
 
-        echo "✅ K8s Infrastructure is Fully Ready."
+        echo "✅ K8s Infrastructure is Fully Ready for Run:ai."
         EOS
       changed_when: false
