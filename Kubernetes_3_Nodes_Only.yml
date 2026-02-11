@@ -43,11 +43,11 @@
           
           machines:
             "0":
-              constraints: tags=virtual
+              constraints: tags=runai
             "1":
-              constraints: tags=slurm-node
+              constraints: tags=runai
             "2":
-              constraints: tags=slurm-node
+              constraints: tags=runai
           
           applications:
             # 核心組件
