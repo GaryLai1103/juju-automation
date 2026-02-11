@@ -10,10 +10,9 @@
     k8s_channel: "1.31/stable"
     bundle_path: "{{ ansible_user_dir }}/charmed-k8s-runai.yaml"
     
-    # [重要] MetalLB IP 設定
-    # 請將此處改為你 x86 VM 所在網段的閒置 IP 區間
-    # 這些 IP 將被用來指派給 Run:ai Dashboard (Ingress)
-    metallb_ip_range: "192.168.64.200-192.168.64.210"
+    # [已修正] MetalLB IP 設定 (配合你的網段 192.168.1.x)
+    # 我們預留 .200 到 .210 給 Run:ai 的 Web UI 使用
+    metallb_ip_range: "192.168.1.200-192.168.1.210"
 
   tasks:
     # --- 1. Environment Cleanup ---
@@ -50,7 +49,7 @@
               constraints: tags=runai
           
           applications:
-            # 核心組件
+            # K8s 核心組件
             easyrsa:
               charm: easyrsa
               channel: latest/stable
@@ -86,7 +85,7 @@
             
             # --- Run:ai 必要組件 ---
             
-            # 1. Metrics Server (排程器需要)
+            # 1. Metrics Server (Run:ai 排程器需要)
             kubernetes-metrics-server:
               charm: kubernetes-metrics-server
               channel: stable
@@ -98,7 +97,7 @@
               channel: stable
               trust: true
             
-            # 3. MetalLB (提供外部 IP 給 Ingress)
+            # 3. MetalLB (提供外部 IP 192.168.1.2xx 給 Ingress)
             metallb:
               charm: metallb
               channel: stable
@@ -179,6 +178,7 @@
         
         # 2. 產生自簽憑證 (Self-Signed Cert)
         # Run:ai Control Plane 啟動時需要掛載這個 Secret
+        # 這裡設定 CN=runai.lab.local，請記得之後要在你的 Mac 設定 hosts
         openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
           -keyout private.pem -out fullchain.pem \
           -subj "/CN=runai.lab.local"
@@ -225,6 +225,12 @@
         sleep 20 # 給 MetalLB 一點時間反應
         kubectl -n ingress-nginx wait deployment/ingress-nginx-controller --for=condition=Available --timeout=300s
         
-        echo "✅ K8s Infrastructure is Fully Ready for Run:ai Installation."
+        # 取得分配到的 IP
+        LB_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        echo "---------------------------------------------------------"
+        echo "✅ K8s Infrastructure is Ready!"
+        echo "🔑 Ingress IP Assigned: $LB_IP"
+        echo "📝 ACTION: Please add '$LB_IP runai.lab.local' to your /etc/hosts"
+        echo "---------------------------------------------------------"
         EOS
       changed_when: false
