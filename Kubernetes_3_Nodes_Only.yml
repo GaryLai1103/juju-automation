@@ -38,7 +38,7 @@
         dest: "{{ bundle_path }}"
         mode: '0644'
         content: |
-          description: Slinky Modern K8s Cluster (Run:ai Ready)
+          description: Modern K8s Cluster (Run:ai Ready)
           base: ubuntu@22.04
           
           machines:
